@@ -129,9 +129,17 @@
             </div>
         </div>
 
+        <div id="resultado-teste-conexao" class="alert" style="display: none; margin-bottom: 16px;">
+            <span class="alert-icon"></span>
+            <div class="alert-mensagem"></div>
+        </div>
+
         <div class="btn-group mt-2">
             <button type="submit" class="btn btn-primary btn-lg">
                 <span>{{ 'Atualizar conexão' if db_config.profile_id else 'Salvar conexão' }}</span>
+            </button>
+            <button type="button" id="btn-testar-conexao" class="btn btn-outline" onclick="testarConexaoBanco()">
+                <span>Testar conexão</span>
             </button>
             <a href="{{ url_for('dashboard') }}" class="btn btn-outline">
                 <span>Voltar</span>
@@ -381,5 +389,42 @@ function alternarModoConexao() {
 }
 
 document.addEventListener('DOMContentLoaded', alternarModoConexao);
+
+async function testarConexaoBanco() {
+    const botao = document.getElementById('btn-testar-conexao');
+    const resultado = document.getElementById('resultado-teste-conexao');
+    const icone = resultado.querySelector('.alert-icon');
+    const mensagem = resultado.querySelector('.alert-mensagem');
+
+    const dadosForm = new FormData(botao.closest('form'));
+
+    const textoOriginal = botao.innerHTML;
+    botao.disabled = true;
+    botao.innerHTML = '<span>Testando...</span>';
+    resultado.style.display = 'none';
+
+    try {
+        const resposta = await fetch('{{ url_for("testar_conexao_banco") }}', {
+            method: 'POST',
+            body: dadosForm
+        });
+        const dados = await resposta.json();
+
+        resultado.classList.remove('alert-success', 'alert-error');
+        resultado.classList.add(dados.sucesso ? 'alert-success' : 'alert-error');
+        icone.textContent = dados.sucesso ? '✓' : '✕';
+        mensagem.textContent = dados.mensagem;
+        resultado.style.display = 'flex';
+    } catch (erro) {
+        resultado.classList.remove('alert-success');
+        resultado.classList.add('alert-error');
+        icone.textContent = '✕';
+        mensagem.textContent = 'Não foi possível executar o teste: ' + erro;
+        resultado.style.display = 'flex';
+    } finally {
+        botao.disabled = false;
+        botao.innerHTML = textoOriginal;
+    }
+}
 </script>
 {% endblock %}

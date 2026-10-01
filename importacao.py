@@ -2415,6 +2415,58 @@ def configurar_banco():
     )
 
 
+@app.route('/configurar-banco/testar', methods=['POST'])
+def testar_conexao_banco():
+    """Testa, via AJAX, os dados preenchidos no formulário sem salvar nada."""
+    form_data = request.form
+
+    connection_mode = (form_data.get('connection_mode') or 'local').strip().lower()
+    host = (form_data.get('host') or '').strip()
+    if connection_mode == 'local' and not host:
+        host = 'localhost'
+    database = (form_data.get('database') or 'postgres').strip()
+    user = (form_data.get('user') or '').strip()
+    password = form_data.get('password') or ''
+    port_raw = (form_data.get('port') or '5432').strip()
+
+    profile_id = (form_data.get('profile_id') or '').strip()
+    if not password and profile_id.isdigit():
+        saved_connection = get_db_connection_by_id(int(profile_id))
+        if saved_connection:
+            password = saved_connection.get('password') or ''
+
+    if not host:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe o IP ou host do banco.'})
+    if not database:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe o nome do banco de dados.'})
+    if not user:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe o usuário do banco de dados.'})
+    if not password:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe a senha do banco de dados.'})
+
+    try:
+        port = int(port_raw)
+    except ValueError:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe uma porta válida.'})
+
+    try:
+        conexao_teste = psycopg2.connect(
+            host=host,
+            database=database,
+            user=user,
+            password=password,
+            port=port,
+            connect_timeout=int(os.getenv('DB_TEST_CONNECT_TIMEOUT', '8'))
+        )
+        conexao_teste.close()
+    except (OperationalError, InterfaceError) as error:
+        return jsonify({'sucesso': False, 'mensagem': f'Falha na conexão: {error}'})
+    except Exception as error:  # noqa: BLE001 - qualquer outro erro do driver vira mensagem para o usuário
+        return jsonify({'sucesso': False, 'mensagem': f'Erro inesperado ao testar a conexão: {error}'})
+
+    return jsonify({'sucesso': True, 'mensagem': f'Conexão bem-sucedida com {host}:{port}/{database}.'})
+
+
 @app.route('/configurar-banco/usar/<int:connection_id>', methods=['POST'])
 def usar_conexao_salva(connection_id):
     """Ativa uma conexão salva como configuração corrente da aplicação."""
