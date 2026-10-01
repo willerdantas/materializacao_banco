@@ -1,0 +1,1011 @@
+<!-- templates/controle_migracao.html -->
+{% extends "base.html" %}
+
+{% block title %}Controle da Migração #{{ migracao.id }}{% endblock %}
+
+{% block extra_css %}
+<style>
+/* Ajustes locais de contraste dos KPIs desta página */
+#controle-page .kpi-card.kpi-ja-existem {
+    background: var(--gradient-accent);
+    color: var(--color-white);
+}
+
+#controle-page .kpi-card.kpi-nao-encontrados {
+    background: #E5E7EB;
+    color: var(--color-dark);
+}
+
+#controle-page .kpi-card.kpi-nao-encontrados .kpi-label,
+#controle-page .kpi-card.kpi-nao-encontrados .kpi-sublabel {
+    opacity: 1;
+    color: var(--color-gray);
+}
+
+#controle-page .kpi-card.kpi-nao-encontrados .kpi-value {
+    color: var(--color-dark);
+    text-shadow: none;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="controle-page"
+    data-migracao-id="{{ migracao.id }}"
+    data-total-registros="{{ total_registros }}"
+    data-id-maximo="{{ migracao.id_maximo or 0 }}"
+    data-registros-processados="{{ migracao.registros_processados }}">
+
+<!-- Info Card com nome das tabelas -->
+<div class="card animate-fade-in" style="margin-bottom: 16px;">
+    <div class="card-header" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; align-items: center;">
+        <div>
+            <h2 class="card-title">Migração #{{ migracao.id }}</h2>
+            <p class="card-subtitle" style="margin-top: 4px;">
+                <strong>Origem:</strong> <code>{{ migracao.tabela_origem }}</code> →
+                <strong>Destino:</strong> <code>{{ migracao.tabela_destino }}</code>
+            </p>
+            <p class="card-subtitle" style="margin-top: 2px;">
+                <strong>Campo ID:</strong> <code>{{ migracao.campo_id }}</code> |
+                <strong>Total na Origem:</strong> {{ "{:,}".format(total_registros).replace(",", ".") }} registros |
+                <strong>ID Máximo:</strong> <span id="info-id-maximo">{{ "{:,}".format(migracao.id_maximo or 0).replace(",", ".") }}</span>
+            </p>
+        </div>
+        <div class="btn-group">
+            <form method="POST" action="{{ url_for('atualizar_lotes_migracao', id=migracao.id) }}" onsubmit="return confirm('Recalcular colunas e ID máximo da origem?');">
+                <button type="submit" class="btn btn-secondary">Atualizar Origem</button>
+            </form>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-outline">Voltar ao Dashboard</a>
+        </div>
+    </div>
+</div>
+
+<!-- KPI Cards -->
+<div class="kpi-grid">
+    <div class="kpi-card primary">
+        <div class="kpi-label">Inseridos</div>
+        <div class="kpi-value" id="stat-inseridos">-</div>
+        <div class="kpi-sublabel" id="stat-ultimo-inserido">Novos registros importados</div>
+    </div>
+    <div class="kpi-card" style="background: var(--color-yellow, #F3A133); color: #fff; border-left: 4px solid #c97d00;">
+        <div class="kpi-label" style="opacity: 0.9;">Atualizados</div>
+        <div class="kpi-value" id="stat-atualizados">-</div>
+        <div class="kpi-sublabel" style="opacity: 0.85;">Registros com diferenças atualizados</div>
+    </div>
+    <div class="kpi-card kpi-ja-existem" style="border-left: 4px solid var(--color-accent);">
+        <div class="kpi-label">Já Existem</div>
+        <div class="kpi-value" id="stat-ja-existem">-</div>
+        <div class="kpi-sublabel">Registros iguais no destino</div>
+    </div>
+    <div class="kpi-card kpi-nao-encontrados" style="border-left: 4px solid #9CA3AF;">
+        <div class="kpi-label">Não Encontrados</div>
+        <div class="kpi-value" id="stat-nao-encontrados">-</div>
+        <div class="kpi-sublabel">IDs sem registro na origem</div>
+    </div>
+    <div class="kpi-card accent">
+        <div class="kpi-label">Com Erro</div>
+        <div class="kpi-value" id="stat-com-erro">-</div>
+        <div class="kpi-sublabel">Disponíveis para reprocessar</div>
+    </div>
+</div>
+
+<!-- Progress Card -->
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Progresso</h2>
+            <p class="card-subtitle" id="tempo-estimado">Aguardando comando...</p>
+        </div>
+        <span class="status status-{{ migracao.status }}" id="status-badge">
+            {{ migracao.status }}
+        </span>
+    </div>
+
+    <!-- Barra de progresso total do banco -->
+    <div style="margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px;">
+            <span style="font-size: 0.8rem; font-weight: 600; color: var(--color-dark);">Total do Banco</span>
+            <span style="font-size: 0.8rem; color: var(--color-gray);" id="total-db-info">
+                {% set proc = migracao.registros_processados or 0 %}
+                {% set tot = total_registros or 0 %}
+                {{ "{:,}".format(proc).replace(",", ".") }} / {{ "{:,}".format(tot).replace(",", ".") }} registros
+            </span>
+        </div>
+        {% set pct_total = (proc / tot * 100) if tot > 0 else 0 %}
+        <div class="progress-container" style="height: 22px; border-radius: 11px;">
+            <div class="progress-bar" id="total-db-bar" style="width: {{ pct_total }}%; border-radius: 11px; font-size: 0.75rem; justify-content: center;">
+                <span id="total-db-pct">{{ "%.1f"|format(pct_total) }}%</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Barra de progresso da faixa atual -->
+    <div style="margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px;">
+            <span style="font-size: 0.8rem; font-weight: 600; color: var(--color-dark);">Faixa Atual</span>
+            <span style="font-size: 0.8rem; color: var(--color-gray);" id="info-ids-verificados">0 / 0</span>
+        </div>
+        <div class="progress-container" style="height: 18px; border-radius: 9px;">
+            <div class="progress-bar" id="progress-bar" style="width: 0%; border-radius: 9px; font-size: 0.7rem; justify-content: center; background: var(--gradient-accent);">
+                <span id="progress-text">0%</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="progress-stats">
+        <div class="progress-stat">
+            <div class="progress-stat-value" id="info-percentual">0%</div>
+            <div class="progress-stat-label">Faixa Completa</div>
+        </div>
+        <div class="progress-stat">
+            <div class="progress-stat-value" id="info-total-db-pct-stat">
+                {{ "%.1f"|format(pct_total) }}%
+            </div>
+            <div class="progress-stat-label">Total do Banco</div>
+        </div>
+        <div class="progress-stat">
+            <div class="progress-stat-value" id="info-velocidade">-</div>
+            <div class="progress-stat-label">Registros/min</div>
+        </div>
+    </div>
+</div>
+
+<!-- Controls Section -->
+<div class="controles-section animate-fade-in">
+    <div class="controles-grid">
+        <!-- Controle por Faixa de IDs -->
+        <div class="controle-card">
+            <h4>📋 Processamento por Faixa de IDs</h4>
+            <div class="form-text" style="margin-bottom: 8px;">Informe o ID inicial e final para verificar e importar.</div>
+            <div class="form-row" style="grid-template-columns: repeat(4, 1fr);">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-size: 0.75rem;">ID Inicial</label>
+                    <input type="number" 
+                           id="id-inicio" 
+                           class="form-control"
+                           value="1" 
+                           min="1">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-size: 0.75rem;">ID Final</label>
+                    <input type="number" 
+                           id="id-fim" 
+                           class="form-control"
+                           value="{{ migracao.id_maximo or '' }}" 
+                           min="1">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-size: 0.75rem;">Tamanho do Lote</label>
+                    <input type="number"
+                           id="tamanho-lote"
+                           class="form-control"
+                           value="500"
+                           min="1"
+                           max="5000"
+                           title="Quantos registros são copiados/gravados por vez (staging em temp)">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-size: 0.75rem;">Delay entre lotes (s)</label>
+                    <input type="number" 
+                           id="delay-segundos" 
+                           class="form-control"
+                           value="1" 
+                           min="0" 
+                           max="10">
+                </div>
+            </div>
+            <div id="faixa-info" style="font-size: 0.75rem; color: var(--color-gray); margin-top: 4px;"></div>
+            <div class="btn-group mt-2">
+                <button type="button" id="btn-automatico" class="btn btn-success" onclick="processarFaixa()">
+                    <span>▶️</span>
+                    <span>Iniciar</span>
+                </button>
+                <button type="button" id="btn-parar" class="btn btn-danger" onclick="pararProcessamento()" disabled>
+                    <span>⏹️</span>
+                    <span>Parar</span>
+                </button>
+                <button type="button" id="btn-reprocessar" class="btn btn-warning" onclick="reprocessarErros()">
+                    <span>🔄</span>
+                    <span>Reprocessar Erros</span>
+                </button>
+            </div>
+        </div>
+        
+        <!-- Controle Manual -->
+        <div class="controle-card">
+            <h4>🎯 Processamento Manual</h4>
+            <div style="display: flex; gap: 12px; align-items: flex-end;">
+                <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                    <label class="form-label" style="font-size: 0.75rem;">ID do Registro</label>
+                    <input type="text" 
+                           id="registro-manual" 
+                           class="form-control"
+                           placeholder="Ex: 12345">
+                </div>
+                <button type="button" class="btn btn-primary" onclick="processarRegistroManual()">
+                    <span>⚡</span>
+                    <span>Processar</span>
+                </button>
+            </div>
+            <div class="form-text mt-2">
+                Processa um registro específico pelo ID (verifica, insere ou atualiza)
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Registros Grid -->
+<div class="card animate-fade-in">
+    <div class="lotes-header">
+        <div>
+            <h2 class="card-title">Registros Processados</h2>
+            <p class="card-subtitle" id="registros-subtitle">Os registros aparecem à medida que são verificados</p>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <span id="registros-loading-indicator" style="display: none; color: var(--color-primary); font-weight: 600;">
+                <span class="spinner spinner-sm" aria-hidden="true"></span>
+                <span id="registros-loading-text">Carregando...</span>
+            </span>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn active" data-status="" onclick="filtrarRegistros('')">Todos</button>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="inserido" onclick="filtrarRegistros('inserido')">Inseridos</button>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="atualizado" onclick="filtrarRegistros('atualizado')">Atualizados</button>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="ja_existe" onclick="filtrarRegistros('ja_existe')">Já Existem</button>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="nao_encontrado" onclick="filtrarRegistros('nao_encontrado')">Não Encontrados</button>
+            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="erro" onclick="filtrarRegistros('erro')">Com Erro</button>
+        </div>
+    </div>
+    <div style="display: flex; gap: 16px; font-size: 0.75rem; padding: 0 16px 8px; align-items: center; flex-wrap: wrap;">
+        <span style="display: flex; align-items: center; gap: 6px;">
+            <span style="width: 12px; height: 12px; background: var(--color-primary); border-radius: 4px;"></span>
+            Inserido
+        </span>
+        <span style="display: flex; align-items: center; gap: 6px;">
+            <span style="width: 12px; height: 12px; background: var(--color-accent); border-radius: 4px;"></span>
+            Já Existe
+        </span>
+        <span style="display: flex; align-items: center; gap: 6px;">
+            <span style="width: 12px; height: 12px; background: var(--color-yellow); border-radius: 4px;"></span>
+            Atualizado
+        </span>
+        <span style="display: flex; align-items: center; gap: 6px;">
+            <span style="width: 12px; height: 12px; background: #D1D5DB; border-radius: 4px;"></span>
+            Não Encontrado
+        </span>
+        <span style="display: flex; align-items: center; gap: 6px;">
+            <span style="width: 12px; height: 12px; background: var(--color-red, #EF4444); border-radius: 4px;"></span>
+            Com Erro
+        </span>
+    </div>
+    
+    <div class="lotes-grid" id="registros-grid">
+        <!-- Registros renderizados dinamicamente via JavaScript -->
+    </div>
+    <div id="registros-paginacao" style="padding: 12px 16px; text-align: center; display: none;">
+        <button type="button" class="btn btn-sm btn-outline" onclick="carregarMaisRegistros()">Carregar mais registros</button>
+        <span id="registros-info" style="margin-left: 12px; font-size: 0.75rem; color: #6B7280;"></span>
+    </div>
+</div>
+
+<!-- Log Card -->
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <h2 class="card-title">Log de Operações</h2>
+        <button type="button" class="btn btn-sm btn-outline" onclick="limparLog()">Limpar Log</button>
+    </div>
+    <div class="log-container" id="log-container">
+        <div class="log-entry">
+            <span class="log-time" id="log-initial-time"></span>
+            <span class="log-info">Sistema iniciado. Aguardando comando...</span>
+        </div>
+    </div>
+</div>
+
+<a href="{{ url_for('dashboard') }}" class="btn-back" style="margin-top: 24px; display: inline-flex;">
+    ← Voltar para o Dashboard
+</a>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let processamentoAtivo = false;
+let refreshAtivo = false;
+const pageConfig = document.getElementById('controle-page');
+const migracaoId = Number(pageConfig?.dataset?.migracaoId || 0);
+let totalRegistros = Number(pageConfig?.dataset?.totalRegistros || 0);
+const idMaximo = Number(pageConfig?.dataset?.idMaximo || 0);
+let horaInicio = null;
+let registrosCarregados = [];
+let paginaAtual = 1;
+let filtroStatus = '';
+const PER_PAGE = 500;
+
+document.addEventListener('DOMContentLoaded', function() {
+    const el = document.getElementById('log-initial-time');
+    if (el) el.textContent = getHoraAtual();
+
+    // Preencher ID fim com o ID máximo
+    const idFimInput = document.getElementById('id-fim');
+    if (idFimInput && idMaximo > 0) {
+        idFimInput.max = idMaximo;
+        idFimInput.placeholder = `Máx: ${idMaximo.toLocaleString('pt-BR')}`;
+        if (!idFimInput.value) {
+            idFimInput.value = idMaximo;
+        }
+    }
+    const idInicioInput = document.getElementById('id-inicio');
+    if (idInicioInput && idMaximo > 0) {
+        idInicioInput.max = idMaximo;
+    }
+
+    // Validar faixa em tempo real
+    document.getElementById('id-inicio')?.addEventListener('input', validarFaixa);
+    document.getElementById('id-fim')?.addEventListener('input', validarFaixa);
+
+    carregarRegistros();
+});
+
+function validarFaixa() {
+    const inicio = parseInt(document.getElementById('id-inicio').value, 10) || 0;
+    const fim = parseInt(document.getElementById('id-fim').value, 10) || 0;
+    const info = document.getElementById('faixa-info');
+    const btn = document.getElementById('btn-automatico');
+
+    if (!inicio || !fim) {
+        info.textContent = '';
+        btn.disabled = processamentoAtivo;
+        return;
+    }
+
+    const total = fim - inicio + 1;
+
+    if (fim < inicio) {
+        info.textContent = '⚠️ ID final deve ser maior ou igual ao inicial.';
+        info.style.color = 'var(--color-orange)';
+        btn.disabled = true;
+    } else if (idMaximo > 0 && fim > idMaximo) {
+        info.textContent = `⚠️ ID final (${fim}) excede o ID máximo da origem (${idMaximo.toLocaleString('pt-BR')}).`;
+        info.style.color = 'var(--color-orange)';
+        btn.disabled = true;
+    } else {
+        const tamanhoLote = parseInt(document.getElementById('tamanho-lote').value, 10) || 500;
+        const totalLotes = Math.ceil(total / tamanhoLote);
+        info.textContent = `${total.toLocaleString('pt-BR')} IDs em ${totalLotes.toLocaleString('pt-BR')} lote(s) de ${tamanhoLote}.`;
+        info.style.color = 'var(--color-gray)';
+        btn.disabled = processamentoAtivo;
+    }
+}
+
+function getHoraAtual() {
+    return new Date().toLocaleTimeString('pt-BR', { hour12: false });
+}
+
+function adicionarLog(mensagem, tipo = 'info') {
+    const container = document.getElementById('log-container');
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `
+        <span class="log-time">${getHoraAtual()}</span>
+        <span class="log-${tipo}">${mensagem}</span>
+    `;
+    container.insertBefore(entry, container.firstChild);
+    while (container.children.length > 100) {
+        container.removeChild(container.lastChild);
+    }
+}
+
+function limparLog() {
+    document.getElementById('log-container').innerHTML = `
+        <div class="log-entry">
+            <span class="log-time">${getHoraAtual()}</span>
+            <span class="log-info">Log limpo pelo usuário</span>
+        </div>
+    `;
+}
+
+// ========== Carregamento de Registros ==========
+
+async function carregarRegistros(append = false) {
+    if (!append) {
+        paginaAtual = 1;
+        registrosCarregados = [];
+    }
+
+    const indicator = document.getElementById('registros-loading-indicator');
+    if (indicator) indicator.style.display = 'inline-flex';
+
+    try {
+        let url = `/api/registros/${migracaoId}?page=${paginaAtual}&per_page=${PER_PAGE}`;
+        if (filtroStatus) url += `&status=${filtroStatus}`;
+
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.registros) {
+            if (append) {
+                registrosCarregados = registrosCarregados.concat(data.registros);
+            } else {
+                registrosCarregados = data.registros;
+            }
+            renderizarGrid();
+        }
+
+        if (data.stats) {
+            atualizarStats(data.stats);
+        }
+
+        // Mostrar/ocultar paginação
+        const pag = document.getElementById('registros-paginacao');
+        const info = document.getElementById('registros-info');
+        const totalFiltrado = data.stats?.total || 0;
+
+        if (registrosCarregados.length < totalFiltrado && !filtroStatus) {
+            pag.style.display = 'block';
+            info.textContent = `Exibindo ${registrosCarregados.length} de ${totalFiltrado.toLocaleString('pt-BR')} registros`;
+        } else if (filtroStatus && data.registros && data.registros.length >= PER_PAGE) {
+            pag.style.display = 'block';
+            info.textContent = `Exibindo ${registrosCarregados.length} registros (filtro: ${filtroStatus})`;
+        } else {
+            pag.style.display = 'none';
+        }
+    } catch (e) {
+        console.error('Erro ao carregar registros:', e);
+    } finally {
+        if (indicator) indicator.style.display = 'none';
+    }
+}
+
+function carregarMaisRegistros() {
+    paginaAtual++;
+    carregarRegistros(true);
+}
+
+function filtrarRegistros(status) {
+    filtroStatus = status;
+    document.querySelectorAll('.filtro-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.status === status);
+    });
+    carregarRegistros();
+}
+
+function renderizarGrid() {
+    const grid = document.getElementById('registros-grid');
+    grid.innerHTML = '';
+
+    const statusClassMap = {
+        'inserido': 'lote-inserido',
+        'ja_existe': 'lote-ja-existe',
+        'atualizado': 'lote-atualizado',
+        'nao_encontrado': 'lote-nao-encontrado',
+        'erro': 'lote-erro',
+        'processado': 'lote-processado',
+        'pendente': 'lote-pendente',
+    };
+
+    const statusLabelMap = {
+        'inserido': 'Inserido',
+        'ja_existe': 'Já existe',
+        'atualizado': 'Atualizado',
+        'nao_encontrado': 'Não encontrado',
+        'erro': 'Erro',
+        'processado': 'Processado',
+        'pendente': 'Pendente',
+    };
+
+    for (const reg of registrosCarregados) {
+        const div = document.createElement('div');
+        const statusClass = statusClassMap[reg.status] || 'lote-pendente';
+        div.className = `lote-item ${statusClass}`;
+        div.dataset.chave = reg.chave_valor;
+        div.textContent = reg.chave_valor;
+        div.title = reg.status === 'erro'
+            ? `Erro: ${reg.erro_msg || 'desconhecido'}`
+            : `ID: ${reg.chave_valor} — ${statusLabelMap[reg.status] || reg.status}`;
+        div.addEventListener('click', () => selecionarRegistro(reg.chave_valor));
+        grid.appendChild(div);
+    }
+}
+
+function atualizarStats(stats) {
+    const inseridosEl = document.getElementById('stat-inseridos');
+    if (inseridosEl) inseridosEl.textContent = (stats.inseridos || 0).toLocaleString('pt-BR');
+
+    const atualizadosEl = document.getElementById('stat-atualizados');
+    if (atualizadosEl) atualizadosEl.textContent = (stats.atualizados || 0).toLocaleString('pt-BR');
+
+    const ultimoEl = document.getElementById('stat-ultimo-inserido');
+    if (ultimoEl) {
+        ultimoEl.textContent = stats.ultimo_inserido
+            ? `Último: #${stats.ultimo_inserido}`
+            : 'Novos registros importados';
+    }
+
+    const jaExistemEl = document.getElementById('stat-ja-existem');
+    if (jaExistemEl) jaExistemEl.textContent = (stats.ja_existem || 0).toLocaleString('pt-BR');
+
+    const naoEncontradosEl = document.getElementById('stat-nao-encontrados');
+    if (naoEncontradosEl) naoEncontradosEl.textContent = (stats.nao_encontrados || 0).toLocaleString('pt-BR');
+
+    const erroEl = document.getElementById('stat-com-erro');
+    if (erroEl) erroEl.textContent = (stats.com_erro || 0).toLocaleString('pt-BR');
+
+    // Atualizar barra de progresso total do banco
+    const processados = (stats.inseridos || 0) + (stats.atualizados || 0) + (stats.ja_existem || 0) + (stats.nao_encontrados || 0);
+    const pctTotal = totalRegistros > 0 ? (processados / totalRegistros * 100) : 0;
+
+    const totalDbBar = document.getElementById('total-db-bar');
+    if (totalDbBar) totalDbBar.style.width = Math.min(100, pctTotal) + '%';
+
+    const totalDbPct = document.getElementById('total-db-pct');
+    if (totalDbPct) totalDbPct.textContent = pctTotal.toFixed(1) + '%';
+
+    const totalDbInfo = document.getElementById('total-db-info');
+    if (totalDbInfo) totalDbInfo.textContent = `${processados.toLocaleString('pt-BR')} / ${totalRegistros.toLocaleString('pt-BR')} registros`;
+
+    const totalDbPctStat = document.getElementById('info-total-db-pct-stat');
+    if (totalDbPctStat) totalDbPctStat.textContent = pctTotal.toFixed(1) + '%';
+}
+
+function selecionarRegistro(chave) {
+    document.getElementById('registro-manual').value = chave;
+}
+
+// ========== Refresh Polling (carregamento de registros) ==========
+
+let pollingRefreshId = null;
+
+function iniciarPollingRefresh() {
+    if (pollingRefreshId) return;
+    refreshAtivo = true;
+    const indicator = document.getElementById('registros-loading-indicator');
+    if (indicator) indicator.style.display = 'inline-flex';
+    pollingRefreshId = setInterval(verificarStatusRefresh, 2000);
+    verificarStatusRefresh();
+}
+
+function pararPollingRefresh() {
+    if (pollingRefreshId) {
+        clearInterval(pollingRefreshId);
+        pollingRefreshId = null;
+    }
+    refreshAtivo = false;
+    const indicator = document.getElementById('registros-loading-indicator');
+    if (indicator) indicator.style.display = 'none';
+}
+
+async function verificarStatusRefresh() {
+    try {
+        const response = await fetch(`/api/background/status?migracao_id=${migracaoId}&tipo=refresh`);
+        const job = await parseJsonResponse(response);
+
+        if (!job || job.status === 'inativo') {
+            pararPollingRefresh();
+            return;
+        }
+
+        const loadingText = document.getElementById('registros-loading-text');
+
+        if (job.status === 'processando' || job.status === 'iniciando') {
+            if (loadingText) loadingText.textContent = 'Preparando migração...';
+        } else if (job.status === 'concluido') {
+            adicionarLog(`✓ ${job.mensagem || 'Migração preparada com sucesso.'}`, 'success');
+            pararPollingRefresh();
+            try {
+                await fetch('/api/background/limpar', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ migracao_id: migracaoId, tipo: 'refresh' })
+                });
+            } catch (_) {}
+            atualizarProgresso(true);
+            carregarRegistros();
+        } else if (job.status === 'erro') {
+            adicionarLog(`✗ ${job.mensagem || 'Erro ao preparar migração.'}`, 'error');
+            pararPollingRefresh();
+        } else if (job.status === 'cancelado') {
+            adicionarLog(`⏹️ ${job.mensagem || 'Preparação cancelada.'}`, 'warning');
+            pararPollingRefresh();
+        }
+    } catch (_) {}
+}
+
+// ========== Utilitários ==========
+
+function calcularVelocidade() {
+    if (!horaInicio) return '-';
+    const agora = new Date();
+    const minutos = (agora - horaInicio) / 60000;
+    if (minutos < 0.01) return '-';
+    const inseridos = parseInt(document.getElementById('stat-inseridos')?.textContent?.replace(/\./g, '') || 0, 10);
+    const velocidade = Math.round(inseridos / minutos);
+    return velocidade > 0 ? velocidade.toLocaleString('pt-BR') : '-';
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function parseJsonResponse(response) {
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+        const text = await response.text();
+        throw new Error(text || 'Resposta inválida do servidor.');
+    }
+    return response.json();
+}
+
+function registrarErroApi(prefixo, payload) {
+    const mensagem = payload?.mensagem || payload?.erro || 'Erro desconhecido';
+    adicionarLog(`${prefixo}: ${mensagem}`, 'error');
+}
+
+// ========== Processamento Manual ==========
+
+async function processarRegistroManual() {
+    const chave = document.getElementById('registro-manual').value.trim();
+    if (!chave) {
+        adicionarLog('⚠️ Informe o ID do registro', 'warning');
+        return;
+    }
+    await processarRegistro(chave);
+}
+
+async function processarRegistro(chave) {
+    const gridItem = document.querySelector(`[data-chave="${chave}"]`);
+    if (gridItem) {
+        gridItem.classList.remove('lote-pendente', 'lote-inserido', 'lote-ja-existe', 'lote-nao-encontrado', 'lote-erro', 'lote-atualizado', 'lote-processado');
+        gridItem.classList.add('lote-atual');
+    }
+
+    if (!horaInicio) horaInicio = new Date();
+    adicionarLog(`Processando registro ${chave}...`, 'info');
+
+    try {
+        const response = await fetch('/api/processar-registro', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                migracao_id: migracaoId,
+                chave_valor: chave
+            })
+        });
+
+        const result = await parseJsonResponse(response);
+        const mensagem = result.mensagem || '';
+
+        if (response.ok && result.status === 'sucesso') {
+            let statusClass = 'lote-inserido';
+            if (mensagem.includes('ja_existe')) statusClass = 'lote-ja-existe';
+            else if (mensagem.includes('atualizado')) statusClass = 'lote-atualizado';
+
+            adicionarLog(`✓ ${mensagem}`, 'success');
+            if (gridItem) {
+                gridItem.classList.remove('lote-atual');
+                gridItem.classList.add(statusClass);
+            }
+            if (result.progresso) atualizarUI(result.progresso);
+            carregarRegistros();
+            return true;
+        } else if (result.status === 'nao_encontrado') {
+            adicionarLog(`○ ${mensagem}`, 'info');
+            if (gridItem) {
+                gridItem.classList.remove('lote-atual');
+                gridItem.classList.add('lote-nao-encontrado');
+            }
+            carregarRegistros();
+            return true;
+        }
+
+        registrarErroApi(`✗ Registro ${chave}`, result);
+        if (gridItem) {
+            gridItem.classList.remove('lote-atual');
+            gridItem.classList.add('lote-erro');
+        }
+        return false;
+    } catch (error) {
+        adicionarLog(`✗ Registro ${chave}: Erro de conexão - ${error.message}`, 'error');
+        if (gridItem) {
+            gridItem.classList.remove('lote-atual');
+            gridItem.classList.add('lote-erro');
+        }
+        return false;
+    }
+}
+
+// ========== Processamento por Faixa ==========
+
+async function processarFaixa() {
+    if (processamentoAtivo) return;
+
+    const idInicio = parseInt(document.getElementById('id-inicio').value, 10);
+    const idFim = parseInt(document.getElementById('id-fim').value, 10);
+    const tamanhoLote = parseInt(document.getElementById('tamanho-lote').value, 10) || 500;
+    const delaySegundos = parseInt(document.getElementById('delay-segundos').value, 10) || 1;
+
+    if (!idInicio || !idFim) {
+        adicionarLog('⚠️ Informe o ID inicial e o ID final.', 'warning');
+        return;
+    }
+
+    if (idFim < idInicio) {
+        adicionarLog('⚠️ O ID final deve ser maior ou igual ao ID inicial.', 'warning');
+        return;
+    }
+
+    if (tamanhoLote <= 0) {
+        adicionarLog('⚠️ O tamanho do lote deve ser maior que zero.', 'warning');
+        return;
+    }
+
+    const total = idFim - idInicio + 1;
+    if (idMaximo > 0 && idFim > idMaximo) {
+        adicionarLog(`⚠️ ID final (${idFim}) excede o ID máximo da origem (${idMaximo}).`, 'warning');
+        return;
+    }
+
+    const totalLotes = Math.ceil(total / tamanhoLote);
+    adicionarLog(`🚀 Iniciando processamento de ID ${idInicio} até ${idFim} (${total} IDs, ${totalLotes} lote(s) de ${tamanhoLote})`, 'info');
+
+    try {
+        const response = await fetch('/api/background/iniciar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                migracao_id: migracaoId,
+                id_inicio: idInicio,
+                id_fim: idFim,
+                tamanho_lote: tamanhoLote,
+                delay_segundos: delaySegundos,
+                apenas_erros: false
+            })
+        });
+
+        const result = await parseJsonResponse(response);
+
+        if (response.ok && result.status === 'sucesso') {
+            processamentoAtivo = true;
+            horaInicio = horaInicio || new Date();
+            document.getElementById('btn-automatico').disabled = true;
+            document.getElementById('btn-reprocessar').disabled = true;
+            document.getElementById('btn-parar').disabled = false;
+            adicionarLog('✓ Processamento em segundo plano iniciado.', 'success');
+            iniciarPollingBackground();
+        } else {
+            registrarErroApi('✗ Iniciar processamento', result);
+        }
+    } catch (error) {
+        adicionarLog(`✗ Erro ao iniciar: ${error.message}`, 'error');
+    }
+}
+
+async function reprocessarErros() {
+    if (processamentoAtivo) return;
+
+    const tamanhoLote = parseInt(document.getElementById('tamanho-lote').value, 10) || 500;
+    adicionarLog('🔄 Reprocessando registros com erro...', 'info');
+
+    try {
+        const response = await fetch('/api/background/iniciar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                migracao_id: migracaoId,
+                apenas_erros: true,
+                tamanho_lote: tamanhoLote,
+                delay_segundos: parseInt(document.getElementById('delay-segundos').value, 10) || 1
+            })
+        });
+
+        const result = await parseJsonResponse(response);
+
+        if (response.ok && result.status === 'sucesso') {
+            processamentoAtivo = true;
+            horaInicio = horaInicio || new Date();
+            document.getElementById('btn-automatico').disabled = true;
+            document.getElementById('btn-reprocessar').disabled = true;
+            document.getElementById('btn-parar').disabled = false;
+            adicionarLog('✓ Reprocessamento em segundo plano iniciado.', 'success');
+            iniciarPollingBackground();
+        } else {
+            registrarErroApi('✗ Reprocessar', result);
+        }
+    } catch (error) {
+        adicionarLog(`✗ Erro: ${error.message}`, 'error');
+    }
+}
+
+// ========== Background Polling ==========
+
+let pollingBackgroundId = null;
+
+function iniciarPollingBackground() {
+    if (pollingBackgroundId) return;
+    pollingBackgroundId = setInterval(verificarStatusBackground, 3000);
+    verificarStatusBackground();
+}
+
+function pararPollingBackground() {
+    if (pollingBackgroundId) {
+        clearInterval(pollingBackgroundId);
+        pollingBackgroundId = null;
+    }
+}
+
+async function verificarStatusBackground() {
+    try {
+        const response = await fetch(`/api/background/status?migracao_id=${migracaoId}&tipo=migracao`);
+        const job = await parseJsonResponse(response);
+
+        if (!job || job.status === 'inativo') {
+            finalizarModoBackground('Nenhum processamento ativo.', 'info');
+            return;
+        }
+
+        if (job.ultimo_progresso) {
+            atualizarUI(job.ultimo_progresso);
+        }
+
+        // Atualizar grid a cada polling
+        carregarRegistros();
+
+        // Atualizar progresso da faixa
+        const idsVerificados = job.ids_verificados || 0;
+        const totalFaixa = job.total_faixa || 1;
+        const percentFaixa = Math.round((idsVerificados / totalFaixa) * 100);
+
+        document.getElementById('progress-bar').style.width = percentFaixa + '%';
+        document.getElementById('progress-text').textContent = percentFaixa + '%';
+        document.getElementById('info-percentual').textContent = percentFaixa + '%';
+        document.getElementById('info-ids-verificados').textContent = `${idsVerificados.toLocaleString('pt-BR')} / ${totalFaixa.toLocaleString('pt-BR')}`;
+        document.getElementById('info-velocidade').textContent = calcularVelocidade();
+
+        const partes = [];
+        if (job.registros_inseridos) partes.push(`${job.registros_inseridos} inserido(s)`);
+        if (job.registros_ja_existem) partes.push(`${job.registros_ja_existem} já existe(m)`);
+        if (job.registros_nao_encontrados) partes.push(`${job.registros_nao_encontrados} não encontrado(s)`);
+        if (job.registros_com_erro?.length) partes.push(`${job.registros_com_erro.length} erro(s)`);
+        const loteInfo = job.tamanho_lote ? ` (lotes de ${job.tamanho_lote})` : '';
+        const info = `${partes.join(', ') || 'processando...'}${loteInfo}`;
+        document.getElementById('tempo-estimado').textContent = `⏳ ${job.mensagem || 'Processando...'} — ${info}`;
+
+        if (job.status === 'concluido') {
+            adicionarLog(`✓ ${job.mensagem || 'Processamento concluído.'}`, 'success');
+            if (job.registros_com_erro && job.registros_com_erro.length > 0) {
+                adicionarLog(`⚠️ ${job.registros_com_erro.length} registro(s) com erro.`, 'warning');
+            }
+            finalizarModoBackground(null, null);
+            limparJobBackground();
+        } else if (job.status === 'erro') {
+            adicionarLog(`✗ ${job.mensagem || 'Erro no processamento.'}`, 'error');
+            finalizarModoBackground(null, null);
+        } else if (job.status === 'cancelado') {
+            adicionarLog(`⏹️ ${job.mensagem || 'Processamento cancelado.'}`, 'warning');
+            finalizarModoBackground(null, null);
+        }
+    } catch (error) {}
+}
+
+function finalizarModoBackground(mensagem, tipo) {
+    pararPollingBackground();
+    processamentoAtivo = false;
+    document.getElementById('btn-automatico').disabled = false;
+    document.getElementById('btn-reprocessar').disabled = false;
+    document.getElementById('btn-parar').disabled = true;
+    validarFaixa();
+    if (mensagem) adicionarLog(mensagem, tipo);
+    atualizarProgresso(true);
+    carregarRegistros();
+}
+
+async function limparJobBackground() {
+    try {
+        await fetch('/api/background/limpar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ migracao_id: migracaoId })
+        });
+    } catch (_) {}
+}
+
+async function pararProcessamento() {
+    adicionarLog('⏹️ Solicitação de parada enviada. O lote atual será concluído.', 'warning');
+    document.getElementById('btn-parar').disabled = true;
+
+    try {
+        const response = await fetch('/api/background/parar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ migracao_id: migracaoId })
+        });
+        const result = await parseJsonResponse(response);
+        if (result.status === 'sucesso') {
+            adicionarLog('✓ Parada solicitada ao servidor.', 'info');
+        }
+    } catch (error) {
+        adicionarLog(`✗ Erro na parada: ${error.message}`, 'error');
+    }
+}
+
+// ========== Atualização de UI ==========
+
+function atualizarUI(progresso) {
+    if (!progresso || typeof progresso !== 'object') return;
+
+    const totalEl = document.getElementById('info-id-maximo');
+    if (totalEl && progresso.id_maximo) {
+        totalEl.textContent = Number(progresso.id_maximo).toLocaleString('pt-BR');
+    }
+
+    const statusEl = document.getElementById('status-badge');
+    if (statusEl) {
+        statusEl.textContent = progresso.status;
+        statusEl.className = 'status status-' + progresso.status;
+    }
+
+    if (progresso.tempo_estimado_minutos && progresso.status !== 'concluido') {
+        document.getElementById('tempo-estimado').textContent = `⏱️ Tempo estimado restante: ~${progresso.tempo_estimado_minutos} minutos`;
+    } else if (progresso.status === 'concluido') {
+        document.getElementById('tempo-estimado').textContent = '✅ Migração concluída com sucesso!';
+        document.getElementById('tempo-estimado').style.color = 'var(--status-success)';
+    }
+}
+
+async function atualizarProgresso(registrarNoLog = false) {
+    try {
+        const response = await fetch(`/api/progresso/${migracaoId}`);
+        const progresso = await parseJsonResponse(response);
+
+        if (!response.ok || progresso.status === 'erro' || progresso.erro) {
+            if (registrarNoLog) registrarErroApi('✗ Progresso', progresso);
+            return;
+        }
+
+        atualizarUI(progresso);
+
+        if (progresso.total_registros) {
+            totalRegistros = progresso.total_registros;
+        }
+    } catch (error) {
+        if (registrarNoLog) adicionarLog(`✗ Erro ao atualizar progresso: ${error.message}`, 'error');
+    }
+}
+
+// Auto-refresh progresso a cada 5 segundos
+setInterval(() => {
+    if (!processamentoAtivo) atualizarProgresso();
+}, 5000);
+
+atualizarProgresso(true);
+
+// Recalcular info da faixa quando o tamanho do lote mudar
+document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('tamanho-lote')?.addEventListener('input', validarFaixa);
+});
+
+// Verificar jobs existentes ao carregar a página
+(async function verificarJobExistente() {
+    try {
+        const response = await fetch(`/api/background/status?migracao_id=${migracaoId}&tipo=migracao`);
+        const job = await parseJsonResponse(response);
+        if (job && (job.status === 'processando' || job.status === 'iniciando')) {
+            processamentoAtivo = true;
+            horaInicio = horaInicio || new Date();
+            document.getElementById('btn-automatico').disabled = true;
+            document.getElementById('btn-reprocessar').disabled = true;
+            document.getElementById('btn-parar').disabled = false;
+            adicionarLog('🔄 Processamento em segundo plano detectado. Acompanhando progresso...', 'info');
+            iniciarPollingBackground();
+        }
+    } catch (_) {}
+
+    try {
+        const response = await fetch(`/api/background/status?migracao_id=${migracaoId}&tipo=refresh`);
+        const job = await parseJsonResponse(response);
+        if (job && (job.status === 'processando' || job.status === 'iniciando')) {
+            adicionarLog('🔄 Preparação da migração em andamento...', 'info');
+            iniciarPollingRefresh();
+        }
+    } catch (_) {}
+})();
+</script>
+{% endblock %}

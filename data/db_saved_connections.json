@@ -1,0 +1,12 @@
+[
+  {
+    "id": 3,
+    "profile_name": "integrash",
+    "host": "localhost",
+    "database": "isivitaedb_hm",
+    "user": "postgres",
+    "password": "gAAAAABqqd2dUtUYJjndcfNuBzMrrC2BluD5QtAYoRhZPkW4VPtD7xgsnOhgbjLAGEo4aM6SVyJf5MfvYHj9Ysm0UZwb3IiOmg==",
+    "port": 5432,
+    "schema_destino": "integra_local"
+  }
+]

@@ -1,0 +1,314 @@
+<!-- templates/nova_migracao.html -->
+{% extends "base.html" %}
+
+{% block title %}Nova Migração - Sistema de Migração{% endblock %}
+
+{% block content %}
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">{{ 'Editar Migração #' ~ migracao_edicao.id if migracao_edicao else 'Configurar Nova Migração' }}</h2>
+            <p class="card-subtitle">
+                {{ 'Ajuste a origem, o destino ou o campo chave — os totais são recalculados automaticamente.' if migracao_edicao else 'Preencha os dados para iniciar a importação' }}
+            </p>
+        </div>
+        <a href="{{ url_for('dashboard') }}" class="btn-back">← Voltar para o início</a>
+    </div>
+
+    <form method="POST" action="{{ url_for('nova_migracao') }}" id="nova-migracao-form">
+        <input type="hidden" name="migracao_id" value="{{ migracao_edicao.id if migracao_edicao else '' }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="tabela_origem">Tabela Origem (Foreign Table)</label>
+                <input type="text"
+                       id="tabela_origem"
+                       name="tabela_origem"
+                       class="form-control"
+                       placeholder="ex: v_paciente"
+                       value="{{ migracao_edicao.tabela_origem if migracao_edicao else '' }}"
+                       required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="tabela_destino">Tabela Destino</label>
+                <input type="text"
+                       id="tabela_destino"
+                       name="tabela_destino"
+                       class="form-control"
+                       placeholder="ex: t_paciente"
+                       value="{{ migracao_edicao.tabela_destino if migracao_edicao else '' }}"
+                       required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="campo_id">Campo ID (Chave Primária)</label>
+                <input type="text"
+                       id="campo_id"
+                       name="campo_id"
+                       class="form-control"
+                       placeholder="ex: isn_paciente"
+                       value="{{ migracao_edicao.campo_id if migracao_edicao else '' }}"
+                       required>
+                <div class="form-text">Se a tabela de destino ainda não existir, ela é criada automaticamente (mesma estrutura da origem) ao iniciar/salvar.</div>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="btn-group mt-2">
+                <button type="submit" class="btn btn-primary btn-lg" id="btn-iniciar-migracao">
+                    <span class="btn-label">{{ '💾 Salvar Alterações' if migracao_edicao else '🚀 Iniciar Migração' }}</span>
+                    <span class="btn-loading-content" hidden>
+                        <span class="spinner spinner-sm" aria-hidden="true"></span>
+                        <span>{{ 'Salvando alterações...' if migracao_edicao else 'Preparando migração...' }}</span>
+                    </span>
+                </button>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-outline">
+                    <span>Cancelar</span>
+                </a>
+            </div>
+        </div>
+    </form>
+
+    <div class="migration-progress-panel" id="migration-progress-panel" hidden>
+        <div class="progress-header">
+            <span id="migration-progress-label">Preparando leitura dos registros...</span>
+            <span id="migration-progress-value">0%</span>
+        </div>
+        <div class="progress-container migration-progress-container">
+            <div class="progress-bar" id="migration-progress-bar" data-progress="0"></div>
+        </div>
+        <div class="migration-progress-meta" id="migration-progress-meta">A leitura será executada agora porque você está criando a migração.</div>
+    </div>
+</div>
+
+<div class="card animate-fade-in" style="border-left: 4px solid var(--color-yellow);">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title" style="color: var(--color-orange);">Exemplos Rápidos</h2>
+            <p class="card-subtitle">Clique para preencher automaticamente com as tabelas da sua lista de controle</p>
+        </div>
+    </div>
+    
+    <div class="btn-group">
+        <button type="button" class="btn btn-success" onclick="preencherExemplo('admissao')">
+            <span>Admissão</span>
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('exame_solic')">
+            <span>Exame Solic.</span>
+        </button>
+        <button type="button" class="btn btn-warning" onclick="preencherExemplo('internacao')">
+            <span>Internação</span>
+        </button>
+        <button type="button" class="btn btn-primary" onclick="preencherExemplo('internacao_alta')">
+            <span>Internação Alta</span>
+        </button>
+        <button type="button" class="btn btn-success" onclick="preencherExemplo('internacao_leito')">
+            <span>Internação Leito</span>
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('paciente')">
+            <span>Paciente</span>
+        </button>
+        <button type="button" class="btn btn-warning" onclick="preencherExemplo('internacao_old')">
+            <span>Internação Old</span>
+        </button>
+        <button type="button" class="btn btn-primary" onclick="preencherExemplo('internacao_alta_old')">
+            <span>Internação Alta Old</span>
+        </button>
+        <button type="button" class="btn btn-success" onclick="preencherExemplo('internacao_atendimento')">
+            <span>Internação Atendimento</span>
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('internacao_leito_old')">
+            <span>Internação Leito Old</span>
+        </button>
+        <button type="button" class="btn btn-warning" onclick="preencherExemplo('marcacao')">
+            <span>Marcação</span>
+        </button>
+        <button type="button" class="btn btn-primary" onclick="preencherExemplo('exame_solic_old')">
+            <span>Exame Solic. Old</span>
+        </button>
+    </div>
+    <div class="form-text mt-2">Os exemplos usam os valores de origem, destino e chave exibidos na imagem enviada.</div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function preencherExemplo(tipo) {
+    const campos = {
+        admissao: {
+            origem: 'v_admissao',
+            destino: 't_admissao',
+            id: 'isn_admissao'
+        },
+        exame_solic: {
+            origem: 'v_exame_solic',
+            destino: 't_exame_solic',
+            id: 'isn_exame_solic'
+        },
+        internacao: {
+            origem: 'v_internacao',
+            destino: 't_internacao',
+            id: 'isn_internacao'
+        },
+        internacao_alta: {
+            origem: 'v_internacao_alta',
+            destino: 't_internacao_alta',
+            id: 'isn_internacao_alta'
+        },
+        internacao_leito: {
+            origem: 'v_internacao_leito',
+            destino: 't_internacao_leito',
+            id: 'isn_internacao_leito'
+        },
+        paciente: {
+            origem: 'v_paciente',
+            destino: 't_paciente',
+            id: 'isn_paciente'
+        },
+        internacao_old: {
+            origem: 'v_internacao_old',
+            destino: 't_internacao_old',
+            id: 'isn_internacao'
+        },
+        internacao_alta_old: {
+            origem: 'v_internacao_alta_old',
+            destino: 't_internacao_alta_old',
+            id: 'isn_internacao_alta'
+        },
+        internacao_atendimento: {
+            origem: 'v_internacao_atendimento',
+            destino: 't_internacao_atendimento',
+            id: 'isn_internacao_atendimento'
+        },
+        internacao_leito_old: {
+            origem: 'v_internacao_leito_old',
+            destino: 't_internacao_leito_old',
+            id: 'isn_internacao_leito'
+        },
+        marcacao: {
+            origem: 'v_marcacao',
+            destino: 't_marcacao',
+            id: 'isn_marcacao'
+        },
+        exame_solic_old: {
+            origem: 'v_exame_solic_old',
+            destino: 't_exame_solic_old',
+            id: 'isn_exame_solic'
+        }
+    };
+    
+    const dados = campos[tipo];
+    if (dados) {
+        document.getElementById('tabela_origem').value = dados.origem;
+        document.getElementById('tabela_destino').value = dados.destino;
+        document.getElementById('campo_id').value = dados.id;
+        
+        // Efeito visual
+        ['tabela_origem', 'tabela_destino', 'campo_id'].forEach(id => {
+            const el = document.getElementById(id);
+            el.style.borderColor = 'var(--color-yellow)';
+            setTimeout(() => el.style.borderColor = '', 500);
+        });
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    const form = document.getElementById('nova-migracao-form');
+    const submitButton = document.getElementById('btn-iniciar-migracao');
+    const submitLabel = submitButton.querySelector('.btn-label');
+    const submitLoading = submitButton.querySelector('.btn-loading-content');
+    const progressPanel = document.getElementById('migration-progress-panel');
+    const progressBar = document.getElementById('migration-progress-bar');
+    const progressLabel = document.getElementById('migration-progress-label');
+    const progressValue = document.getElementById('migration-progress-value');
+    const progressMeta = document.getElementById('migration-progress-meta');
+
+    const stages = [
+        { value: 18, label: 'Validando parâmetros...', meta: 'Conferindo tabelas informadas e a chave primária.' },
+        { value: 45, label: 'Normalizando relações...', meta: 'Verificando schema, tabela de origem e tabela de destino.' },
+        { value: 78, label: 'Lendo diferenças...', meta: 'Calculando os registros da migração solicitada.' },
+        { value: 95, label: 'Finalizando cadastro...', meta: 'Gravando a migração com a quantidade de registros encontrada.' }
+    ];
+
+    function setProgress(value, label, meta) {
+        const normalizedValue = Math.max(0, Math.min(100, value));
+        progressBar.style.width = normalizedValue + '%';
+        progressValue.textContent = normalizedValue + '%';
+        if (label) {
+            progressLabel.textContent = label;
+        }
+        if (meta) {
+            progressMeta.textContent = meta;
+        }
+    }
+
+    function setSubmittingState(isSubmitting) {
+        submitButton.disabled = isSubmitting;
+        submitButton.classList.toggle('is-loading', isSubmitting);
+        submitLabel.hidden = isSubmitting;
+        submitLoading.hidden = !isSubmitting;
+        progressPanel.hidden = !isSubmitting;
+    }
+
+    async function parseMigrationResponse(response) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            return response.json();
+        }
+
+        const text = await response.text();
+        return {
+            status: 'erro',
+            mensagem: text || 'Resposta inválida do servidor ao criar a migração.'
+        };
+    }
+
+    form.addEventListener('submit', async function (event) {
+        event.preventDefault();
+
+        setSubmittingState(true);
+        setProgress(4, 'Iniciando criação da migração...', 'Conectando ao banco e preparando a leitura dos lotes.');
+
+        let stageIndex = 0;
+        const stageTimer = window.setInterval(function () {
+            const stage = stages[Math.min(stageIndex, stages.length - 1)];
+            setProgress(stage.value, stage.label, stage.meta);
+            if (stageIndex < stages.length - 1) {
+                stageIndex += 1;
+            }
+        }, 700);
+
+        try {
+            const response = await fetch(form.action, {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: new FormData(form)
+            });
+
+            const payload = await parseMigrationResponse(response);
+
+            if (!response.ok || payload.status !== 'sucesso') {
+                throw new Error(payload.mensagem || 'Não foi possível iniciar a migração.');
+            }
+
+            setProgress(100, 'Leitura concluída.', payload.mensagem || 'Migração criada com sucesso.');
+
+            window.setTimeout(function () {
+                window.location.href = payload.redirect_url;
+            }, 500);
+        } catch (error) {
+            window.clearInterval(stageTimer);
+            setSubmittingState(false);
+            setProgress(0, 'Falha ao iniciar a migração.', error.message || 'Erro inesperado ao preparar os lotes.');
+            alert(error.message || 'Erro inesperado ao iniciar a migração.');
+            return;
+        }
+
+        window.clearInterval(stageTimer);
+    });
+});
+</script>
+{% endblock %}

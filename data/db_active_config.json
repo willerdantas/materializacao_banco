@@ -1,0 +1,13 @@
+{
+  "id": 3,
+  "profile_name": "integrash",
+  "host": "localhost",
+  "database": "isivitaedb_hm",
+  "user": "postgres",
+  "password": "gAAAAABqqd2ftaRDB_-Dg1TjLEsAOLjxunAy76fjMZnXOoprlEpFdCqPbGmVI72xxuzxAan8k8W5GR_tdQpOATWCz2JrRjMxMw==",
+  "port": 5432,
+  "schema_destino": "integra_local",
+  "connection_mode": "local",
+  "profile_id": 3,
+  "client_encoding": "WIN1252"
+}

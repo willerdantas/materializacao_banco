@@ -1,0 +1,554 @@
+{% extends "base.html" %}
+
+{% block title %}Agendar Importação{% endblock %}
+
+{% block content %}
+<div id="agendamento-page">
+    <div class="kpi-grid">
+        <div class="kpi-card primary">
+            <div class="kpi-label">Tabelas Configuradas</div>
+            <div class="kpi-value">{{ tabelas|length }}</div>
+            <div class="kpi-sublabel">Cadastradas no Agendar Importação</div>
+        </div>
+        <div class="kpi-card secondary">
+            <div class="kpi-label">Horários Ligados</div>
+            <div class="kpi-value">{{ tabelas|selectattr('status', 'equalto', 'ativa')|list|length }}</div>
+            <div class="kpi-sublabel">Disparam sozinhas no horário configurado</div>
+        </div>
+        <div class="kpi-card accent">
+            <div class="kpi-label">Horários Desligados</div>
+            <div class="kpi-value">{{ tabelas|selectattr('status', 'equalto', 'parada')|list|length }}</div>
+            <div class="kpi-sublabel">Só rodam com "Executar Agora"</div>
+        </div>
+    </div>
+
+    <div class="card animate-fade-in" style="border-left: 4px solid var(--color-primary);">
+        <div class="card-header">
+            <div>
+                <h2 class="card-title">O que é o Agendar Importação</h2>
+            </div>
+        </div>
+        <p class="form-text" style="padding: 0 16px 16px;">
+            Faz uma sincronização <strong>completa</strong> da tabela: compara a origem inteira com o
+            destino e faz <strong>insert</strong> (o que é novo), <strong>update</strong> (o que mudou) e
+            <strong>delete</strong> (o que sumiu da origem) — diferente da Importação Automática, que só
+            olha uma janela recente e nunca apaga nada. Roda nos horários que você configurar (até 4 por dia).
+        </p>
+    </div>
+
+    <!-- Cadastro / edição de tabela -->
+    <div class="card animate-fade-in" id="card-form-agendamento">
+        <div class="card-header">
+            <div>
+                <h2 class="card-title" id="form-agendamento-titulo">
+                    {{ 'Editar Tabela' if tabela_edicao else 'Nova Tabela para Agendar Importação' }}
+                </h2>
+                <p class="card-subtitle">Informe origem, destino, campo chave, tamanho do lote e de 1 a 4 horários.</p>
+            </div>
+            {% if tabela_edicao %}
+            <a href="{{ url_for('agendar_importacao') }}" class="btn btn-outline btn-sm">Cancelar edição</a>
+            {% endif %}
+        </div>
+
+        {% if not tabela_edicao %}
+        <div class="btn-group" id="agendamento-examples-bar" style="margin-bottom: 12px;">
+            {% for example in examples %}
+            <button type="button"
+                    class="btn btn-sm {% if loop.index0 % 3 == 0 %}btn-success{% elif loop.index0 % 3 == 1 %}btn-secondary{% else %}btn-warning{% endif %}"
+                    data-example-source="{{ example.origem }}"
+                    data-example-target="{{ example.destino }}"
+                    data-example-key="{{ example.campo_id }}">
+                + {{ example.label }}
+            </button>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <form method="POST" action="{{ url_for('agendar_importacao') }}" id="form-nova-tabela-agendamento">
+            <input type="hidden" name="tabela_id" value="{{ tabela_edicao.id if tabela_edicao else '' }}">
+            <div class="form-row form-row-single-line">
+                <div class="form-group">
+                    <label class="form-label">Migração Configurada</label>
+                    <select id="agendamento-select-migracao" class="form-control">
+                        <option value="">-- Selecionar --</option>
+                        {% for m in migracoes_disponiveis %}
+                        <option value="{{ loop.index0 }}"
+                                data-origem="{{ m.tabela_origem }}"
+                                data-destino="{{ m.tabela_destino }}"
+                                data-campo="{{ m.campo_id }}">
+                            #{{ m.id }} · {{ m.tabela_destino }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tabela Origem (Foreign Table)</label>
+                    <input type="text" name="tabela_origem" id="agendamento-new-source" class="form-control" placeholder="v_paciente" value="{{ tabela_edicao.tabela_origem if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tabela Destino</label>
+                    <input type="text" name="tabela_destino" id="agendamento-new-target" class="form-control" placeholder="t_paciente" value="{{ tabela_edicao.tabela_destino if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Campo Chave</label>
+                    <input type="text" name="campo_id" id="agendamento-new-key" class="form-control" placeholder="isn_paciente" value="{{ tabela_edicao.campo_id if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tamanho do Lote</label>
+                    <input type="number" name="tamanho_lote" class="form-control" value="{{ tabela_edicao.tamanho_lote if tabela_edicao else 500 }}" min="1" max="5000">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="font-size: 0.75rem;">Horário 1</label>
+                    <input type="time" name="horario_1" class="form-control" value="{{ (tabela_edicao.horario_1|string)[:5] if tabela_edicao and tabela_edicao.horario_1 else '' }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="font-size: 0.75rem;">Horário 2</label>
+                    <input type="time" name="horario_2" class="form-control" value="{{ (tabela_edicao.horario_2|string)[:5] if tabela_edicao and tabela_edicao.horario_2 else '' }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="font-size: 0.75rem;">Horário 3</label>
+                    <input type="time" name="horario_3" class="form-control" value="{{ (tabela_edicao.horario_3|string)[:5] if tabela_edicao and tabela_edicao.horario_3 else '' }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="font-size: 0.75rem;">Horário 4</label>
+                    <input type="time" name="horario_4" class="form-control" value="{{ (tabela_edicao.horario_4|string)[:5] if tabela_edicao and tabela_edicao.horario_4 else '' }}">
+                </div>
+            </div>
+            <div class="form-text">
+                Se a tabela de destino ainda não existir, ela é criada automaticamente (mesma estrutura da origem).
+                Informe pelo menos 1 horário — os que ficarem em branco simplesmente não disparam.
+            </div>
+            <div class="btn-group mt-2">
+                <button type="submit" class="btn btn-primary">
+                    {{ 'Salvar Alterações' if tabela_edicao else '+ Adicionar Tabela' }}
+                </button>
+                {% if tabela_edicao %}
+                <a href="{{ url_for('agendar_importacao') }}" class="btn btn-outline">Cancelar</a>
+                {% endif %}
+            </div>
+        </form>
+    </div>
+
+    <!-- Lista de tabelas configuradas -->
+    <div class="card animate-fade-in">
+        <div class="card-header">
+            <div>
+                <h2 class="card-title">Tabelas Configuradas</h2>
+                <p class="card-subtitle">Iniciar liga os horários enquanto esta aba estiver aberta.</p>
+            </div>
+            {% if tabelas %}
+            <div class="btn-group">
+                <button type="button" id="btn-iniciar-todas" class="btn btn-success btn-sm">▶️ Iniciar Todas</button>
+                <button type="button" id="btn-parar-todas" class="btn btn-danger btn-sm">⏹️ Parar Todas</button>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if tabelas %}
+        <div class="table-container" style="max-height: 600px; overflow-y: auto;">
+            <table class="data-table">
+                <thead style="position: sticky; top: 0; z-index: 1; background: var(--color-white, #fff);">
+                    <tr>
+                        <th>Destino</th>
+                        <th>Horários</th>
+                        <th style="text-align: center;">Lote</th>
+                        <th style="text-align: center;">Execuções</th>
+                        <th style="text-align: right;">Último ID</th>
+                        <th style="text-align: center;">Status</th>
+                        <th style="text-align: center;">Ações</th>
+                    </tr>
+                </thead>
+                <tbody id="agendamento-tabelas-body">
+                    {% for t in tabelas %}
+                    {% set horarios_lista = [t.horario_1, t.horario_2, t.horario_3, t.horario_4] | select | map('string') | map('truncate', 5, True, '') | list %}
+                    <tr class="agendamento-tabela-row"
+                        data-id="{{ t.id }}"
+                        data-status="{{ t.status }}"
+                        data-horarios="{{ horarios_lista|tojson|forceescape }}"
+                        data-destino="{{ t.tabela_destino }}">
+                        <td>{{ t.tabela_destino }}</td>
+                        <td>{{ horarios_lista|join(', ') if horarios_lista else '-' }}</td>
+                        <td style="text-align: center;">{{ t.tamanho_lote }}</td>
+                        <td style="text-align: center;" class="agendamento-execucoes-count">{{ t.total_execucoes }}</td>
+                        <td style="text-align: right;" class="agendamento-ultimo-id">
+                            {{ "{:,}".format(t.ultimo_id_destino).replace(",", ".") if t.ultimo_id_destino is not none else '-' }}
+                        </td>
+                        <td style="text-align: center; min-width: 140px;">
+                            <span class="status status-{{ 'processando' if t.status == 'ativa' else 'pendente' }} agendamento-status-badge">
+                                {{ 'ativa' if t.status == 'ativa' else 'parada' }}
+                            </span>
+                            <div class="agendamento-progress-wrap" style="display: none; margin-top: 6px;">
+                                <div class="progress-container" style="height: 8px; margin: 0; border-radius: 4px;">
+                                    <div class="progress-bar agendamento-progress-bar" style="width: 0%; border-radius: 4px;"></div>
+                                </div>
+                                <small class="agendamento-progress-text" style="display: block; font-size: 0.65rem; color: var(--color-gray); margin-top: 2px;"></small>
+                            </div>
+                        </td>
+                        <td style="text-align: center;">
+                            <div class="actions" style="justify-content: center; flex-wrap: wrap;">
+                                <button type="button" class="btn btn-success btn-sm agendamento-btn-iniciar" {% if t.status == 'ativa' %}disabled{% endif %}>▶️ Iniciar</button>
+                                <button type="button" class="btn btn-danger btn-sm agendamento-btn-parar" {% if t.status != 'ativa' %}disabled{% endif %}>⏹️ Parar</button>
+                                <button type="button" class="btn btn-warning btn-sm agendamento-btn-executar">⚡ Executar Agora</button>
+                                <a href="{{ url_for('agendamento_execucoes', tabela_id=t.id) }}" class="btn btn-outline btn-sm">🔍 Verificar</a>
+                                <a href="{{ url_for('agendar_importacao', editar=t.id) }}" class="btn btn-secondary btn-sm">✏️ Editar</a>
+                                <form method="POST" action="{{ url_for('agendamento_excluir', tabela_id=t.id) }}" onsubmit="return confirm('Excluir esta tabela do Agendar Importação?');">
+                                    <button type="submit" class="btn btn-danger btn-sm">Excluir</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <div class="empty-state-icon">🕓</div>
+            <h3>Nenhuma tabela configurada</h3>
+            <p>Use o formulário acima para adicionar a primeira tabela.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="card animate-fade-in">
+        <div class="card-header">
+            <h2 class="card-title">Log do Agendamento</h2>
+            <button type="button" id="btn-clear-agendamento-log" class="btn btn-sm btn-outline">Limpar Log</button>
+        </div>
+        <div class="log-container" id="agendamento-log">
+            <div class="log-entry">
+                <span class="log-time" id="agendamento-log-initial-time"></span>
+                <span class="log-info">Pronto. Clique em "Iniciar" nas tabelas que quiser deixar rodando nos horários configurados.</span>
+            </div>
+        </div>
+        <div class="form-text" style="padding: 0 16px 16px;">
+            ⚠️ O agendamento roda no navegador — mantenha esta aba aberta (ou o dashboard, se ele também
+            tiver sido configurado pra isso). Se fechar ou recarregar, os horários voltam a ser checados
+            automaticamente para as tabelas marcadas como "ativa".
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const agendamentoLog = document.getElementById('agendamento-log');
+let agendamentoEmExecucao = {}; // { tabelaId: bool } evita sobrepor execuções da mesma tabela
+let agendamentoJaDisparadoHoje = {}; // { 'tabelaId_HH:MM': true }
+
+document.addEventListener('DOMContentLoaded', () => {
+    const initialTime = document.getElementById('agendamento-log-initial-time');
+    if (initialTime) initialTime.textContent = getTime();
+
+    const tabelaIdInput = document.querySelector('#form-nova-tabela-agendamento input[name="tabela_id"]');
+    if (tabelaIdInput && tabelaIdInput.value) {
+        document.getElementById('card-form-agendamento')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.getElementById('btn-clear-agendamento-log')?.addEventListener('click', clearLog);
+    document.getElementById('btn-iniciar-todas')?.addEventListener('click', iniciarTodas);
+    document.getElementById('btn-parar-todas')?.addEventListener('click', pararTodas);
+
+    document.querySelectorAll('#agendamento-examples-bar [data-example-source]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.getElementById('agendamento-new-source').value = btn.dataset.exampleSource;
+            document.getElementById('agendamento-new-target').value = btn.dataset.exampleTarget;
+            document.getElementById('agendamento-new-key').value = btn.dataset.exampleKey;
+        });
+    });
+
+    document.getElementById('agendamento-select-migracao')?.addEventListener('change', (event) => {
+        const opt = event.target.selectedOptions[0];
+        if (!opt || !opt.dataset.origem) return;
+        document.getElementById('agendamento-new-source').value = opt.dataset.origem;
+        document.getElementById('agendamento-new-target').value = opt.dataset.destino;
+        document.getElementById('agendamento-new-key').value = opt.dataset.campo;
+    });
+
+    document.querySelectorAll('.agendamento-tabela-row').forEach(row => {
+        row.querySelector('.agendamento-btn-iniciar')?.addEventListener('click', () => iniciarTabela(row));
+        row.querySelector('.agendamento-btn-parar')?.addEventListener('click', () => pararTabela(row));
+        row.querySelector('.agendamento-btn-executar')?.addEventListener('click', () => executarExecucao(row, true));
+
+        // Se a página foi recarregada enquanto essa tabela estava executando,
+        // retoma o acompanhamento em vez de mostrar só "ativa" (sem isso, o
+        // status visual "esquecia" que tinha uma execução rolando).
+        retomarSeJaExecutando(row);
+    });
+
+    // Checa os horários a cada 10s, com janela de tolerância de 5 min (veja
+    // horarioDentroDaJanela) — evita perder o disparo por causa de throttle
+    // do navegador em aba em segundo plano.
+    verificarHorarios();
+    setInterval(verificarHorarios, 10000);
+});
+
+async function retomarSeJaExecutando(row) {
+    const id = row.dataset.id;
+    try {
+        const resp = await fetch(`/api/agendar-importacao/${id}/executar/status`);
+        const job = await parseJsonResponse(resp);
+        if (job && (job.status === 'iniciando' || job.status === 'processando')) {
+            appendLog(`🔄 ${row.dataset.destino}: execução em andamento detectada, retomando acompanhamento...`, 'info');
+            acompanharExecucao(row);
+        }
+    } catch (_) { /* sem job ativo — segue normal */ }
+}
+
+function getTime() {
+    return new Date().toLocaleTimeString('pt-BR', { hour12: false });
+}
+
+function horaAtualHHMM() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function appendLog(msg, type = 'info') {
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `<span class="log-time">${getTime()}</span><span class="log-${type}">${msg}</span>`;
+    agendamentoLog.insertBefore(entry, agendamentoLog.firstChild);
+    while (agendamentoLog.children.length > 200) agendamentoLog.removeChild(agendamentoLog.lastChild);
+}
+
+function clearLog() {
+    agendamentoLog.innerHTML = `<div class="log-entry"><span class="log-time">${getTime()}</span><span class="log-info">Log limpo.</span></div>`;
+}
+
+async function parseJsonResponse(response) {
+    const ct = response.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) throw new Error(await response.text());
+    return response.json();
+}
+
+function setRowUiAtiva(row, ativa) {
+    row.dataset.status = ativa ? 'ativa' : 'parada';
+    row.querySelector('.agendamento-btn-iniciar').disabled = ativa;
+    row.querySelector('.agendamento-btn-parar').disabled = !ativa;
+    const badge = row.querySelector('.agendamento-status-badge');
+    badge.textContent = ativa ? 'ativa' : 'parada';
+    badge.className = `status status-${ativa ? 'processando' : 'pendente'} agendamento-status-badge`;
+}
+
+async function iniciarTabela(row) {
+    const id = row.dataset.id;
+    try {
+        const resp = await fetch(`/agendar-importacao/${id}/iniciar`, { method: 'POST' });
+        const data = await parseJsonResponse(resp);
+        if (data.status !== 'sucesso') {
+            appendLog(`✗ ${row.dataset.destino}: ${data.mensagem || 'erro ao iniciar'}`, 'error');
+            return;
+        }
+        setRowUiAtiva(row, true);
+        appendLog(`▶️ ${row.dataset.destino}: horários ligados.`, 'success');
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    }
+}
+
+async function pararTabela(row) {
+    const id = row.dataset.id;
+    try {
+        const resp = await fetch(`/agendar-importacao/${id}/parar`, { method: 'POST' });
+        const data = await parseJsonResponse(resp);
+        if (data.status !== 'sucesso') {
+            appendLog(`✗ ${row.dataset.destino}: ${data.mensagem || 'erro ao parar'}`, 'error');
+            return;
+        }
+        setRowUiAtiva(row, false);
+        appendLog(`⏹️ ${row.dataset.destino}: horários desligados.`, 'warning');
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    }
+}
+
+async function iniciarTodas() {
+    const rows = Array.from(document.querySelectorAll('.agendamento-tabela-row'));
+    const paradas = rows.filter(row => row.dataset.status !== 'ativa');
+    if (paradas.length === 0) {
+        appendLog('ℹ️ Todas as tabelas já estão ativas.', 'info');
+        return;
+    }
+    appendLog(`▶️ Ligando horários de ${paradas.length} tabela(s)...`, 'info');
+    for (const row of paradas) {
+        await iniciarTabela(row);
+    }
+}
+
+async function pararTodas() {
+    const rows = Array.from(document.querySelectorAll('.agendamento-tabela-row'));
+    const ativas = rows.filter(row => row.dataset.status === 'ativa');
+    if (ativas.length === 0) {
+        appendLog('ℹ️ Nenhuma tabela ativa no momento.', 'info');
+        return;
+    }
+    appendLog(`⏹️ Desligando horários de ${ativas.length} tabela(s)...`, 'info');
+    for (const row of ativas) {
+        await pararTabela(row);
+    }
+}
+
+function dataDeHojeStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Em vez de exigir que o check bata no minuto EXATO (o que falha se a aba
+// estiver em segundo plano e o navegador atrasar o setInterval — comum em
+// abas inativas por horas, esperando um horário como 03:00), aceita disparar
+// em até 5 minutos depois do horário configurado. A trava por dia
+// (agendamentoJaDisparadoHoje) garante que não dispara mais de uma vez.
+function horarioDentroDaJanela(horario) {
+    const agora = new Date();
+    const [h, m] = horario.split(':').map(Number);
+    if (Number.isNaN(h) || Number.isNaN(m)) return false;
+    const alvo = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate(), h, m, 0);
+    const diffMs = agora - alvo;
+    return diffMs >= 0 && diffMs < 5 * 60 * 1000;
+}
+
+function verificarHorarios() {
+    const hoje = dataDeHojeStr();
+    document.querySelectorAll('.agendamento-tabela-row').forEach(row => {
+        if (row.dataset.status !== 'ativa') return;
+
+        let horarios = [];
+        try { horarios = JSON.parse(row.dataset.horarios || '[]'); } catch (_) { horarios = []; }
+
+        horarios.forEach(h => {
+            const chave = `${row.dataset.id}_${h}_${hoje}`;
+            if (horarioDentroDaJanela(h) && !agendamentoJaDisparadoHoje[chave]) {
+                agendamentoJaDisparadoHoje[chave] = true;
+                executarExecucao(row, false);
+            }
+        });
+    });
+}
+
+function marcarExecutando(row, executando) {
+    const badge = row.querySelector('.agendamento-status-badge');
+    const wrap = row.querySelector('.agendamento-progress-wrap');
+    if (executando) {
+        badge.textContent = '⏳ executando...';
+        badge.classList.add('status-processando');
+        if (wrap) wrap.style.display = '';
+    } else {
+        const ativa = row.dataset.status === 'ativa';
+        badge.textContent = ativa ? 'ativa' : 'parada';
+        badge.className = `status status-${ativa ? 'processando' : 'pendente'} agendamento-status-badge`;
+        if (wrap) wrap.style.display = 'none';
+    }
+}
+
+function atualizarProgressoLote(row, job) {
+    const wrap = row.querySelector('.agendamento-progress-wrap');
+    const bar = row.querySelector('.agendamento-progress-bar');
+    const texto = row.querySelector('.agendamento-progress-text');
+    if (!wrap || !bar || !texto) return;
+
+    const total = job.total_lotes || 0;
+    const atual = job.lote_atual || 0;
+    const pct = total > 0 ? Math.round((atual / total) * 100) : 0;
+    const label = total > 0 ? `Lote ${atual}/${total} (${pct}%)` : (job.mensagem || 'preparando...');
+
+    bar.style.width = pct + '%';
+    texto.textContent = label;
+}
+
+function incrementarContadorExecucoes(row) {
+    const el = row.querySelector('.agendamento-execucoes-count');
+    if (!el) return;
+    el.textContent = (parseInt(el.textContent, 10) || 0) + 1;
+}
+
+function aguardar(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function executarExecucao(row, manual) {
+    const id = row.dataset.id;
+    if (agendamentoEmExecucao[id]) {
+        if (manual) appendLog(`ℹ️ ${row.dataset.destino}: já existe uma execução em andamento.`, 'info');
+        return;
+    }
+
+    appendLog(`⏳ ${row.dataset.destino}: iniciando execução${manual ? ' manual' : ''}...`, 'info');
+
+    try {
+        const respStart = await fetch(`/api/agendar-importacao/${id}/executar`, { method: 'POST' });
+        const dataStart = await parseJsonResponse(respStart);
+
+        if (!respStart.ok || dataStart.status === 'erro') {
+            appendLog(`✗ ${row.dataset.destino}: ${dataStart.mensagem || 'erro ao iniciar execução'}`, 'error');
+            return;
+        }
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+        return;
+    }
+
+    await acompanharExecucao(row);
+}
+
+// Só acompanha uma execução já em andamento (disparada agora ou detectada ao
+// carregar a página) — não dispara nada novo. Assim dá pra reaproveitar tanto
+// depois de iniciar quanto ao retomar uma execução que já estava rolando.
+async function acompanharExecucao(row) {
+    const id = row.dataset.id;
+    if (agendamentoEmExecucao[id]) return;
+
+    agendamentoEmExecucao[id] = true;
+    marcarExecutando(row, true);
+
+    try {
+        let job = null;
+        while (true) {
+            const respStatus = await fetch(`/api/agendar-importacao/${id}/executar/status`);
+            job = await parseJsonResponse(respStatus);
+
+            if (!job || job.status === 'inativo') break;
+            atualizarProgressoLote(row, job);
+
+            if (job.status === 'concluido' || job.status === 'erro' || job.status === 'cancelado') break;
+            await aguardar(1000);
+        }
+
+        if (job && job.status === 'cancelado') {
+            appendLog(`⏹️ ${row.dataset.destino}: execução interrompida.`, 'warning');
+            return;
+        }
+
+        if (!job || job.status === 'erro') {
+            appendLog(`✗ ${row.dataset.destino}: ${(job && job.mensagem) || 'erro na execução'}`, 'error');
+            return;
+        }
+
+        incrementarContadorExecucoes(row);
+
+        const ultimoIdEl = row.querySelector('.agendamento-ultimo-id');
+        if (ultimoIdEl && job.ultimo_id_destino != null) {
+            ultimoIdEl.textContent = Number(job.ultimo_id_destino).toLocaleString('pt-BR');
+        }
+
+        const partes = [];
+        if (job.registros_inseridos) partes.push(`${job.registros_inseridos} inserido(s)`);
+        if (job.registros_atualizados) partes.push(`${job.registros_atualizados} atualizado(s)`);
+        if (job.registros_deletados) partes.push(`${job.registros_deletados} deletado(s)`);
+        if (job.registros_com_erro) partes.push(`${job.registros_com_erro} com erro`);
+        const loteInfo = job.total_lotes ? ` [${job.total_lotes} lote(s) de ${job.tamanho_lote}]` : '';
+
+        if (partes.length > 0) {
+            appendLog(`✓ ${row.dataset.destino}: ${partes.join(', ')}${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'success');
+        } else {
+            appendLog(`○ ${row.dataset.destino}: nenhuma alteração${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'info');
+        }
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    } finally {
+        agendamentoEmExecucao[id] = false;
+        marcarExecutando(row, false);
+    }
+}
+</script>
+{% endblock %}

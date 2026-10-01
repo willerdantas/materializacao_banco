@@ -1,0 +1,204 @@
+<!-- templates/agendar_importacao_execucoes.html -->
+{% extends "base.html" %}
+
+{% block title %}Execuções - {{ tabela.tabela_destino }}{% endblock %}
+
+{% block content %}
+<div class="card animate-fade-in" style="margin-bottom: 16px;">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Execuções de {{ tabela.tabela_destino }}</h2>
+            <p class="card-subtitle">
+                <strong>Origem:</strong> <code>{{ tabela.tabela_origem }}</code> →
+                <strong>Destino:</strong> <code>{{ tabela.tabela_destino }}</code> |
+                <strong>Campo:</strong> <code>{{ tabela.campo_id }}</code> |
+                <strong>Lote:</strong> {{ tabela.tamanho_lote }} |
+                <strong>Horários:</strong>
+                {{ [tabela.horario_1, tabela.horario_2, tabela.horario_3, tabela.horario_4] | select | map('string') | map('truncate', 5, True, '') | join(', ') or '-' }}
+            </p>
+        </div>
+        <a href="{{ url_for('agendar_importacao') }}" class="btn btn-outline">← Voltar</a>
+    </div>
+</div>
+
+<!-- Execução em andamento (ao vivo) — só aparece se houver uma execução rodando agora -->
+<div class="card animate-fade-in" id="execucao-ativa-card" style="display: none; border-left: 4px solid var(--color-primary);">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">⏳ Execução em Andamento</h2>
+            <p class="card-subtitle" id="execucao-ativa-mensagem">Preparando...</p>
+        </div>
+    </div>
+    <div style="padding: 0 16px 16px;">
+        <div class="progress-container" style="height: 10px; margin-bottom: 4px; border-radius: 5px;">
+            <div class="progress-bar" id="execucao-ativa-barra" style="width: 0%; border-radius: 5px;"></div>
+        </div>
+        <small id="execucao-ativa-texto" style="color: var(--color-gray);"></small>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 1.5fr; gap: 16px; padding: 0 16px 16px;">
+        <div>
+            <strong style="font-size: 0.8rem;">Lotes desta execução</strong>
+            <div id="execucao-ativa-lotes" style="max-height: 240px; overflow-y: auto; margin-top: 6px; font-size: 0.75rem; border: 1px solid var(--border-color, #e5e7eb); border-radius: 6px;"></div>
+        </div>
+        <div>
+            <strong style="font-size: 0.8rem;">Log da execução</strong>
+            <div id="execucao-ativa-log" class="log-container" style="max-height: 240px; overflow-y: auto; margin-top: 6px;"></div>
+        </div>
+    </div>
+</div>
+
+<div class="kpi-grid">
+    <div class="kpi-card primary">
+        <div class="kpi-label">Execuções</div>
+        <div class="kpi-value">{{ execucoes|length }}</div>
+        <div class="kpi-sublabel">Histórico completo desta tabela</div>
+    </div>
+    <div class="kpi-card secondary">
+        <div class="kpi-label">Total Inserido</div>
+        <div class="kpi-value">{{ "{:,}".format(execucoes|sum(attribute='registros_inseridos')).replace(",", ".") }}</div>
+        <div class="kpi-sublabel">Somando todas as execuções</div>
+    </div>
+    <div class="kpi-card accent">
+        <div class="kpi-label">Total Deletado</div>
+        <div class="kpi-value">{{ "{:,}".format(execucoes|sum(attribute='registros_deletados')).replace(",", ".") }}</div>
+        <div class="kpi-sublabel">Removidos do destino por não existirem mais na origem</div>
+    </div>
+</div>
+
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Histórico</h2>
+            <p class="card-subtitle">Clique em uma execução para ver o detalhe por registro.</p>
+        </div>
+    </div>
+
+    {% if execucoes %}
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Data/Hora</th>
+                    <th style="text-align: center;">Status</th>
+                    <th style="text-align: right;">Inseridos</th>
+                    <th style="text-align: right;">Atualizados</th>
+                    <th style="text-align: right;">Já Existiam</th>
+                    <th style="text-align: right;">Deletados</th>
+                    <th style="text-align: right;">Com Erro</th>
+                    <th style="text-align: right;">Lotes</th>
+                    <th style="text-align: right;">Último ID</th>
+                    <th style="text-align: center;">Ações</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in execucoes %}
+                <tr>
+                    <td>{{ e.executado_em.strftime('%d/%m/%Y %H:%M:%S') if e.executado_em else '-' }}</td>
+                    <td style="text-align: center;">
+                        <span class="status status-{{ e.status }}">{{ e.status }}</span>
+                    </td>
+                    <td style="text-align: right;">{{ "{:,}".format(e.registros_inseridos).replace(",", ".") }}</td>
+                    <td style="text-align: right;">{{ "{:,}".format(e.registros_atualizados).replace(",", ".") }}</td>
+                    <td style="text-align: right;">{{ "{:,}".format(e.registros_ja_existem).replace(",", ".") }}</td>
+                    <td style="text-align: right;">
+                        {% if e.registros_deletados > 0 %}
+                        <span style="color: #6B21A8; font-weight: 600;">{{ e.registros_deletados }}</span>
+                        {% else %}0{% endif %}
+                    </td>
+                    <td style="text-align: right;">
+                        {% if e.registros_com_erro > 0 %}
+                        <span style="color: var(--color-red, #EF4444); font-weight: 600;">{{ e.registros_com_erro }}</span>
+                        {% else %}0{% endif %}
+                    </td>
+                    <td style="text-align: right;">{{ e.total_lotes }}{% if e.tamanho_lote %} × {{ e.tamanho_lote }}{% endif %}</td>
+                    <td style="text-align: right;">{{ "{:,}".format(e.ultimo_id_destino).replace(",", ".") if e.ultimo_id_destino is not none else '-' }}</td>
+                    <td style="text-align: center;">
+                        <a href="{{ url_for('agendamento_execucao_registros', execucao_id=e.id) }}" class="btn btn-primary btn-sm">Ver Registros</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">📋</div>
+        <h3>Nenhuma execução rodada ainda</h3>
+        <p>Clique em "Iniciar" ou "Executar Agora" na lista de tabelas.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const tabelaIdExecucoes = {{ tabela.id }};
+let pollingExecucaoAtiva = null;
+
+function escapeHtmlExecucoes(v) {
+    return String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+}
+
+function atualizarExecucaoAtiva(job) {
+    document.getElementById('execucao-ativa-mensagem').textContent = job.mensagem || '';
+
+    const total = job.total_lotes || 0;
+    const atual = job.lote_atual || 0;
+    const pct = total > 0 ? Math.round((atual / total) * 100) : 0;
+    const texto = total > 0 ? `Lote ${atual}/${total} (${pct}%)` : '';
+    document.getElementById('execucao-ativa-barra').style.width = pct + '%';
+    document.getElementById('execucao-ativa-texto').textContent = texto;
+
+    const lotesEl = document.getElementById('execucao-ativa-lotes');
+    const lotes = job.lotes || [];
+    lotesEl.innerHTML = lotes.length === 0
+        ? '<div style="padding: 10px; color: var(--color-gray);">Nenhum lote processado ainda.</div>'
+        : lotes.slice().reverse().map(l => {
+            const cor = l.com_erro > 0 ? 'color: var(--color-red, #EF4444); font-weight: 600;' : '';
+            return `<div style="padding: 4px 8px; border-bottom: 1px solid var(--border-color, #eee); ${cor}">
+                Lote ${l.numero}: ${l.inseridos} inserido(s), ${l.atualizados} atualizado(s),
+                ${l.ja_existem} já existe(m), ${l.deletados || 0} deletado(s)${l.com_erro > 0 ? `, ${l.com_erro} com erro` : ''}
+            </div>`;
+        }).join('');
+
+    const logEl = document.getElementById('execucao-ativa-log');
+    const log = job.log || [];
+    const nivelClasse = { info: 'log-info', sucesso: 'log-success', aviso: 'log-warning', erro: 'log-error' };
+    logEl.innerHTML = log.length === 0
+        ? '<div class="log-entry"><span class="log-info">Sem log ainda.</span></div>'
+        : log.slice().reverse().map(l => `
+            <div class="log-entry">
+                <span class="log-time">${l.hora}</span>
+                <span class="${nivelClasse[l.nivel] || 'log-info'}">${escapeHtmlExecucoes(l.mensagem)}</span>
+            </div>
+        `).join('');
+}
+
+async function verificarExecucaoAtiva() {
+    const card = document.getElementById('execucao-ativa-card');
+    try {
+        const resp = await fetch(`/api/agendar-importacao/${tabelaIdExecucoes}/executar/status`);
+        const job = await resp.json();
+
+        if (!job || job.status === 'inativo') {
+            card.style.display = 'none';
+            return;
+        }
+
+        card.style.display = '';
+        atualizarExecucaoAtiva(job);
+
+        if (job.status !== 'iniciando' && job.status !== 'processando') {
+            clearInterval(pollingExecucaoAtiva);
+            pollingExecucaoAtiva = null;
+            setTimeout(() => window.location.reload(), 2000);
+        }
+    } catch (e) { /* falha isolada de polling — tenta de novo no próximo tick */ }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    verificarExecucaoAtiva();
+    pollingExecucaoAtiva = setInterval(verificarExecucaoAtiva, 1000);
+});
+</script>
+{% endblock %}

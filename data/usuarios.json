@@ -1,0 +1,9 @@
+[
+  {
+    "id": 1,
+    "username": "admin",
+    "password_hash": "pbkdf2:sha256:260000$ZZJXly8gvTrNe8rP$ae5ddc0698870575acedf101823a37e5bdd955f8c7d61e1f807eb1cddd2bc0ae",
+    "perfil": "administrador",
+    "created_at": "2026-09-15T10:29:57.354790"
+  }
+]

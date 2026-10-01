@@ -1,0 +1,385 @@
+{% extends "base.html" %}
+
+{% block title %}Configurar Banco de Dados{% endblock %}
+
+{% block content %}
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Conexão com o Banco de Dados</h2>
+            <p class="card-subtitle">Informe as credenciais do PostgreSQL. Se o banco estiver na mesma máquina, mantenha a opção local.</p>
+        </div>
+        <span class="status status-{{ 'concluido' if db_configured else 'pendente' }}">
+            {{ 'Configurado' if db_configured else 'Pendente' }}
+        </span>
+    </div>
+
+    {% if error_details %}
+    <div class="alert alert-error">
+        <span class="alert-icon">✕</span>
+        <div>
+            <strong>Falha na conexão:</strong>
+            <div>{{ error_details }}</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('configurar_banco') }}">
+        <input type="hidden" name="profile_id" value="{{ db_config.profile_id }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="profile_name">Nome da conexão</label>
+                <input type="text"
+                       id="profile_name"
+                       name="profile_name"
+                       class="form-control"
+                       value="{{ db_config.profile_name }}"
+                       placeholder="Ex: Banco produção hospital"
+                       required>
+                <div class="form-text">Esse nome será exibido na lista de conexões salvas.</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="connection_mode">Tipo de conexão</label>
+                <select id="connection_mode" name="connection_mode" class="form-control" onchange="alternarModoConexao()">
+                    <option value="local" {% if db_config.connection_mode == 'local' %}selected{% endif %}>Banco local</option>
+                    <option value="remote" {% if db_config.connection_mode == 'remote' %}selected{% endif %}>Banco remoto</option>
+                </select>
+                <div class="form-text">Selecione remoto para informar o IP do servidor PostgreSQL.</div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="host">IP / Host do banco</label>
+                <input type="text"
+                       id="host"
+                       name="host"
+                       class="form-control"
+                       value="{{ db_config.host }}"
+                       placeholder="Ex: 192.168.0.10 ou db.servidor.local">
+                <div class="form-text">Para banco local, o sistema usa <strong>localhost</strong>.</div>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="database">Nome do banco</label>
+                <input type="text"
+                       id="database"
+                       name="database"
+                       class="form-control"
+                       value="{{ db_config.database }}"
+                       placeholder="Ex: postgres"
+                       required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="port">Porta</label>
+                <input type="number"
+                       id="port"
+                       name="port"
+                       class="form-control"
+                       value="{{ db_config.port }}"
+                       min="1"
+                       max="65535"
+                       required>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="user">Usuário do banco</label>
+                <input type="text"
+                       id="user"
+                       name="user"
+                       class="form-control"
+                       value="{{ db_config.user }}"
+                       placeholder="Ex: postgres"
+                       autocomplete="username"
+                       required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="password">Senha</label>
+                <input type="password"
+                       id="password"
+                       name="password"
+                       class="form-control"
+                       placeholder="Informe a senha do banco"
+                       autocomplete="current-password"
+                       required>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="schema_destino">Schema de destino</label>
+                <input type="text"
+                       id="schema_destino"
+                       name="schema_destino"
+                       class="form-control"
+                       value="{{ db_config.schema_destino or 'public' }}"
+                       placeholder="Ex: public"
+                       required>
+                <div class="form-text">
+                    Schema onde ficam as tabelas de destino e as tabelas de controle. Nas telas
+                    de migração/importação, basta informar o nome da tabela, sem o schema.
+                    Ao salvar, as tabelas de controle são criadas/verificadas automaticamente
+                    aqui. <strong>Deve ser diferente</strong> do "Schema local do FDW" abaixo,
+                    que é só para as foreign tables (somente leitura) da origem.
+                </div>
+            </div>
+        </div>
+
+        <div class="btn-group mt-2">
+            <button type="submit" class="btn btn-primary btn-lg">
+                <span>{{ 'Atualizar conexão' if db_config.profile_id else 'Salvar conexão' }}</span>
+            </button>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-outline">
+                <span>Voltar</span>
+            </a>
+        </div>
+    </form>
+</div>
+
+<!-- Provisionamento: banco local, FDW, schema temp e tabelas de controle -->
+<div class="card animate-fade-in" style="border-left: 4px solid var(--color-primary);">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">⚙️ Provisionamento do Banco</h2>
+            <p class="card-subtitle">
+                Ações de configuração inicial. Salve a conexão acima primeiro (isso já cria as
+                tabelas de controle no schema de destino), depois rode: banco local → FDW →
+                schema temp.
+            </p>
+        </div>
+    </div>
+
+    <!-- 1) Criar banco local -->
+    <div class="controle-card" style="margin-bottom: 16px;">
+        <h4>1. Banco de dados local</h4>
+        <p class="form-text">
+            Cria o banco <strong>"{{ db_config.database }}"</strong> no host configurado acima
+            (via conexão à base de manutenção <code>postgres</code>), caso ainda não exista.
+        </p>
+        <form method="POST" action="{{ url_for('criar_banco_local_route') }}"
+              onsubmit="return confirm('Criar o banco &quot;{{ db_config.database }}&quot; em {{ db_config.host }}?');">
+            <button type="submit" class="btn btn-primary">Criar Banco Local</button>
+        </form>
+    </div>
+
+    <!-- 2) Criar FDW -->
+    <div class="controle-card" style="margin-bottom: 16px;">
+        <h4>2. Foreign Data Wrapper (origem)</h4>
+        <p class="form-text">
+            Cria a extensão <code>postgres_fdw</code>, o servidor remoto, o mapeamento de usuário
+            e importa as tabelas do schema remoto para o schema local abaixo. Pode ser rodado
+            de novo para atualizar credenciais ou importar tabelas novas.
+        </p>
+        <form method="POST" action="{{ url_for('criar_fdw_route') }}">
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Host da origem</label>
+                    <input type="text"
+                           name="fdw_host"
+                           class="form-control"
+                           value="{{ fdw_config.host }}"
+                           placeholder="Ex: 192.168.0.20"
+                           required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Porta</label>
+                    <input type="number"
+                           name="fdw_port"
+                           class="form-control"
+                           value="{{ fdw_config.port }}"
+                           min="1"
+                           max="65535">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Banco da origem</label>
+                    <input type="text"
+                           name="fdw_database"
+                           class="form-control"
+                           value="{{ fdw_config.database }}"
+                           placeholder="Ex: hospital_prod"
+                           required>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Usuário da origem</label>
+                    <input type="text"
+                           name="fdw_user"
+                           class="form-control"
+                           value="{{ fdw_config.user }}"
+                           autocomplete="off"
+                           required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Senha da origem</label>
+                    <input type="password"
+                           name="fdw_password"
+                           class="form-control"
+                           placeholder="Deixe em branco para manter a senha salva"
+                           autocomplete="new-password">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Schema remoto a importar</label>
+                    <input type="text"
+                           name="fdw_schema_remoto"
+                           class="form-control"
+                           value="{{ fdw_config.schema_remoto or 'public' }}">
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Schema local do FDW</label>
+                <input type="text"
+                       name="fdw_schema_local"
+                       class="form-control"
+                       value="{{ fdw_config.schema_local or 'fdw_externo' }}"
+                       required>
+                <div class="form-text">
+                    Prefixo usado nas migrações, ex: <code>{{ fdw_config.schema_local or 'fdw_externo' }}.v_paciente</code>.
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary mt-2">Criar / Atualizar FDW</button>
+        </form>
+    </div>
+
+    <!-- 3) Criar schema temp -->
+    <div class="controle-card" style="margin-bottom: 16px;">
+        <h4>3. Schema de staging (temp)</h4>
+        <p class="form-text">
+            Cria o schema <code>{{ temp_schema_name }}</code>, usado para copiar cada lote de IDs
+            antes de gravar no schema de destino configurado acima.
+        </p>
+        <form method="POST" action="{{ url_for('criar_schema_temp_route') }}">
+            <button type="submit" class="btn btn-secondary">Criar Schema Temp</button>
+        </form>
+    </div>
+
+    <!-- 4) Criar tabelas de controle -->
+    <div class="controle-card">
+        <h4>4. Tabelas de controle</h4>
+        <p class="form-text">
+            <code>controle_migracao</code>, <code>controle_migracao_lotes</code>,
+            <code>auto_importacao_tabelas</code>, <code>auto_importacao_ciclos</code> e
+            <code>auto_importacao_ciclo_registros</code> já são criadas/verificadas
+            automaticamente no schema de destino sempre que você salva a conexão acima
+            (seção 1) ou troca a conexão ativa na lista de conexões salvas. Use o botão
+            abaixo só se quiser forçar a verificação de novo sem resalvar a conexão.
+        </p>
+        <div class="form-text" style="color: var(--color-orange);">
+            ⚠️ As funções SQL usadas em outras telas (<code>processar_lote</code>,
+            <code>verificar_progresso</code>, <code>preparar_colunas_migracao</code>,
+            <code>atualizar_lotes_migracao</code>, <code>finalizar_migracao</code>) não são
+            criadas por aqui — precisam existir separadamente no banco.
+        </div>
+        <form method="POST" action="{{ url_for('criar_tabelas_route') }}">
+            <button type="submit" class="btn btn-secondary mt-2">Verificar Tabelas de Controle</button>
+        </form>
+    </div>
+</div>
+
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Configuração atual</h2>
+            <p class="card-subtitle">Resumo da conexão ativa na aplicação.</p>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <table class="data-table">
+            <tbody>
+                <tr>
+                    <td><strong>Host</strong></td>
+                    <td>{{ db_host }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Banco</strong></td>
+                    <td>{{ db_name }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Status</strong></td>
+                    <td>{{ 'Conectado/configurado' if db_configured else 'Aguardando credenciais' }}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Conexões salvas</h2>
+            <p class="card-subtitle">Perfis gravados localmente no projeto para usar, editar ou excluir.</p>
+        </div>
+    </div>
+
+    {% if saved_connections %}
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Nome</th>
+                    <th>Host</th>
+                    <th>Banco</th>
+                    <th>Usuário</th>
+                    <th>Porta</th>
+                    <th style="text-align: center;">Ações</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for connection in saved_connections %}
+                <tr>
+                    <td><strong>{{ connection.profile_name }}</strong></td>
+                    <td>{{ connection.host }}</td>
+                    <td>{{ connection.database }}</td>
+                    <td>{{ connection.user }}</td>
+                    <td>{{ connection.port }}</td>
+                    <td>
+                        <div class="actions">
+                            <form method="POST" action="{{ url_for('usar_conexao_salva', connection_id=connection.id) }}">
+                                <button type="submit" class="btn btn-primary btn-sm">Usar</button>
+                            </form>
+                            <a href="{{ url_for('configurar_banco', editar=connection.id) }}" class="btn btn-secondary btn-sm">Editar</a>
+                            <form method="POST" action="{{ url_for('excluir_conexao_salva', connection_id=connection.id) }}" onsubmit="return confirm('Excluir esta conexão salva?');">
+                                <button type="submit" class="btn btn-danger btn-sm">Excluir</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">🗄️</div>
+        <h3>Nenhuma conexão salva</h3>
+        <p>Preencha o formulário acima para adicionar a primeira conexão salva localmente.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function alternarModoConexao() {
+    const modo = document.getElementById('connection_mode').value;
+    const hostInput = document.getElementById('host');
+
+    if (modo === 'local') {
+        hostInput.value = 'localhost';
+        hostInput.readOnly = true;
+    } else {
+        if (hostInput.value === 'localhost') {
+            hostInput.value = '';
+        }
+        hostInput.readOnly = false;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', alternarModoConexao);
+</script>
+{% endblock %}

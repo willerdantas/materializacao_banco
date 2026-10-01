@@ -1,0 +1,30 @@
+services:
+  importacao-intergash:
+    build: .
+    container_name: importacao-intergash
+    restart: unless-stopped
+
+    # network_mode: host faz o container enxergar a rede do host diretamente.
+    # É o modo mais simples aqui porque o banco de destino já está configurado
+    # com host "localhost" (mesma máquina) em data/db_active_config.json —
+    # assim continua funcionando sem precisar reconfigurar nada na tela
+    # Configurar Banco. Só funciona em Docker no Linux.
+    network_mode: host
+
+    # Se preferir modo bridge padrão (ex.: Docker Desktop no Mac/Windows, ou
+    # se o Postgres estiver em outro host/container), comente a linha
+    # "network_mode: host" acima, descomente o bloco "ports" abaixo, e ajuste
+    # o host do banco/FDW na tela Configurar Banco para o IP real do
+    # servidor Postgres (não use "localhost" — de dentro do container isso
+    # apontaria para o próprio container, não para o host).
+    # ports:
+    #   - "5310:5310"
+
+    environment:
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:?defina FLASK_SECRET_KEY no arquivo .env}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
+
+    volumes:
+      # Persiste configs (banco, FDW, usuários) e a chave de encriptação fora
+      # da imagem — sem isso, tudo se perderia a cada rebuild do container.
+      - ./data:/app/data

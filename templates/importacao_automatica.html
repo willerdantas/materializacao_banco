@@ -1,0 +1,470 @@
+{% extends "base.html" %}
+
+{% block title %}Importação Automática{% endblock %}
+
+{% block content %}
+<div id="auto-import-page">
+    <div class="kpi-grid">
+        <div class="kpi-card primary">
+            <div class="kpi-label">Tabelas Configuradas</div>
+            <div class="kpi-value">{{ tabelas|length }}</div>
+            <div class="kpi-sublabel">Cadastradas na importação automática</div>
+        </div>
+        <div class="kpi-card secondary">
+            <div class="kpi-label">Rotinas Ativas</div>
+            <div class="kpi-value">{{ tabelas|selectattr('status', 'equalto', 'ativa')|list|length }}</div>
+            <div class="kpi-sublabel">Executando em loop no navegador</div>
+        </div>
+        <div class="kpi-card accent">
+            <div class="kpi-label">Rotinas Paradas</div>
+            <div class="kpi-value">{{ tabelas|selectattr('status', 'equalto', 'parada')|list|length }}</div>
+            <div class="kpi-sublabel">Aguardando início manual</div>
+        </div>
+    </div>
+
+    <!-- Cadastro / edição de tabela -->
+    <div class="card animate-fade-in" id="card-form-auto">
+        <div class="card-header">
+            <div>
+                <h2 class="card-title" id="form-auto-titulo">
+                    {{ 'Editar Tabela' if tabela_edicao else 'Nova Tabela para Importação Automática' }}
+                </h2>
+                <p class="card-subtitle">Informe origem, destino, campo chave, intervalo, quantidade de registros e tamanho do lote.</p>
+            </div>
+            {% if tabela_edicao %}
+            <a href="{{ url_for('importacao_automatica') }}" class="btn btn-outline btn-sm">Cancelar edição</a>
+            {% endif %}
+        </div>
+
+        {% if not tabela_edicao %}
+        <div class="btn-group" id="auto-import-examples-bar" style="margin-bottom: 12px;">
+            {% for example in examples %}
+            <button type="button"
+                    class="btn btn-sm {% if loop.index0 % 3 == 0 %}btn-success{% elif loop.index0 % 3 == 1 %}btn-secondary{% else %}btn-warning{% endif %}"
+                    data-example-source="{{ example.origem }}"
+                    data-example-target="{{ example.destino }}"
+                    data-example-key="{{ example.campo_id }}">
+                + {{ example.label }}
+            </button>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <form method="POST" action="{{ url_for('importacao_automatica') }}" id="form-nova-tabela-auto">
+            <input type="hidden" name="tabela_id" value="{{ tabela_edicao.id if tabela_edicao else '' }}">
+            <div class="form-row form-row-single-line">
+                <div class="form-group">
+                    <label class="form-label">Migração Configurada</label>
+                    <select id="auto-select-migracao" class="form-control">
+                        <option value="">-- Selecionar --</option>
+                        {% for m in migracoes_disponiveis %}
+                        <option value="{{ loop.index0 }}"
+                                data-origem="{{ m.tabela_origem }}"
+                                data-destino="{{ m.tabela_destino }}"
+                                data-campo="{{ m.campo_id }}">
+                            #{{ m.id }} · {{ m.tabela_destino }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tabela Origem (Foreign Table)</label>
+                    <input type="text" name="tabela_origem" id="auto-new-source" class="form-control" placeholder="v_paciente" value="{{ tabela_edicao.tabela_origem if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tabela Destino</label>
+                    <input type="text" name="tabela_destino" id="auto-new-target" class="form-control" placeholder="t_paciente" value="{{ tabela_edicao.tabela_destino if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Campo Chave</label>
+                    <input type="text" name="campo_id" id="auto-new-key" class="form-control" placeholder="isn_paciente" value="{{ tabela_edicao.campo_id if tabela_edicao else '' }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Intervalo (min)</label>
+                    <input type="number" name="intervalo_min" class="form-control" value="{{ tabela_edicao.intervalo_min if tabela_edicao else 5 }}" min="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Qtd Registros</label>
+                    <input type="number" name="qtd_registros" class="form-control" value="{{ tabela_edicao.qtd_registros if tabela_edicao else 100 }}" min="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tamanho do Lote</label>
+                    <input type="number" name="tamanho_lote" class="form-control" value="{{ tabela_edicao.tamanho_lote if tabela_edicao else 500 }}" min="1" max="5000">
+                </div>
+            </div>
+            <div class="form-text mt-1">Se a tabela de destino ainda não existir, ela é criada automaticamente (mesma estrutura da origem).</div>
+            <div class="btn-group mt-2">
+                <button type="submit" class="btn btn-primary">
+                    {{ 'Salvar Alterações' if tabela_edicao else '+ Adicionar Tabela' }}
+                </button>
+                {% if tabela_edicao %}
+                <a href="{{ url_for('importacao_automatica') }}" class="btn btn-outline">Cancelar</a>
+                {% endif %}
+            </div>
+        </form>
+    </div>
+
+    <!-- Lista de tabelas configuradas -->
+    <div class="card animate-fade-in">
+        <div class="card-header">
+            <div>
+                <h2 class="card-title">Tabelas Configuradas</h2>
+                <p class="card-subtitle">Iniciar deixa a rotina rodando enquanto esta aba estiver aberta.</p>
+            </div>
+            {% if tabelas %}
+            <div class="btn-group">
+                <button type="button" id="btn-iniciar-todas" class="btn btn-success btn-sm">▶️ Iniciar Todas</button>
+                <button type="button" id="btn-parar-todas" class="btn btn-danger btn-sm">⏹️ Parar Todas</button>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if tabelas %}
+        <div class="table-container" style="max-height: 600px; overflow-y: auto;">
+            <table class="data-table">
+                <thead style="position: sticky; top: 0; z-index: 1; background: var(--color-white, #fff);">
+                    <tr>
+                        <th>Destino</th>
+                        <th style="text-align: center;">Intervalo</th>
+                        <th style="text-align: center;">Qtd</th>
+                        <th style="text-align: center;">Lote</th>
+                        <th style="text-align: center;">Ciclos</th>
+                        <th style="text-align: right;">Último ID</th>
+                        <th style="text-align: center;">Status</th>
+                        <th style="text-align: center;">Ações</th>
+                    </tr>
+                </thead>
+                <tbody id="auto-tabelas-body">
+                    {% for t in tabelas %}
+                    <tr class="auto-tabela-row"
+                        data-id="{{ t.id }}"
+                        data-status="{{ t.status }}"
+                        data-intervalo-min="{{ t.intervalo_min }}"
+                        data-destino="{{ t.tabela_destino }}">
+                        <td>{{ t.tabela_destino }}</td>
+                        <td style="text-align: center;">{{ t.intervalo_min }} min</td>
+                        <td style="text-align: center;">{{ t.qtd_registros }}</td>
+                        <td style="text-align: center;">{{ t.tamanho_lote }}</td>
+                        <td style="text-align: center;" class="auto-ciclos-count">{{ t.total_ciclos }}</td>
+                        <td style="text-align: right;" class="auto-ultimo-id">
+                            {{ "{:,}".format(t.ultimo_id_destino).replace(",", ".") if t.ultimo_id_destino is not none else '-' }}
+                        </td>
+                        <td style="text-align: center; min-width: 140px;">
+                            <span class="status status-{{ 'processando' if t.status == 'ativa' else 'pendente' }} auto-status-badge">
+                                {{ 'ativa' if t.status == 'ativa' else 'parada' }}
+                            </span>
+                            <div class="auto-progress-wrap" style="display: none; margin-top: 6px;">
+                                <div class="progress-container" style="height: 8px; margin: 0; border-radius: 4px;">
+                                    <div class="progress-bar auto-progress-bar" style="width: 0%; border-radius: 4px;"></div>
+                                </div>
+                                <small class="auto-progress-text" style="display: block; font-size: 0.65rem; color: var(--color-gray); margin-top: 2px;"></small>
+                            </div>
+                        </td>
+                        <td style="text-align: center;">
+                            <div class="actions" style="justify-content: center; flex-wrap: wrap;">
+                                <button type="button" class="btn btn-success btn-sm auto-btn-iniciar" {% if t.status == 'ativa' %}disabled{% endif %}>▶️ Iniciar</button>
+                                <button type="button" class="btn btn-danger btn-sm auto-btn-parar" {% if t.status != 'ativa' %}disabled{% endif %}>⏹️ Parar</button>
+                                <a href="{{ url_for('auto_import_ciclos', tabela_id=t.id) }}" class="btn btn-outline btn-sm">🔍 Verificar</a>
+                                <a href="{{ url_for('importacao_automatica', editar=t.id) }}" class="btn btn-secondary btn-sm">✏️ Editar</a>
+                                <form method="POST" action="{{ url_for('auto_import_excluir', tabela_id=t.id) }}" onsubmit="return confirm('Excluir esta tabela da importação automática?');">
+                                    <button type="submit" class="btn btn-danger btn-sm">Excluir</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <div class="empty-state-icon">⟳</div>
+            <h3>Nenhuma tabela configurada</h3>
+            <p>Use o formulário acima para adicionar a primeira tabela.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="card animate-fade-in">
+        <div class="card-header">
+            <h2 class="card-title">Log da Rotina Automática</h2>
+            <button type="button" id="btn-clear-auto-log" class="btn btn-sm btn-outline">Limpar Log</button>
+        </div>
+        <div class="log-container" id="auto-import-log">
+            <div class="log-entry">
+                <span class="log-time" id="auto-log-initial-time"></span>
+                <span class="log-info">Rotina pronta. Clique em "Iniciar" nas tabelas que quiser monitorar.</span>
+            </div>
+        </div>
+        <div class="form-text" style="padding: 0 16px 16px;">
+            ⚠️ A rotina roda no navegador — mantenha esta aba aberta. Se fechar ou recarregar, os
+            temporizadores reiniciam automaticamente para as tabelas marcadas como "ativa".
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const autoImportLog = document.getElementById('auto-import-log');
+let autoTimers = {};   // { tabelaId: intervalId }
+let autoEmExecucao = {}; // { tabelaId: bool } evita sobrepor ciclos da mesma tabela
+
+document.addEventListener('DOMContentLoaded', () => {
+    const initialTime = document.getElementById('auto-log-initial-time');
+    if (initialTime) initialTime.textContent = getTime();
+
+    // Em modo de edição, leva o usuário direto pro formulário preenchido
+    const tabelaIdInput = document.querySelector('#form-nova-tabela-auto input[name="tabela_id"]');
+    if (tabelaIdInput && tabelaIdInput.value) {
+        document.getElementById('card-form-auto')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.getElementById('btn-clear-auto-log')?.addEventListener('click', clearLog);
+    document.getElementById('btn-iniciar-todas')?.addEventListener('click', iniciarTodas);
+    document.getElementById('btn-parar-todas')?.addEventListener('click', pararTodas);
+
+    document.querySelectorAll('#auto-import-examples-bar [data-example-source]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.getElementById('auto-new-source').value = btn.dataset.exampleSource;
+            document.getElementById('auto-new-target').value = btn.dataset.exampleTarget;
+            document.getElementById('auto-new-key').value = btn.dataset.exampleKey;
+        });
+    });
+
+    document.getElementById('auto-select-migracao')?.addEventListener('change', (event) => {
+        const opt = event.target.selectedOptions[0];
+        if (!opt || !opt.dataset.origem) return;
+        document.getElementById('auto-new-source').value = opt.dataset.origem;
+        document.getElementById('auto-new-target').value = opt.dataset.destino;
+        document.getElementById('auto-new-key').value = opt.dataset.campo;
+    });
+
+    document.querySelectorAll('.auto-tabela-row').forEach(row => {
+        row.querySelector('.auto-btn-iniciar')?.addEventListener('click', () => iniciarTabela(row));
+        row.querySelector('.auto-btn-parar')?.addEventListener('click', () => pararTabela(row));
+
+        // Retoma o loop automaticamente para tabelas que já estavam "ativa"
+        if (row.dataset.status === 'ativa') {
+            agendarTabela(row);
+        }
+    });
+});
+
+function getTime() {
+    return new Date().toLocaleTimeString('pt-BR', { hour12: false });
+}
+
+function appendLog(msg, type = 'info') {
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `<span class="log-time">${getTime()}</span><span class="log-${type}">${msg}</span>`;
+    autoImportLog.insertBefore(entry, autoImportLog.firstChild);
+    while (autoImportLog.children.length > 200) autoImportLog.removeChild(autoImportLog.lastChild);
+}
+
+function clearLog() {
+    autoImportLog.innerHTML = `<div class="log-entry"><span class="log-time">${getTime()}</span><span class="log-info">Log limpo.</span></div>`;
+}
+
+async function parseJsonResponse(response) {
+    const ct = response.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) throw new Error(await response.text());
+    return response.json();
+}
+
+function setRowUiAtiva(row, ativa) {
+    row.dataset.status = ativa ? 'ativa' : 'parada';
+    row.querySelector('.auto-btn-iniciar').disabled = ativa;
+    row.querySelector('.auto-btn-parar').disabled = !ativa;
+    const badge = row.querySelector('.auto-status-badge');
+    badge.textContent = ativa ? 'ativa' : 'parada';
+    badge.className = `status status-${ativa ? 'processando' : 'pendente'} auto-status-badge`;
+}
+
+async function iniciarTabela(row) {
+    const id = row.dataset.id;
+    try {
+        const resp = await fetch(`/importacao-automatica/${id}/iniciar`, { method: 'POST' });
+        const data = await parseJsonResponse(resp);
+        if (data.status !== 'sucesso') {
+            appendLog(`✗ ${row.dataset.destino}: ${data.mensagem || 'erro ao iniciar'}`, 'error');
+            return;
+        }
+        setRowUiAtiva(row, true);
+        appendLog(`▶️ ${row.dataset.destino}: rotina iniciada (a cada ${row.dataset.intervaloMin} min).`, 'success');
+        agendarTabela(row);
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    }
+}
+
+async function pararTabela(row) {
+    const id = row.dataset.id;
+    try {
+        const resp = await fetch(`/importacao-automatica/${id}/parar`, { method: 'POST' });
+        const data = await parseJsonResponse(resp);
+        if (data.status !== 'sucesso') {
+            appendLog(`✗ ${row.dataset.destino}: ${data.mensagem || 'erro ao parar'}`, 'error');
+            return;
+        }
+        setRowUiAtiva(row, false);
+        desagendarTabela(row);
+        appendLog(`⏹️ ${row.dataset.destino}: rotina parada.`, 'warning');
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    }
+}
+
+async function iniciarTodas() {
+    const rows = Array.from(document.querySelectorAll('.auto-tabela-row'));
+    const paradas = rows.filter(row => row.dataset.status !== 'ativa');
+    if (paradas.length === 0) {
+        appendLog('ℹ️ Todas as tabelas já estão ativas.', 'info');
+        return;
+    }
+    appendLog(`▶️ Iniciando ${paradas.length} tabela(s)...`, 'info');
+    for (const row of paradas) {
+        await iniciarTabela(row);
+    }
+}
+
+async function pararTodas() {
+    const rows = Array.from(document.querySelectorAll('.auto-tabela-row'));
+    const ativas = rows.filter(row => row.dataset.status === 'ativa');
+    if (ativas.length === 0) {
+        appendLog('ℹ️ Nenhuma tabela ativa no momento.', 'info');
+        return;
+    }
+    appendLog(`⏹️ Parando ${ativas.length} tabela(s)...`, 'info');
+    for (const row of ativas) {
+        await pararTabela(row);
+    }
+}
+
+function agendarTabela(row) {
+    const id = row.dataset.id;
+    if (autoTimers[id]) return; // já agendada
+
+    const intervaloMs = (parseInt(row.dataset.intervaloMin, 10) || 5) * 60 * 1000;
+    executarCiclo(row); // roda imediatamente ao iniciar
+    autoTimers[id] = setInterval(() => executarCiclo(row), intervaloMs);
+}
+
+function desagendarTabela(row) {
+    const id = row.dataset.id;
+    if (autoTimers[id]) {
+        clearInterval(autoTimers[id]);
+        delete autoTimers[id];
+    }
+}
+
+function marcarExecutando(row, executando) {
+    const badge = row.querySelector('.auto-status-badge');
+    const wrap = row.querySelector('.auto-progress-wrap');
+    if (executando) {
+        badge.textContent = '⏳ executando...';
+        badge.classList.add('status-processando');
+        if (wrap) wrap.style.display = '';
+    } else {
+        const ativa = row.dataset.status === 'ativa';
+        badge.textContent = ativa ? 'ativa' : 'parada';
+        badge.className = `status status-${ativa ? 'processando' : 'pendente'} auto-status-badge`;
+        if (wrap) wrap.style.display = 'none';
+    }
+}
+
+function atualizarProgressoLote(row, job) {
+    const wrap = row.querySelector('.auto-progress-wrap');
+    const bar = row.querySelector('.auto-progress-bar');
+    const texto = row.querySelector('.auto-progress-text');
+    if (!wrap || !bar || !texto) return;
+
+    const total = job.total_lotes || 0;
+    const atual = job.lote_atual || 0;
+    const pct = total > 0 ? Math.round((atual / total) * 100) : 0;
+    const label = total > 0 ? `Lote ${atual}/${total} (${pct}%)` : (job.mensagem || 'preparando...');
+
+    bar.style.width = pct + '%';
+    texto.textContent = label;
+}
+
+function incrementarContadorCiclos(row) {
+    const el = row.querySelector('.auto-ciclos-count');
+    if (!el) return;
+    el.textContent = (parseInt(el.textContent, 10) || 0) + 1;
+}
+
+function aguardar(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function executarCiclo(row) {
+    const id = row.dataset.id;
+    if (autoEmExecucao[id]) return; // ciclo anterior ainda rodando
+    if (row.dataset.status !== 'ativa') { desagendarTabela(row); return; }
+
+    autoEmExecucao[id] = true;
+    appendLog(`⏳ ${row.dataset.destino}: iniciando ciclo...`, 'info');
+    marcarExecutando(row, true);
+
+    try {
+        // 1) dispara o ciclo em segundo plano
+        const respStart = await fetch(`/api/importacao-automatica/${id}/ciclo`, { method: 'POST' });
+        const dataStart = await parseJsonResponse(respStart);
+
+        if (!respStart.ok || dataStart.status === 'erro') {
+            appendLog(`✗ ${row.dataset.destino}: ${dataStart.mensagem || 'erro ao iniciar ciclo'}`, 'error');
+            return;
+        }
+
+        // 2) acompanha o progresso por lote até terminar
+        let job = null;
+        while (true) {
+            const respStatus = await fetch(`/api/importacao-automatica/${id}/ciclo/status`);
+            job = await parseJsonResponse(respStatus);
+
+            if (!job || job.status === 'inativo') break;
+            atualizarProgressoLote(row, job);
+
+            if (job.status === 'concluido' || job.status === 'erro' || job.status === 'cancelado') break;
+            await aguardar(1000);
+        }
+
+        if (job && job.status === 'cancelado') {
+            appendLog(`⏹️ ${row.dataset.destino}: ciclo interrompido.`, 'warning');
+            return;
+        }
+
+        if (!job || job.status === 'erro') {
+            appendLog(`✗ ${row.dataset.destino}: ${(job && job.mensagem) || 'erro no ciclo'}`, 'error');
+            return;
+        }
+
+        incrementarContadorCiclos(row);
+
+        const ultimoIdEl = row.querySelector('.auto-ultimo-id');
+        if (ultimoIdEl && job.ultimo_id_destino != null) {
+            ultimoIdEl.textContent = Number(job.ultimo_id_destino).toLocaleString('pt-BR');
+        }
+
+        const partes = [];
+        if (job.registros_inseridos) partes.push(`${job.registros_inseridos} inserido(s)`);
+        if (job.registros_atualizados) partes.push(`${job.registros_atualizados} atualizado(s)`);
+        if (job.registros_com_erro) partes.push(`${job.registros_com_erro} com erro`);
+        const loteInfo = job.total_lotes ? ` [${job.total_lotes} lote(s) de ${job.tamanho_lote}]` : '';
+
+        if (partes.length > 0) {
+            appendLog(`✓ ${row.dataset.destino}: ${partes.join(', ')}${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'success');
+        } else {
+            appendLog(`○ ${row.dataset.destino}: nenhum registro novo${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'info');
+        }
+    } catch (e) {
+        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
+    } finally {
+        autoEmExecucao[id] = false;
+        marcarExecutando(row, false);
+    }
+}
+</script>
+{% endblock %}

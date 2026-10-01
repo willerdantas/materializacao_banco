@@ -1,0 +1,4959 @@
+# app.py - Aplicação Flask para Controle de Migração
+# ============================================================
+
+from flask import Flask, render_template, request, jsonify, flash, redirect, url_for, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet, InvalidToken
+import json
+import psycopg2
+from psycopg2 import InterfaceError, OperationalError
+from psycopg2.extras import RealDictCursor
+import os
+import threading
+import time
+import math
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'importacao-intergash-dev-key')
+app.config['DB_SAVED_CONNECTIONS'] = []
+app.config['DB_SAVED_CONNECTIONS_LOADED'] = False
+app.config['DB_CONFIG_LOADED'] = False
+
+AUTO_IMPORT_EXAMPLES = [
+    {'label': 'Admissão', 'origem': 'v_admissao', 'destino': 't_admissao', 'campo_id': 'isn_admissao'},
+    {'label': 'Exame Solic.', 'origem': 'v_exame_solic', 'destino': 't_exame_solic', 'campo_id': 'isn_exame_solic'},
+    {'label': 'Internação', 'origem': 'v_internacao', 'destino': 't_internacao', 'campo_id': 'isn_internacao'},
+    {'label': 'Internação Alta', 'origem': 'v_internacao_alta', 'destino': 't_internacao_alta', 'campo_id': 'isn_internacao_alta'},
+    {'label': 'Internação Leito', 'origem': 'v_internacao_leito', 'destino': 't_internacao_leito', 'campo_id': 'isn_internacao_leito'},
+    {'label': 'Paciente', 'origem': 'v_paciente', 'destino': 't_paciente', 'campo_id': 'isn_paciente'},
+    {'label': 'Marcação', 'origem': 'v_marcacao', 'destino': 't_marcacao', 'campo_id': 'isn_marcacao'}
+]
+
+# Configuração do Banco de Dados
+DEFAULT_DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'postgres'),
+    'user': os.getenv('DB_USER', ''),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'port': int(os.getenv('DB_PORT', '5432')),
+    'schema_destino': os.getenv('DB_SCHEMA_DESTINO', 'public')
+}
+DB_CLIENT_ENCODING_CANDIDATES = ('WIN1252', 'LATIN1', 'UTF8', 'LATIN9', 'SQL_ASCII')
+DB_CONNECT_KEYS = ('host', 'database', 'user', 'password', 'port')
+APP_DATA_DIR = os.path.join(app.root_path, 'data')
+SAVED_CONNECTIONS_FILE = os.path.join(APP_DATA_DIR, 'db_saved_connections.json')
+ACTIVE_DB_CONFIG_FILE = os.path.join(APP_DATA_DIR, 'db_active_config.json')
+FDW_CONFIG_FILE = os.path.join(APP_DATA_DIR, 'fdw_config.json')  # credenciais da origem (FDW)
+USERS_FILE = os.path.join(APP_DATA_DIR, 'usuarios.json')  # usuários e perfis de acesso
+app.config['DB_CONFIG'] = DEFAULT_DB_CONFIG.copy()
+
+# Configuração padrão do FDW (origem dos dados)
+DEFAULT_FDW_CONFIG = {
+    'host': '',
+    'port': 5432,
+    'database': '',
+    'user': '',
+    'password': '',
+    'schema_remoto': 'public',
+    'schema_local': 'fdw_externo',
+}
+app.config['FDW_CONFIG'] = DEFAULT_FDW_CONFIG.copy()
+app.config['FDW_CONFIG_LOADED'] = False
+
+# NOVO: schema usado como staging antes do upsert em public
+TEMP_SCHEMA_NAME = 'temp'
+
+# ============================================================
+# WORKER DE PROCESSAMENTO EM SEGUNDO PLANO
+# ============================================================
+
+background_jobs = {}
+background_jobs_lock = threading.Lock()
+
+
+def _generate_job_id(job_type, resource_id):
+    """Gera um identificador único para um job em segundo plano."""
+    return f'{job_type}:{resource_id}'
+
+
+def get_background_job(job_id):
+    """Retorna o estado de um job ou None."""
+    with background_jobs_lock:
+        return background_jobs.get(job_id)
+
+
+def set_background_job(job_id, data):
+    """Atualiza o estado de um job."""
+    with background_jobs_lock:
+        background_jobs[job_id] = data
+
+
+def remove_background_job(job_id):
+    """Remove um job da lista."""
+    with background_jobs_lock:
+        background_jobs.pop(job_id, None)
+
+
+def contar_migracoes_manuais_em_execucao():
+    """Conta jobs de segundo plano ativos (processando/iniciando) das
+    migrações manuais — mais confiável que o campo `status` de
+    controle_migracao, que o worker de migração não atualiza durante o
+    processamento."""
+    with background_jobs_lock:
+        return sum(
+            1 for job in background_jobs.values()
+            if job.get('tipo') in ('migracao', 'refresh') and job.get('status') in ('processando', 'iniciando')
+        )
+
+
+# ============================================================
+# STAGING EM SCHEMA TEMP + PROCESSAMENTO EM LOTE
+# ============================================================
+# A faixa de IDs é dividida em lotes (tamanho_lote). Para cada lote:
+#   1) copia os IDs do lote da origem para uma tabela em `temp`
+#      (com reconexão automática se a origem cair);
+#   2) faz UPSERT do lote inteiro em UMA instrução SQL (rápido);
+#   3) se o upsert em lote falhar, cai para registro-a-registro
+#      só naquele lote (não perde o restante da migração);
+#   4) grava o status de todo o lote em UMA instrução (bulk).
+
+DEFAULT_TAMANHO_LOTE = 500   # usado se o front não enviar valor
+MAX_TAMANHO_LOTE = 5000      # trava para não gerar staging gigante
+
+
+def obter_staging_table(migracao_id):
+    """Nome único da tabela temp por migração."""
+    return f'{TEMP_SCHEMA_NAME}.stg_mig_{migracao_id}'
+
+
+def ensure_temp_schema(conn):
+    """Garante existência do schema temp."""
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(TEMP_SCHEMA_NAME)}')
+    conn.commit()
+
+
+def preparar_staging_vazia(conn, migracao_id, tab_orig, cols_ins):
+    """Cria a tabela temp vazia (só estrutura), reaproveitada por todos os lotes."""
+    staging = obter_staging_table(migracao_id)
+    quoted_source = quote_qualified_relation(normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local']))
+    insert_columns = _split_sql_columns(cols_ins)
+    if not insert_columns:
+        raise ValueError('Colunas de inserção não preparadas para a migração.')
+    cols_select = ', '.join([f's.{quote_identifier(c)}' for c in insert_columns])
+
+    with conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS {staging}')  # remove staging antigo
+        cur.execute(                                    # cria só a estrutura (WHERE FALSE)
+            f'CREATE UNLOGGED TABLE {staging} AS '
+            f'SELECT {cols_select} FROM {quoted_source} s WHERE FALSE'
+        )
+    conn.commit()
+    return staging
+
+
+def copiar_lote_para_staging(conn, staging, tab_orig, campo, cols_ins, ids_lote):
+    """Substitui o conteúdo da staging pelos IDs do lote atual."""
+    quoted_source = quote_qualified_relation(normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local']))
+    quoted_key = quote_identifier(campo)
+    insert_columns = _split_sql_columns(cols_ins)
+    cols_select = ', '.join([f's.{quote_identifier(c)}' for c in insert_columns])
+    ids_int = [int(v) for v in ids_lote]  # array para WHERE ... = ANY
+
+    with conn.cursor() as cur:
+        cur.execute(f'TRUNCATE TABLE {staging}')  # reaproveita a tabela, só troca linhas
+        cur.execute(
+            f'INSERT INTO {staging} '
+            f'SELECT {cols_select} FROM {quoted_source} s '
+            f'WHERE s.{quoted_key} = ANY(%s)',
+            (ids_int,)
+        )
+    conn.commit()
+
+
+def remover_staging(conn, migracao_id):
+    """Remove a tabela temp ao final do processamento."""
+    staging = obter_staging_table(migracao_id)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS {staging}')
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()  # evita deixar a conexão em estado sujo
+        except Exception:
+            pass
+
+
+def obter_staging_table_auto(tabela_destino):
+    """Nome da staging da Importação Automática — prefixo 'c_' para nunca colidir
+    com o staging das migrações manuais (que usa 'stg_mig_<id>'), já que a
+    importação automática roda em loop e pode coexistir com uma migração ativa.
+    Ex.: destino 'public.t_internacao' -> 'temp.c_t_internacao'.
+    """
+    _, nome_tabela = tabela_destino.split('.', 1)
+    return f'{TEMP_SCHEMA_NAME}.c_{nome_tabela}'
+
+
+def obter_staging_table_agendamento(tabela_destino):
+    """Nome da staging do Agendar Importação (sincronização completa) —
+    prefixo 'a_' para nunca colidir com o staging das migrações manuais
+    ('stg_mig_<id>') nem com o da importação automática ('c_<tabela>'), já
+    que os três podem rodar ao mesmo tempo contra a mesma tabela destino.
+    Ex.: destino 'public.t_internacao' -> 'temp.a_t_internacao'.
+    """
+    _, nome_tabela = tabela_destino.split('.', 1)
+    return f'{TEMP_SCHEMA_NAME}.a_{nome_tabela}'
+
+
+def executar_com_reconexao(operacao, abrir_conexao_fn, conn, max_tentativas=4, job_id=None, etapa='origem'):
+    """Roda `operacao(conn)`; se a conexão com a origem cair, reconecta e tenta de novo.
+    Conflito de recovery (standby ocupado com replay do WAL) recebe mais tentativas
+    e espera maior, já que costuma levar mais tempo pra se resolver sozinho do que
+    uma queda de conexão comum."""
+    tentativa = 0
+    while True:
+        try:
+            operacao(conn)
+            return conn
+        except (OperationalError, InterfaceError) as error:
+            tentativa += 1
+            eh_recovery = _is_recovery_conflict(error)
+            limite = 12 if eh_recovery else max_tentativas
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if tentativa >= limite:
+                raise
+            espera = min(90, 15 * tentativa) if eh_recovery else min(30, 5 * tentativa)
+            if job_id:
+                motivo = (
+                    'Conflito de recovery na origem (standby ocupado com replay do WAL)'
+                    if eh_recovery else f'Conexão com a {etapa} caiu'
+                )
+                set_background_job(job_id, {
+                    **(get_background_job(job_id) or {}),
+                    'mensagem': f'{motivo}. Reconectando em {espera}s (tentativa {tentativa}/{limite})...',
+                })
+            time.sleep(espera)
+            conn = abrir_conexao_fn()  # reabre a conexão (origem e destino usam a mesma)
+
+
+def montar_sql_upsert_lote(staging, tab_dest, campo, cols_ins):
+    """SQL que faz o UPSERT do lote INTEIRO em uma única instrução."""
+    quoted_target = quote_qualified_relation(normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino']))
+    quoted_key = quote_identifier(campo)
+    insert_columns = _split_sql_columns(cols_ins)
+    key_token = (campo or '').strip().lower()
+    update_columns = [c for c in insert_columns if _normalize_identifier_token(c) != key_token]
+
+    if update_columns:
+        update_assignments = ', '.join([f'{c} = EXCLUDED.{c}' for c in update_columns])
+        difference_clause = ' OR '.join(
+            [f'{quoted_target}.{c} IS DISTINCT FROM EXCLUDED.{c}' for c in update_columns]
+        )
+        conflict_sql = f"""
+            ON CONFLICT ({quoted_key}) DO UPDATE
+            SET {update_assignments}
+            WHERE {difference_clause}
+            RETURNING {quoted_key} AS chave, (xmax = 0) AS inserido
+        """
+    else:
+        conflict_sql = f"""
+            ON CONFLICT ({quoted_key}) DO NOTHING
+            RETURNING {quoted_key} AS chave, (xmax = 0) AS inserido
+        """
+
+    return f"""
+        INSERT INTO {quoted_target} ({cols_ins})
+        SELECT {', '.join(insert_columns)} FROM {staging}
+        {conflict_sql}
+    """
+
+
+def processar_lote_bulk(conn, staging, tab_dest, campo, cols_ins, ids_lote):
+    """Faz o upsert do lote inteiro de uma vez (caminho rápido)."""
+    quoted_key = quote_identifier(campo)
+    sql_upsert = montar_sql_upsert_lote(staging, tab_dest, campo, cols_ins)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f'SELECT {quoted_key} AS chave FROM {staging}')  # ids que existem na origem
+        presentes = {str(r['chave']) for r in cur.fetchall()}
+
+        cur.execute(sql_upsert)
+        retornados = {str(r['chave']): r['inserido'] for r in cur.fetchall()}
+    conn.commit()
+
+    return {
+        'inseridos': [c for c, ins in retornados.items() if ins],
+        'atualizados': [c for c, ins in retornados.items() if not ins],
+        'ja_existem': [c for c in presentes if c not in retornados],
+        'nao_encontrados': [c for c in ids_lote if c not in presentes],
+        'com_erro': [],
+    }
+
+
+def processar_lote_fallback(conn, staging, tab_dest, campo, cols_ins, ids_lote):
+    """Processa o lote registro a registro (usado só quando o upsert em lote falha)."""
+    cols_sel_staging = ', '.join([f's.{quote_identifier(c)}' for c in _split_sql_columns(cols_ins)])
+    sql_upsert_one = build_single_record_upsert_sql(staging, tab_dest, campo, cols_ins, cols_sel_staging)
+
+    resultado = {'inseridos': [], 'atualizados': [], 'ja_existem': [], 'nao_encontrados': [], 'com_erro': []}
+
+    for chave in ids_lote:
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql_upsert_one, (int(chave),))
+                outcome = cur.fetchone() or {}
+            conn.commit()
+
+            if not outcome.get('existe_origem'):
+                resultado['nao_encontrados'].append(chave)
+            elif outcome.get('inserido') is True:
+                resultado['inseridos'].append(chave)
+            elif outcome.get('inserido') is False:
+                resultado['atualizados'].append(chave)
+            else:
+                resultado['ja_existem'].append(chave)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            resultado['com_erro'].append({'chave': chave, 'erro': str(e)[:500]})
+
+    return resultado
+
+
+def gravar_status_lote(conn, migracao_id, resultado):
+    """Grava o status de TODO o lote em uma única instrução (bulk, via unnest)."""
+    chaves, status_list, erro_list = [], [], []
+
+    for chave in resultado.get('inseridos', []):
+        chaves.append(chave); status_list.append('inserido'); erro_list.append(None)
+    for chave in resultado.get('atualizados', []):
+        chaves.append(chave); status_list.append('atualizado'); erro_list.append(None)
+    for chave in resultado.get('ja_existem', []):
+        chaves.append(chave); status_list.append('ja_existe'); erro_list.append(None)
+    for chave in resultado.get('nao_encontrados', []):
+        chaves.append(chave); status_list.append('nao_encontrado'); erro_list.append(None)
+    for item in resultado.get('com_erro', []):
+        chaves.append(item['chave']); status_list.append('erro'); erro_list.append(item['erro'])
+
+    if not chaves:
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO controle_migracao_lotes
+                (migracao_id, numero_lote, chave_valor, status, erro_msg, updated_at)
+            SELECT %s, 1, x.chave, x.status, x.erro, CURRENT_TIMESTAMP
+            FROM unnest(%s::text[], %s::text[], %s::text[]) AS x(chave, status, erro)
+            ON CONFLICT (migracao_id, chave_valor) DO UPDATE
+            SET status = EXCLUDED.status, erro_msg = EXCLUDED.erro_msg, updated_at = CURRENT_TIMESTAMP
+            """,
+            (migracao_id, chaves, status_list, erro_list)
+        )
+    conn.commit()
+
+
+def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_segundos,
+                                 apenas_erros=False, tamanho_lote=DEFAULT_TAMANHO_LOTE):
+    """Thread worker que processa a faixa de IDs em LOTES (ver seção acima).
+    Cada lote é copiado para staging em `temp` e gravado no destino com poucas
+    instruções SQL, muito mais rápido que processar registro a registro.
+    """
+    job = get_background_job(job_id)
+    if not job:
+        return
+
+    tamanho_lote = max(1, min(int(tamanho_lote or DEFAULT_TAMANHO_LOTE), MAX_TAMANHO_LOTE))
+    set_background_job(job_id, {**job, 'status': 'processando', 'inicio': datetime.now().isoformat(),
+                                 'tamanho_lote': tamanho_lote})
+
+    registros_inseridos = 0
+    registros_ja_existem = 0
+    registros_atualizados = 0
+    registros_nao_encontrados = 0
+    registros_com_erro = []
+    total_faixa = id_fim - id_inicio + 1
+
+    def abrir_conexao():
+        for enc in get_db_client_encoding_candidates():
+            try:
+                c = open_db_connection(client_encoding=enc, statement_timeout_ms=120000)
+                persist_working_client_encoding(enc)
+                return c
+            except Exception:
+                continue
+        return open_db_connection(statement_timeout_ms=120000)
+
+    try:
+        with app.app_context():
+            conn = abrir_conexao()
+            try:
+                # Ler config da migração UMA VEZ
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT tabela_origem, tabela_destino, campo_id,
+                               sql_colunas_insert, sql_colunas_select
+                        FROM controle_migracao WHERE id = %s
+                    """, (migracao_id,))
+                    cfg = cur.fetchone()
+                conn.commit()
+
+                if not cfg:
+                    set_background_job(job_id, {
+                        **get_background_job(job_id),
+                        'status': 'erro',
+                        'mensagem': 'Migração não encontrada.',
+                    })
+                    return
+
+                tab_orig = cfg['tabela_origem']
+                tab_dest = cfg['tabela_destino']
+                campo = cfg['campo_id']
+                cols_ins = cfg['sql_colunas_insert']
+                cols_sel = cfg['sql_colunas_select']
+
+                if not cols_ins or not cols_sel:
+                    set_background_job(job_id, {
+                        **get_background_job(job_id),
+                        'status': 'erro',
+                        'mensagem': 'Colunas não preparadas. Atualize a origem primeiro.',
+                    })
+                    return
+
+                # Montar lista de IDs a processar
+                if apenas_erros:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute("""SELECT chave_valor FROM controle_migracao_lotes
+                                       WHERE migracao_id = %s AND status = 'erro'
+                                       ORDER BY id""", (migracao_id,))
+                        ids_list = [r['chave_valor'] for r in cur.fetchall()]
+                    conn.commit()
+                    total_faixa = len(ids_list)
+                    if total_faixa == 0:
+                        set_background_job(job_id, {
+                            **get_background_job(job_id),
+                            'status': 'concluido',
+                            'mensagem': 'Nenhum registro com erro encontrado.',
+                            'registros_inseridos': 0,
+                            'fim': datetime.now().isoformat(),
+                        })
+                        return
+                else:
+                    ids_list = [str(v) for v in range(id_inicio, id_fim + 1)]
+
+                # Staging vazia é criada UMA vez; cada lote só troca o conteúdo
+                ensure_temp_schema(conn)                                     # garante schema temp
+                staging = preparar_staging_vazia(conn, migracao_id, tab_orig, cols_ins)  # cria estrutura
+
+                total_lotes = math.ceil(len(ids_list) / tamanho_lote)
+
+                for lote_idx in range(total_lotes):
+                    current_job = get_background_job(job_id)
+                    if not current_job or current_job.get('cancelar'):
+                        set_background_job(job_id, {
+                            **(get_background_job(job_id) or {}),
+                            'status': 'cancelado',
+                            'mensagem': f'Interrompido pelo usuário no lote {lote_idx + 1}/{total_lotes}.',
+                            'ids_verificados': lote_idx * tamanho_lote,
+                            'total_faixa': len(ids_list),
+                            'registros_inseridos': registros_inseridos,
+                            'registros_ja_existem': registros_ja_existem,
+                            'registros_atualizados': registros_atualizados,
+                            'registros_nao_encontrados': registros_nao_encontrados,
+                            'registros_com_erro': registros_com_erro,
+                        })
+                        return
+
+                    ids_lote = ids_list[lote_idx * tamanho_lote: (lote_idx + 1) * tamanho_lote]
+
+                    set_background_job(job_id, {
+                        **get_background_job(job_id),
+                        'mensagem': f'Lote {lote_idx + 1}/{total_lotes}: copiando {len(ids_lote)} registro(s) da origem...',
+                    })
+
+                    # 1) Copia o lote para staging — reconecta à origem se a conexão cair
+                    conn = executar_com_reconexao(
+                        lambda c: copiar_lote_para_staging(c, staging, tab_orig, campo, cols_ins, ids_lote),
+                        abrir_conexao, conn, job_id=job_id, etapa='origem'
+                    )
+
+                    # 2) Upsert em lote (caminho rápido); se falhar, cai pro fallback linha a linha
+                    try:
+                        resultado = processar_lote_bulk(conn, staging, tab_dest, campo, cols_ins, ids_lote)
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        set_background_job(job_id, {
+                            **get_background_job(job_id),
+                            'mensagem': f'Lote {lote_idx + 1}/{total_lotes}: upsert em lote falhou, reprocessando registro a registro...',
+                        })
+                        resultado = processar_lote_fallback(conn, staging, tab_dest, campo, cols_ins, ids_lote)
+
+                    # 3) Grava o status do lote inteiro em uma única instrução
+                    gravar_status_lote(conn, migracao_id, resultado)
+
+                    registros_inseridos += len(resultado['inseridos'])
+                    registros_atualizados += len(resultado['atualizados'])
+                    registros_ja_existem += len(resultado['ja_existem'])
+                    registros_nao_encontrados += len(resultado['nao_encontrados'])
+                    registros_com_erro.extend(resultado['com_erro'])
+
+                    ids_verificados = min((lote_idx + 1) * tamanho_lote, len(ids_list))
+
+                    # Atualizar registros_processados no banco a cada lote (não mais a cada registro)
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE controle_migracao
+                                SET registros_processados = (
+                                        SELECT COUNT(*) FROM controle_migracao_lotes
+                                        WHERE migracao_id = %s AND status IN ('inserido', 'ja_existe', 'atualizado')
+                                    ),
+                                    lote_atual = %s,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s
+                            """, (migracao_id, lote_idx + 1, migracao_id))
+                        conn.commit()
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+
+                    set_background_job(job_id, {
+                        **get_background_job(job_id),
+                        'status': 'processando',
+                        'ids_verificados': ids_verificados,
+                        'total_faixa': len(ids_list),
+                        'registros_inseridos': registros_inseridos,
+                        'registros_ja_existem': registros_ja_existem,
+                        'registros_atualizados': registros_atualizados,
+                        'registros_nao_encontrados': registros_nao_encontrados,
+                        'registros_com_erro': registros_com_erro,
+                        'registro_atual': ids_lote[-1] if ids_lote else None,
+                        'registros_processados': registros_inseridos + registros_ja_existem + registros_atualizados,
+                    })
+
+                    # Delay entre LOTES (não mais entre cada registro) — bem mais rápido
+                    if lote_idx < total_lotes - 1 and delay_segundos > 0:
+                        for _ in range(delay_segundos * 10):
+                            cj = get_background_job(job_id)
+                            if not cj or cj.get('cancelar'):
+                                break
+                            time.sleep(0.1)
+
+            finally:
+                # Staging só existe durante o processamento desta migração
+                try:
+                    remover_staging(conn, migracao_id)  # limpa a tabela temp
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    except Exception as e:
+        set_background_job(job_id, {
+            **(get_background_job(job_id) or {}),
+            'status': 'erro',
+            'mensagem': f'Erro fatal no worker: {str(e)}',
+            'registros_inseridos': registros_inseridos,
+            'registros_atualizados': registros_atualizados,
+            'registros_com_erro': registros_com_erro,
+        })
+        return
+
+    partes = []
+    if registros_inseridos > 0:
+        partes.append(f'{registros_inseridos} inserido(s)')
+    if registros_atualizados > 0:
+        partes.append(f'{registros_atualizados} atualizado(s)')
+    if registros_ja_existem > 0:
+        partes.append(f'{registros_ja_existem} já existente(s)')
+    if registros_nao_encontrados > 0:
+        partes.append(f'{registros_nao_encontrados} não encontrado(s)')
+    if registros_com_erro:
+        partes.append(f'{len(registros_com_erro)} com erro')
+    final_msg = 'Processamento concluído: ' + (', '.join(partes) if partes else 'nenhum registro processado') + '.'
+
+    set_background_job(job_id, {
+        **get_background_job(job_id),
+        'status': 'concluido',
+        'mensagem': final_msg,
+        'ids_verificados': total_faixa,
+        'total_faixa': total_faixa,
+        'registros_inseridos': registros_inseridos,
+        'registros_ja_existem': registros_ja_existem,
+        'registros_atualizados': registros_atualizados,
+        'registros_nao_encontrados': registros_nao_encontrados,
+        'registros_com_erro': registros_com_erro,
+        'fim': datetime.now().isoformat(),
+    })
+
+
+# ============================================================
+# ENCRIPTAÇÃO DAS SENHAS PERSISTIDAS EM DISCO
+# ============================================================
+# As senhas do banco de destino e do FDW precisam ser recuperáveis (o app
+# conecta com elas), então usamos encriptação simétrica (Fernet/AES), não
+# hash. A chave vem de APP_ENCRYPTION_KEY (recomendado em produção) ou,
+# na ausência dela, de um arquivo local gerado na primeira execução.
+# Em memória (app.config) as senhas continuam em texto puro — só o que vai
+# para os arquivos .json em disco é encriptado.
+
+ENCRYPTION_KEY_FILE = os.path.join(APP_DATA_DIR, '.encryption_key')
+
+
+def _carregar_ou_criar_chave_encriptacao():
+    """Retorna a chave Fernet a usar: de env var, de arquivo local, ou gera uma nova."""
+    chave_env = os.getenv('APP_ENCRYPTION_KEY')
+    if chave_env:
+        return chave_env.encode('ascii')
+
+    os.makedirs(APP_DATA_DIR, exist_ok=True)  # ensure_app_data_dir() ainda não foi definida aqui
+    if os.path.exists(ENCRYPTION_KEY_FILE):
+        with open(ENCRYPTION_KEY_FILE, 'rb') as file_handle:
+            return file_handle.read().strip()
+
+    nova_chave = Fernet.generate_key()
+    with open(ENCRYPTION_KEY_FILE, 'wb') as file_handle:
+        file_handle.write(nova_chave)
+    os.chmod(ENCRYPTION_KEY_FILE, 0o600)  # só o dono do processo pode ler
+    return nova_chave
+
+
+_fernet = Fernet(_carregar_ou_criar_chave_encriptacao())
+
+
+def encrypt_secret(valor_texto_puro):
+    """Encripta uma string para persistir em disco. Vazio/None passa direto."""
+    if not valor_texto_puro:
+        return valor_texto_puro
+    return _fernet.encrypt(valor_texto_puro.encode('utf-8')).decode('ascii')
+
+
+def decrypt_secret_or_plain(valor):
+    """Descriptografa um valor salvo em disco. Se não for um token válido,
+    assume que é uma senha antiga ainda em texto puro (de antes desta
+    migração) e devolve como está, sem quebrar a conexão."""
+    if not valor:
+        return valor
+    try:
+        return _fernet.decrypt(valor.encode('ascii')).decode('utf-8')
+    except (InvalidToken, ValueError, UnicodeDecodeError):
+        return valor
+
+
+def _config_com_senha_encriptada(config_dict):
+    """Cópia do dict de configuração com 'password' encriptado, para salvar em
+    disco sem alterar o dict em memória (que precisa continuar em texto puro)."""
+    copia = dict(config_dict)
+    if copia.get('password'):
+        copia['password'] = encrypt_secret(copia['password'])
+    return copia
+
+
+# ============================================================
+# FUNÇÕES DE CONEXÃO COM O BANCO
+# ============================================================
+
+def get_db_config():
+    """Retorna a configuração atual de banco em memória."""
+    if not app.config.get('DB_CONFIG_LOADED'):
+        stored_config = load_json_file(ACTIVE_DB_CONFIG_FILE, default={})
+        if isinstance(stored_config, dict) and stored_config:
+            merged_config = DEFAULT_DB_CONFIG.copy()
+            merged_config.update(stored_config)
+            merged_config['password'] = decrypt_secret_or_plain(merged_config.get('password'))
+            app.config['DB_CONFIG'] = merged_config
+        app.config['DB_CONFIG_LOADED'] = True
+
+    return app.config.setdefault('DB_CONFIG', DEFAULT_DB_CONFIG.copy())
+
+
+def ensure_app_data_dir():
+    """Garante a existência do diretório de persistência local da aplicação."""
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+
+def load_json_file(file_path, default):
+    """Lê um arquivo JSON local retornando um valor padrão em caso de ausência ou erro."""
+    if not os.path.exists(file_path):
+        return default
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file_handle:
+            return json.load(file_handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json_file(file_path, data):
+    """Salva um arquivo JSON local com indentação estável."""
+    ensure_app_data_dir()
+    with open(file_path, 'w', encoding='utf-8') as file_handle:
+        json.dump(data, file_handle, ensure_ascii=False, indent=2)
+
+
+def persist_saved_db_connections():
+    """Persiste a lista de conexões salvas em disco (senhas encriptadas)."""
+    conexoes_para_salvar = [_config_com_senha_encriptada(c) for c in get_saved_db_connections()]
+    save_json_file(SAVED_CONNECTIONS_FILE, conexoes_para_salvar)
+
+
+def persist_active_db_config():
+    """Persiste a configuração ativa de banco em disco (senha encriptada)."""
+    save_json_file(ACTIVE_DB_CONFIG_FILE, _config_com_senha_encriptada(get_db_config()))
+
+
+def get_fdw_config():
+    """Retorna a configuração atual do FDW (origem) em memória."""
+    if not app.config.get('FDW_CONFIG_LOADED'):
+        stored_config = load_json_file(FDW_CONFIG_FILE, default={})
+        if isinstance(stored_config, dict) and stored_config:
+            merged_config = DEFAULT_FDW_CONFIG.copy()
+            merged_config.update(stored_config)
+            merged_config['password'] = decrypt_secret_or_plain(merged_config.get('password'))
+            app.config['FDW_CONFIG'] = merged_config
+        app.config['FDW_CONFIG_LOADED'] = True
+
+    return app.config.setdefault('FDW_CONFIG', DEFAULT_FDW_CONFIG.copy())
+
+
+def persist_fdw_config(fdw_config):
+    """Persiste a configuração do FDW em disco (senha encriptada), mantendo a
+    versão em texto puro em memória (usada pra conectar)."""
+    app.config['FDW_CONFIG'] = fdw_config
+    app.config['FDW_CONFIG_LOADED'] = True
+    save_json_file(FDW_CONFIG_FILE, _config_com_senha_encriptada(fdw_config))
+
+
+# ============================================================
+# USUÁRIOS E PERFIS DE ACESSO
+# ============================================================
+# Perfis suportados:
+#   'usuario'        -> acessa Dashboard, Nova Migração, Migrações, Importação Automática
+#   'administrador'  -> acessa tudo, incluindo Configurar Banco e esta tela de Usuários
+
+PERFIS_VALIDOS = ('usuario', 'administrador')
+
+
+def get_users():
+    """Retorna a lista de usuários cadastrados (sem cache — arquivo pequeno)."""
+    users = load_json_file(USERS_FILE, default=[])
+    return users if isinstance(users, list) else []
+
+
+def save_users(users):
+    """Persiste a lista de usuários em disco."""
+    save_json_file(USERS_FILE, users)
+
+
+def find_user_by_username(username):
+    """Busca um usuário pelo nome (case-insensitive)."""
+    alvo = (username or '').strip().lower()
+    if not alvo:
+        return None
+    for user in get_users():
+        if user.get('username', '').lower() == alvo:
+            return user
+    return None
+
+
+def criar_usuario(username, password, perfil):
+    """Valida e cria um novo usuário. Levanta ValueError em caso de dado inválido."""
+    username = (username or '').strip()
+    if not username:
+        raise ValueError('Informe o nome de usuário.')
+    if not password:
+        raise ValueError('Informe a senha.')
+    if perfil not in PERFIS_VALIDOS:
+        raise ValueError('Perfil inválido.')
+    if find_user_by_username(username):
+        raise ValueError(f'Já existe um usuário com o nome "{username}".')
+
+    users = get_users()
+    next_id = max([u['id'] for u in users], default=0) + 1
+    novo_usuario = {
+        'id': next_id,
+        'username': username,
+        'password_hash': generate_password_hash(password),
+        'perfil': perfil,
+        'created_at': datetime.now().isoformat(),
+    }
+    users.append(novo_usuario)
+    save_users(users)
+    return novo_usuario
+
+
+def verificar_login(username, password):
+    """Retorna o usuário se as credenciais forem válidas, senão None."""
+    user = find_user_by_username(username)
+    if not user or not check_password_hash(user.get('password_hash', ''), password or ''):
+        return None
+    return user
+
+
+def excluir_usuario(user_id):
+    """Remove um usuário pelo id. Levanta ValueError se não encontrado."""
+    users = get_users()
+    restantes = [u for u in users if u['id'] != user_id]
+    if len(restantes) == len(users):
+        raise ValueError('Usuário não encontrado.')
+    save_users(restantes)
+
+
+# Endpoints acessíveis sem login (nome da view Flask, não a URL)
+PUBLIC_ENDPOINTS = {'login', 'logout', 'static'}
+
+# Endpoints restritos ao perfil administrador
+ADMIN_ONLY_ENDPOINTS = {
+    'configurar_banco', 'usar_conexao_salva', 'excluir_conexao_salva',
+    'criar_banco_local_route', 'criar_fdw_route', 'criar_schema_temp_route', 'criar_tabelas_route',
+    'usuarios', 'excluir_usuario_route',
+}
+
+
+@app.before_request
+def exigir_login():
+    """Bloqueia acesso a quem não está logado; restringe telas de admin."""
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+
+    # Bootstrap: enquanto não existir NENHUM usuário, libera a tela de Usuários
+    # sem exigir login, só para permitir criar o primeiro administrador.
+    if request.endpoint in ('usuarios', 'excluir_usuario_route') and not get_users():
+        return None
+
+    if not session.get('usuario_id'):
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'erro', 'mensagem': 'Faça login para continuar.'}), 401
+        return redirect(url_for('login', next=request.path))
+
+    if request.endpoint in ADMIN_ONLY_ENDPOINTS and session.get('perfil') != 'administrador':
+        if request.path.startswith('/api/'):
+            return jsonify({'status': 'erro', 'mensagem': 'Acesso restrito a administradores.'}), 403
+        flash('Acesso restrito a administradores.', 'error')
+        return redirect(url_for('dashboard'))
+
+    return None
+
+
+def get_db_connection_config():
+    """Retorna apenas as opções válidas para abertura da conexão PostgreSQL."""
+    db_config = get_db_config()
+    connection_config = {key: db_config.get(key) for key in DB_CONNECT_KEYS}
+    connection_config.update({
+        'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '30')),
+        'keepalives': 1,
+        'keepalives_idle': int(os.getenv('DB_KEEPALIVES_IDLE', '15')),
+        'keepalives_interval': int(os.getenv('DB_KEEPALIVES_INTERVAL', '5')),
+        'keepalives_count': int(os.getenv('DB_KEEPALIVES_COUNT', '5')),
+        'application_name': 'importacao_intergash'
+    })
+    return connection_config
+
+
+def get_db_client_encoding_candidates():
+    """Retorna a ordem de encodings a testar na conexão com o banco."""
+    configured_encoding = (get_db_config().get('client_encoding') or '').strip().upper()
+    candidates = []
+
+    if configured_encoding:
+        candidates.append(configured_encoding)
+
+    for encoding in DB_CLIENT_ENCODING_CANDIDATES:
+        if encoding not in candidates:
+            candidates.append(encoding)
+
+    return candidates
+
+
+def get_saved_db_connections():
+    """Retorna a lista de conexões salvas, carregando-a do disco quando necessário."""
+    if not app.config.get('DB_SAVED_CONNECTIONS_LOADED'):
+        stored_connections = load_json_file(SAVED_CONNECTIONS_FILE, default=[])
+        if isinstance(stored_connections, list):
+            for connection in stored_connections:
+                if isinstance(connection, dict) and connection.get('password'):
+                    connection['password'] = decrypt_secret_or_plain(connection['password'])
+            app.config['DB_SAVED_CONNECTIONS'] = stored_connections
+        else:
+            app.config['DB_SAVED_CONNECTIONS'] = []
+        app.config['DB_SAVED_CONNECTIONS_LOADED'] = True
+
+    return app.config.setdefault('DB_SAVED_CONNECTIONS', [])
+
+
+def get_db_connection_by_id(connection_id):
+    """Busca um perfil salvo pelo identificador."""
+    for connection in get_saved_db_connections():
+        if connection['id'] == connection_id:
+            return connection
+    return None
+
+
+def sanitize_db_connection(connection):
+    """Remove dados sensíveis para exibição em template."""
+    sanitized = connection.copy()
+    sanitized['password'] = ''
+    return sanitized
+
+
+def get_db_form_data(db_config=None):
+    """Monta os dados exibidos no formulário de conexão."""
+    current_config = (db_config or get_db_config()).copy()
+    current_config['connection_mode'] = (
+        'local' if current_config.get('host') in ('localhost', '127.0.0.1', '') else 'remote'
+    )
+    current_config['password'] = ''
+    current_config['profile_name'] = current_config.get('profile_name', '')
+    current_config['profile_id'] = current_config.get('profile_id', '')
+    return current_config
+
+
+def get_posted_db_form_data(form_data):
+    """Lê os dados enviados pelo formulário preservando valores para reexibição."""
+    return {
+        'profile_id': (form_data.get('profile_id') or '').strip(),
+        'profile_name': (form_data.get('profile_name') or '').strip(),
+        'connection_mode': (form_data.get('connection_mode') or 'local').strip().lower(),
+        'host': (form_data.get('host') or 'localhost').strip(),
+        'database': (form_data.get('database') or 'postgres').strip(),
+        'user': (form_data.get('user') or '').strip(),
+        'password': '',
+        'port': (form_data.get('port') or '5432').strip(),
+        'schema_destino': (form_data.get('schema_destino') or 'public').strip()
+    }
+
+
+def build_db_config(form_data):
+    """Valida e normaliza os dados da conexão recebidos pelo formulário."""
+    connection_mode = (form_data.get('connection_mode') or 'local').strip().lower()
+    host = 'localhost' if connection_mode == 'local' else (form_data.get('host') or '').strip()
+    database = (form_data.get('database') or 'postgres').strip()
+    user = (form_data.get('user') or '').strip()
+    password = form_data.get('password') or ''
+    port_raw = (form_data.get('port') or '5432').strip()
+    schema_destino = (form_data.get('schema_destino') or 'public').strip()
+
+    if not host:
+        raise ValueError('Informe o IP ou host do banco remoto.')
+    if not database:
+        raise ValueError('Informe o nome do banco de dados.')
+    if not user:
+        raise ValueError('Informe o usuário do banco de dados.')
+    if not password:
+        raise ValueError('Informe a senha do banco de dados.')
+
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise ValueError('Informe uma porta válida para o banco de dados.') from exc
+
+    return {
+        'profile_name': (form_data.get('profile_name') or '').strip(),
+        'host': host,
+        'database': database,
+        'user': user,
+        'password': password,
+        'port': port,
+        'schema_destino': schema_destino
+    }
+
+
+def save_db_connection_profile(db_config, profile_id=None):
+    """Salva ou atualiza um perfil de conexão persistido localmente."""
+    profile_name = (db_config.get('profile_name') or '').strip()
+    if not profile_name:
+        raise ValueError('Informe um nome para salvar a conexão na lista.')
+
+    saved_connections = get_saved_db_connections()
+    next_id = max([item['id'] for item in saved_connections], default=0) + 1
+
+    profile_data = {
+        'id': profile_id or next_id,
+        'profile_name': profile_name,
+        'host': db_config['host'],
+        'database': db_config['database'],
+        'user': db_config['user'],
+        'password': db_config['password'],
+        'port': db_config['port'],
+        'schema_destino': db_config.get('schema_destino', 'public')
+    }
+
+    existing = get_db_connection_by_id(profile_data['id'])
+    if existing:
+        existing.update(profile_data)
+        persist_saved_db_connections()
+        return existing, False
+
+    saved_connections.append(profile_data)
+    persist_saved_db_connections()
+    return profile_data, True
+
+
+def create_migration_record(source_table, target_table, key_column, batch_size):
+    """Cria o registro inicial da migração sem disparar leitura ou atualização de lotes."""
+    result = execute_query(
+        """
+        INSERT INTO controle_migracao (
+            tabela_origem,
+            tabela_destino,
+            campo_id,
+            lote_atual,
+            total_registros,
+            registros_processados,
+            tamanho_lote,
+            id_maximo,
+            status,
+            data_inicio,
+            erro_msg,
+            updated_at
+        ) VALUES (%s, %s, %s, 0, 0, 0, %s, 0, 'pendente', CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
+        RETURNING id, total_registros, tamanho_lote
+        """,
+        (source_table, target_table, key_column, batch_size)
+    )
+
+    migration = result[0]
+    migration['total_lotes'] = 0
+    migration['migracao_id'] = migration['id']
+    return migration
+
+
+def update_migration_record(migracao_id, source_table, target_table, key_column):
+    """Atualiza origem/destino/chave de uma migração existente e zera os totais
+    e o mapeamento de colunas — quem recalcula é o refresh em segundo plano
+    disparado logo em seguida, com base nas tabelas novas."""
+    execute_query(
+        """
+        UPDATE controle_migracao
+        SET tabela_origem = %s,
+            tabela_destino = %s,
+            campo_id = %s,
+            sql_colunas_insert = NULL,
+            sql_colunas_select = NULL,
+            total_registros = 0,
+            registros_processados = 0,
+            id_maximo = 0,
+            lote_atual = 0,
+            status = 'pendente',
+            erro_msg = NULL,
+            data_fim = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (source_table, target_table, key_column, migracao_id),
+        fetch=False
+    )
+
+
+def refresh_migration_batches(migration_id):
+    """Atualiza a consulta de diferenças e retorna os totais recalculados da migração."""
+    result = execute_query(
+        "SELECT * FROM public.atualizar_lotes_migracao(%s)",
+        (migration_id,),
+        statement_timeout_ms=1800000  # 30 minutos para tabelas grandes
+    )
+    return result[0]
+
+
+def _background_refresh_batches_worker(job_id, migration_id):
+    """Thread worker que prepara colunas e obtém totais da migração.
+
+    Não carrega todos os IDs da origem — apenas obtém COUNT e MAX(id).
+    O processamento sequencial é feito pelo worker de migração.
+    """
+    job = get_background_job(job_id)
+    if not job:
+        return
+
+    set_background_job(job_id, {**job, 'status': 'processando', 'inicio': datetime.now().isoformat()})
+
+    try:
+        with app.app_context():
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'mensagem': 'Preparando colunas e obtendo totais da migração...',
+            })
+
+            # Limpar lotes anteriores (serão populados on-the-fly pelo processar_registro)
+            execute_query(
+                "DELETE FROM controle_migracao_lotes WHERE migracao_id = %s",
+                (migration_id,),
+                fetch=False
+            )
+
+            # Preparar colunas e obter COUNT + MAX(id) — sem carregar todos os IDs
+            info = execute_query(
+                "SELECT * FROM public.preparar_colunas_migracao(%s)",
+                (migration_id,),
+                statement_timeout_ms=600000
+            )[0]
+
+            total_registros = info.get('total_registros_out', 0) or 0
+            id_maximo = info.get('id_maximo_out', 0) or 0
+
+            # Resetar contadores para nova execução
+            execute_query(
+                """UPDATE controle_migracao
+                   SET registros_processados = 0, lote_atual = 0,
+                       status = CASE WHEN %s = 0 THEN 'concluido' ELSE 'pendente' END,
+                       erro_msg = NULL,
+                       data_inicio = CURRENT_TIMESTAMP,
+                       data_fim = CASE WHEN %s = 0 THEN CURRENT_TIMESTAMP ELSE NULL END,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (total_registros, total_registros, migration_id),
+                fetch=False
+            )
+
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'status': 'concluido',
+                'mensagem': f'Migração preparada: {total_registros} registros, ID máximo: {id_maximo}.',
+                'total_registros': total_registros,
+                'total_lotes': total_registros,
+                'fim': datetime.now().isoformat(),
+            })
+    except Exception as e:
+        set_background_job(job_id, {
+            **get_background_job(job_id),
+            'status': 'erro',
+            'mensagem': f'Erro ao preparar migração: {str(e)}',
+            'fim': datetime.now().isoformat(),
+        })
+
+
+def start_background_refresh_batches(migration_id):
+    """Inicia a geração de lotes em segundo plano e retorna imediatamente."""
+    job_id = _generate_job_id('refresh', migration_id)
+    existing = get_background_job(job_id)
+    if existing and existing.get('status') in ('processando', 'iniciando'):
+        return job_id
+
+    set_background_job(job_id, {
+        'job_id': job_id,
+        'tipo': 'refresh',
+        'migracao_id': migration_id,
+        'status': 'iniciando',
+        'mensagem': 'Carregando registros em segundo plano...',
+        'registros_processados': 0,
+        'registros_com_erro': [],
+        'registro_atual': None,
+        'total_registros_solicitados': 0,
+        'ultimo_progresso': None,
+        'cancelar': False,
+    })
+
+    thread = threading.Thread(
+        target=_background_refresh_batches_worker,
+        args=(job_id, migration_id),
+        daemon=True
+    )
+    thread.start()
+    return job_id
+
+
+def is_db_configured():
+    """Verifica se há credenciais suficientes para tentar abrir a conexão."""
+    db_config = get_db_connection_config()
+    return all(db_config.get(field) for field in DB_CONNECT_KEYS)
+
+
+def handle_db_connection_error(error, api=False):
+    """Padroniza a resposta para falhas de conexão com o banco."""
+    message = 'Não foi possível conectar ao banco de dados com a configuração atual.'
+    details = str(error)
+
+    if api:
+        return jsonify({
+            'status': 'erro',
+            'mensagem': message,
+            'detalhes': details,
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    flash(f'{message} Detalhes: {details}', 'error')
+    return redirect(url_for('configurar_banco'))
+
+
+@app.context_processor
+def inject_db_context():
+    """Disponibiliza informações resumidas da conexão para os templates."""
+    db_config = get_db_config()
+    return {
+        'db_configured': is_db_configured(),
+        'db_host': db_config.get('host') or 'localhost',
+        'db_name': db_config.get('database') or 'postgres'
+    }
+
+def get_search_path_option():
+    """Monta a opção -c search_path com o schema de destino configurado na frente."""
+    schema_destino = (get_db_config().get('schema_destino') or 'public').strip()
+    if schema_destino == 'public':
+        return '-c search_path=public'
+    return f'-c search_path={schema_destino},public'
+
+
+def get_db_connection():
+    """Cria conexão com o banco PostgreSQL"""
+    connection_config = get_db_connection_config()
+    connection_config['options'] = get_search_path_option()
+    return psycopg2.connect(**connection_config)
+
+
+def open_db_connection(client_encoding=None, statement_timeout_ms=300000):
+    """Abre a conexão e aplica client encoding explícito quando informado."""
+    connection_config = get_db_connection_config()
+    options_parts = [f'-c statement_timeout={statement_timeout_ms}', get_search_path_option()]
+    if client_encoding:
+        options_parts.append(f'-c client_encoding={client_encoding}')
+    connection_config['options'] = ' '.join(options_parts)
+
+    connection = psycopg2.connect(**connection_config)
+    if client_encoding:
+        connection.set_client_encoding(client_encoding)
+    return connection
+
+
+def persist_working_client_encoding(client_encoding):
+    """Memoriza o encoding que funcionou para evitar novas tentativas desnecessárias."""
+    if not client_encoding:
+        return
+
+    db_config = get_db_config()
+    if db_config.get('client_encoding') != client_encoding:
+        db_config['client_encoding'] = client_encoding
+        persist_active_db_config()
+
+
+def run_query_with_connection(conn, query, params=None, fetch=True):
+    """Executa uma consulta usando uma conexão já aberta."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        if fetch:
+            result = cur.fetchall()
+        else:
+            result = None
+        return result
+
+
+def _is_encoding_error(error):
+    """Verifica se um erro de banco é relacionado a encoding/codificação (PT e EN)."""
+    message = str(error).lower()
+    patterns = (
+        # Inglês
+        'invalid byte sequence',
+        'character with byte sequence',
+        'untranslatable character',
+        "codec can't decode",
+        'unicode decode error',
+        # Português (PostgreSQL com locale pt_BR)
+        'sequ\u00eancia de bytes',
+        'inv\u00e1lida para codifica',
+        'caractere intraduz\u00edvel',
+        'codifica\u00e7\u00e3o',
+    )
+    return any(p in message for p in patterns)
+
+
+def _is_recovery_conflict(error):
+    """Verifica se o erro é um conflito de recovery em standby PostgreSQL."""
+    message = str(error).lower()
+    patterns = (
+        'conflict with recovery',
+        'conflito com recupera',
+        'terminating connection',
+        'servidor fechou a conex',
+        'server closed the connection',
+        'connection to server was lost',
+    )
+    return any(p in message for p in patterns)
+
+
+def _fetch_with_recovery_retry(query, params=None, max_retries=5, statement_timeout_ms=1800000):
+    """Executa query com retry automático para conflitos de recovery em standby."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return execute_query(query, params, statement_timeout_ms=statement_timeout_ms)
+        except Exception as e:
+            if _is_recovery_conflict(e) and attempt < max_retries - 1:
+                wait_seconds = 10 * (attempt + 1)
+                time.sleep(wait_seconds)
+                last_error = e
+                continue
+            raise
+    raise last_error
+
+
+def execute_db_operation(operation, statement_timeout_ms=300000):
+    """Executa uma operação reutilizando a mesma conexão durante toda a transação."""
+    last_error = None
+
+    for client_encoding in get_db_client_encoding_candidates():
+        conn = None
+        try:
+            conn = open_db_connection(client_encoding=client_encoding, statement_timeout_ms=statement_timeout_ms)
+            result = operation(conn)
+            conn.commit()
+            persist_working_client_encoding(client_encoding)
+            return result
+        except UnicodeDecodeError as error:
+            last_error = error
+            if conn is not None:
+                conn.rollback()
+        except psycopg2.Error as error:
+            if _is_encoding_error(error):
+                last_error = error
+                if conn is not None:
+                    conn.rollback()
+                continue
+            if conn is not None:
+                conn.rollback()
+            raise error
+        except Exception:
+            if conn is not None:
+                conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+
+    if last_error is not None:
+        raise RuntimeError(
+            'Não foi possível decodificar a resposta do banco com os encodings testados '
+            f'({", ".join(get_db_client_encoding_candidates())}). Último erro: {last_error}'
+        )
+
+    raise RuntimeError('Falha ao executar a consulta no banco de dados.')
+
+def execute_query(query, params=None, fetch=True, statement_timeout_ms=300000):
+    """Executa query e retorna resultados"""
+    return execute_db_operation(
+        lambda conn: run_query_with_connection(conn, query, params=params, fetch=fetch),
+        statement_timeout_ms=statement_timeout_ms
+    )
+
+
+def is_ajax_request():
+    """Indica se a requisição atual espera resposta JSON para atualização assíncrona."""
+    return request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+
+
+def resolve_relation_name(relation_name):
+    """Resolve schema.nome para relações informadas sem schema."""
+    candidates = execute_query(
+        """
+        SELECT
+            n.nspname AS schema_name,
+            c.relname AS relation_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p')
+          AND lower(c.relname) = lower(%s)
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY
+            CASE WHEN n.nspname = 'public' THEN 0 ELSE 1 END,
+            n.nspname,
+            c.relname
+        """,
+        (relation_name,)
+    )
+
+    if not candidates:
+        raise ValueError(
+            f'Relação "{relation_name}" não encontrada. Informe no formato schema.tabela, '
+            'por exemplo: fdw_externo.v_paciente.'
+        )
+
+    if len(candidates) > 1:
+        options = ', '.join([f'{item["schema_name"]}.{item["relation_name"]}' for item in candidates[:5]])
+        raise ValueError(
+            f'Foram encontradas múltiplas relações com nome "{relation_name}": {options}. '
+            'Informe explicitamente o schema no campo.'
+        )
+
+    candidate = candidates[0]
+    return f'{candidate["schema_name"]}.{candidate["relation_name"]}'
+
+
+def normalize_relation_input(relation_input, field_label, default_schema=None):
+    """Normaliza o nome da relação. Sem schema informado, usa default_schema
+    (schema local do FDW para origem, schema de destino configurado para destino)."""
+    value = (relation_input or '').strip()
+    if not value:
+        raise ValueError(f'Informe o campo "{field_label}".')
+
+    if '.' in value:
+        parts = value.split('.')
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ValueError(f'O campo "{field_label}" deve estar no formato schema.tabela.')
+        return f'{parts[0].strip()}.{parts[1].strip()}'
+
+    if default_schema:
+        return f'{default_schema}.{value}'
+
+    return resolve_relation_name(value)
+
+
+def quote_identifier(identifier):
+    """Escapa identificadores SQL de forma segura."""
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def quote_qualified_relation(relation_name):
+    """Escapa schema.tabela para uso em SQL dinâmico."""
+    schema_name, table_name = relation_name.split('.', 1)
+    return f'{quote_identifier(schema_name)}.{quote_identifier(table_name)}'
+
+
+def get_relation_columns(relation_name):
+    """Retorna metadados das colunas da relação informada."""
+    schema_name, table_name = relation_name.split('.', 1)
+    return execute_query(
+        """
+        SELECT
+            column_name,
+            is_identity,
+            is_generated,
+            column_default,
+            ordinal_position
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (schema_name, table_name)
+    )
+
+
+def get_common_update_columns(source_relation, target_relation, key_column):
+    """Retorna as colunas comuns que podem ser atualizadas entre origem e destino."""
+    source_columns = {column['column_name'] for column in get_relation_columns(source_relation)}
+    target_columns = get_relation_columns(target_relation)
+
+    if key_column not in source_columns:
+        raise ValueError(f'A coluna chave "{key_column}" não existe na tabela de origem {source_relation}.')
+
+    if not any(column['column_name'] == key_column for column in target_columns):
+        raise ValueError(f'A coluna chave "{key_column}" não existe na tabela de destino {target_relation}.')
+
+    common_columns = []
+    for column in target_columns:
+        column_name = column['column_name']
+        if column_name == key_column:
+            continue
+        if column_name not in source_columns:
+            continue
+        if column.get('is_generated') == 'ALWAYS':
+            continue
+        common_columns.append(column_name)
+
+    return common_columns
+
+
+def criar_tabela_destino_como_origem(tabela_origem_raw, tabela_destino_raw, campo_id, falhar_se_existir=True):
+    """Cria a tabela de destino replicando as colunas/tipos da tabela de origem
+    (foreign table via FDW), usando CREATE TABLE ... AS SELECT ... WHERE FALSE
+    (copia estrutura sem dados) e define campo_id como chave primária.
+
+    Se `falhar_se_existir` for False e o destino já existir, não faz nada e
+    retorna com 'criada_agora': False (usado no fluxo automático de
+    iniciar/salvar migração, onde a tabela normalmente já existe)."""
+    normalized_source = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+    normalized_target = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
+    normalized_key = (campo_id or '').strip()
+
+    if not normalized_key:
+        raise ValueError('Informe o campo chave (campo_id) para criar a tabela de destino.')
+
+    quoted_source = quote_qualified_relation(normalized_source)
+    quoted_target = quote_qualified_relation(normalized_target)
+    quoted_key = quote_identifier(normalized_key)
+    target_schema, target_table = normalized_target.split('.', 1)
+
+    def _operacao(conn):
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT to_regclass(%s) AS existe', (normalized_source,))
+            if cur.fetchone()['existe'] is None:
+                raise ValueError(f'Tabela de origem "{normalized_source}" não encontrada.')
+
+            cur.execute('SELECT to_regclass(%s) AS existe', (normalized_target,))
+            if cur.fetchone()['existe'] is not None:
+                if not falhar_se_existir:
+                    return {
+                        'tabela_origem': normalized_source,
+                        'tabela_destino': normalized_target,
+                        'campo_id': normalized_key,
+                        'criada_agora': False,
+                    }
+                raise ValueError(f'A tabela de destino "{normalized_target}" já existe.')
+
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(target_schema)}')
+            cur.execute(f'CREATE TABLE {quoted_target} AS SELECT * FROM {quoted_source} WHERE FALSE')
+
+            try:
+                cur.execute(f'ALTER TABLE {quoted_target} ADD PRIMARY KEY ({quoted_key})')
+            except psycopg2.errors.UndefinedColumn:
+                raise ValueError(
+                    f'A coluna chave "{normalized_key}" não existe na tabela de origem {normalized_source}.'
+                )
+
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (target_schema, target_table)
+            )
+            return {
+                'tabela_origem': normalized_source,
+                'tabela_destino': normalized_target,
+                'campo_id': normalized_key,
+                'colunas': cur.fetchall(),
+                'criada_agora': True,
+            }
+
+    return execute_db_operation(_operacao, statement_timeout_ms=120000)
+
+
+def garantir_tabela_destino(tabela_origem_raw, tabela_destino_raw, campo_id):
+    """Cria a tabela de destino igual à origem se ela ainda não existir; não faz
+    nada se já existir. Retorna True se criou a tabela agora."""
+    resultado = criar_tabela_destino_como_origem(
+        tabela_origem_raw, tabela_destino_raw, campo_id, falhar_se_existir=False
+    )
+    return resultado['criada_agora']
+
+
+def _split_sql_columns(columns_csv):
+    """Divide lista CSV simples de colunas SQL preservando identificadores já quotados."""
+    return [column.strip() for column in (columns_csv or '').split(',') if column and column.strip()]
+
+
+def _normalize_identifier_token(identifier_token):
+    """Normaliza token de identificador para comparação (sem schema, sem aspas, minúsculo)."""
+    token = (identifier_token or '').strip()
+    if '.' in token:
+        token = token.split('.')[-1].strip()
+    if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+        token = token[1:-1].replace('""', '"')
+    return token.lower()
+
+
+def build_single_record_upsert_sql(tab_orig, tab_dest, campo, cols_ins, cols_sel):
+    """Monta SQL para inserir ou atualizar 1 registro comparando origem x destino.
+
+    OBS: `tab_orig` pode ser a tabela de origem real (schema.tabela do FDW)
+    ou a tabela de staging em `temp` (ver copiar_lote_para_staging). A função
+    não muda: ela só monta SQL contra a relação informada.
+    """
+    normalized_source = normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local'])
+    normalized_target = normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino'])
+    normalized_key = (campo or '').strip()
+
+    if not normalized_key:
+        raise ValueError('Campo chave inválido na configuração da migração.')
+
+    quoted_source = quote_qualified_relation(normalized_source)
+    quoted_target = quote_qualified_relation(normalized_target)
+    quoted_key = quote_identifier(normalized_key)
+
+    insert_columns = _split_sql_columns(cols_ins)
+    if not insert_columns:
+        raise ValueError('Colunas de inserção não preparadas para a migração.')
+
+    normalized_key_token = normalized_key.lower()
+    update_columns = [
+        column for column in insert_columns
+        if _normalize_identifier_token(column) != normalized_key_token
+    ]
+
+    base_sql = f"""
+        WITH src AS (
+            SELECT {cols_sel}
+            FROM {quoted_source} s
+            WHERE s.{quoted_key} = %s
+            LIMIT 1
+        ), upserted AS (
+            INSERT INTO {quoted_target} ({cols_ins})
+            SELECT {', '.join(insert_columns)} FROM src
+    """
+
+    if update_columns:
+        update_assignments = ', '.join([f'{column} = EXCLUDED.{column}' for column in update_columns])
+        difference_clause = ' OR '.join([f'{quoted_target}.{column} IS DISTINCT FROM EXCLUDED.{column}' for column in update_columns])
+        conflict_sql = f"""
+            ON CONFLICT ({quoted_key}) DO UPDATE
+            SET {update_assignments}
+            WHERE {difference_clause}
+            RETURNING (xmax = 0) AS inserido
+        """
+    else:
+        conflict_sql = f"""
+            ON CONFLICT ({quoted_key}) DO NOTHING
+            RETURNING (xmax = 0) AS inserido
+        """
+
+    tail_sql = """
+        )
+        SELECT
+            EXISTS(SELECT 1 FROM src) AS existe_origem,
+            (SELECT inserido FROM upserted LIMIT 1) AS inserido;
+    """
+
+    return base_sql + conflict_sql + tail_sql
+
+
+def process_automatic_update_batch(source_relation, target_relation, key_column, batch_size):
+    """Processa um lote de registros alterados entre origem estrangeira e tabela local."""
+    normalized_source = normalize_relation_input(source_relation, 'Tabela Origem', get_fdw_config()['schema_local'])
+    normalized_target = normalize_relation_input(target_relation, 'Tabela Destino', get_db_config()['schema_destino'])
+    normalized_key = (key_column or '').strip()
+
+    if not normalized_key:
+        raise ValueError('Informe a coluna chave para a atualização automática.')
+
+    if batch_size <= 0:
+        raise ValueError('O tamanho do lote deve ser maior que zero.')
+
+    common_columns = get_common_update_columns(normalized_source, normalized_target, normalized_key)
+    if not common_columns:
+        raise ValueError(
+            f'Nenhuma coluna compatível foi encontrada entre {normalized_source} e {normalized_target}. '
+            'Verifique se as tabelas possuem colunas com os mesmos nomes.'
+        )
+
+    quoted_source = quote_qualified_relation(normalized_source)
+    quoted_target = quote_qualified_relation(normalized_target)
+    quoted_key = quote_identifier(normalized_key)
+    difference_clause = ' OR '.join(
+        [f'd.{quote_identifier(column)} IS DISTINCT FROM s.{quote_identifier(column)}' for column in common_columns]
+    )
+    assignments = ', '.join(
+        [f'{quote_identifier(column)} = s.{quote_identifier(column)}' for column in common_columns]
+    )
+
+    sql = f"""
+        WITH changed_rows AS (
+            SELECT d.{quoted_key} AS row_id
+            FROM {quoted_target} d
+            INNER JOIN {quoted_source} s
+                ON d.{quoted_key} = s.{quoted_key}
+            WHERE {difference_clause}
+            ORDER BY d.{quoted_key}
+            LIMIT %s
+        ), updated_rows AS (
+            UPDATE {quoted_target} d
+            SET {assignments}
+            FROM {quoted_source} s
+            INNER JOIN changed_rows c
+                ON c.row_id = s.{quoted_key}
+            WHERE d.{quoted_key} = c.row_id
+            RETURNING d.{quoted_key} AS row_id
+        )
+        SELECT row_id FROM updated_rows
+    """
+
+    updated_rows = execute_query(sql, (batch_size,))
+    updated_ids = [row['row_id'] for row in updated_rows]
+
+    return {
+        'origem': normalized_source,
+        'destino': normalized_target,
+        'campo_id': normalized_key,
+        'colunas_comparadas': common_columns,
+        'registros_atualizados': len(updated_ids),
+        'registros_ids': updated_ids[:20],
+        'possui_mais': len(updated_ids) == batch_size
+    }
+
+
+# ============================================================
+# IMPORTAÇÃO AUTOMÁTICA: TABELAS CONFIGURADAS + HISTÓRICO DE CICLOS
+# ============================================================
+# Persistido no banco (antes ficava só no localStorage do navegador).
+# auto_importacao_tabelas    -> lista de tabelas configuradas (como as migrações)
+# auto_importacao_ciclos     -> um registro por execução de ciclo
+# auto_importacao_ciclo_registros -> detalhe por chave, igual aos "registros
+#                                     processados" de uma migração
+
+def garantir_tabelas_e_executar(operacao):
+    """Executa `operacao()`; se alguma tabela de controle ainda não existir
+    (UndefinedTable), cria todas as tabelas (idempotente, CREATE TABLE IF NOT
+    EXISTS) e tenta novamente uma única vez. Evita depender do usuário clicar
+    manualmente em "Criar Tabelas de Controle" antes de usar a tela."""
+    try:
+        return operacao()
+    except psycopg2.errors.UndefinedTable:
+        criar_tabelas_controle()
+        return operacao()
+
+
+def listar_migracoes_para_selecao():
+    """Lista as migrações manuais já cadastradas (origem/destino/campo_id),
+    usada para preencher o seletor de "tabela já configurada" nas telas de
+    Importação Automática e Agendar Importação."""
+    return garantir_tabelas_e_executar(lambda: execute_query(
+        "SELECT id, tabela_origem, tabela_destino, campo_id FROM controle_migracao ORDER BY id"
+    ))
+
+
+def get_auto_import_tabelas():
+    """Lista todas as tabelas configuradas, com o total de ciclos já executados
+    e a data/hora do último ciclo (usada para não reiniciar um ciclo só porque
+    a página foi recarregada antes do intervalo configurado terminar)."""
+    return garantir_tabelas_e_executar(lambda: execute_query(
+        """
+        SELECT t.*, COALESCE(c.total_ciclos, 0) AS total_ciclos, c.ultimo_ciclo_em
+        FROM auto_importacao_tabelas t
+        LEFT JOIN (
+            SELECT tabela_id, COUNT(*) AS total_ciclos, MAX(executado_em) AS ultimo_ciclo_em
+            FROM auto_importacao_ciclos
+            GROUP BY tabela_id
+        ) c ON c.tabela_id = t.id
+        ORDER BY t.created_at ASC
+        """
+    ))
+
+
+def get_auto_import_tabela(tabela_id):
+    """Busca uma tabela configurada pelo id, ou None."""
+    def _buscar():
+        rows = execute_query(
+            "SELECT * FROM auto_importacao_tabelas WHERE id = %s", (tabela_id,)
+        )
+        return rows[0] if rows else None
+    return garantir_tabelas_e_executar(_buscar)
+
+
+def criar_auto_import_tabela(tabela_origem, tabela_destino, campo_id, intervalo_min, qtd_registros, tamanho_lote):
+    """Cadastra uma nova tabela para a rotina de importação automática."""
+    def _inserir():
+        result = execute_query(
+            """
+            INSERT INTO auto_importacao_tabelas
+                (tabela_origem, tabela_destino, campo_id, intervalo_min, qtd_registros,
+                 tamanho_lote, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'parada', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            RETURNING *
+            """,
+            (tabela_origem, tabela_destino, campo_id, intervalo_min, qtd_registros, tamanho_lote)
+        )
+        return result[0]
+    return garantir_tabelas_e_executar(_inserir)
+
+
+def atualizar_status_auto_import_tabela(tabela_id, status):
+    """Marca a tabela como 'ativa' ou 'parada' (intenção de rodar — quem executa é o JS)."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        "UPDATE auto_importacao_tabelas SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+        (status, tabela_id), fetch=False
+    ))
+
+
+def atualizar_ultimo_id_auto_import(tabela_id, ultimo_id):
+    """Atualiza o último ID conhecido no destino, exibido na lista."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        "UPDATE auto_importacao_tabelas SET ultimo_id_destino = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+        (ultimo_id, tabela_id), fetch=False
+    ))
+
+
+def excluir_auto_import_tabela(tabela_id):
+    """Remove a tabela configurada (cascade apaga ciclos e registros)."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        "DELETE FROM auto_importacao_tabelas WHERE id = %s", (tabela_id,), fetch=False
+    ))
+
+
+def atualizar_auto_import_tabela(tabela_id, tabela_origem, tabela_destino, campo_id,
+                                  intervalo_min, qtd_registros, tamanho_lote):
+    """Atualiza a configuração de uma tabela já cadastrada (status e último ID não mudam)."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        """
+        UPDATE auto_importacao_tabelas
+        SET tabela_origem = %s, tabela_destino = %s, campo_id = %s,
+            intervalo_min = %s, qtd_registros = %s, tamanho_lote = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (tabela_origem, tabela_destino, campo_id, intervalo_min, qtd_registros, tamanho_lote, tabela_id),
+        fetch=False
+    ))
+
+
+# ============================================================
+# AGENDAR IMPORTAÇÃO: SINCRONIZAÇÃO COMPLETA (INSERT/UPDATE/DELETE)
+# ============================================================
+# Mesmo padrão de tela/tabelas da importação automática, mas cada tabela
+# roda no horário configurado (até 4 por dia) em vez de a cada N minutos,
+# e cobre a tabela INTEIRA (com DELETE do que sumiu na origem), não só uma
+# janela recente.
+
+def get_agendamento_tabelas():
+    """Lista todas as tabelas configuradas, com o total de execuções já rodadas."""
+    return garantir_tabelas_e_executar(lambda: execute_query(
+        """
+        SELECT t.*, COALESCE(e.total_execucoes, 0) AS total_execucoes
+        FROM agendamento_importacao_tabelas t
+        LEFT JOIN (
+            SELECT tabela_id, COUNT(*) AS total_execucoes
+            FROM agendamento_importacao_execucoes
+            GROUP BY tabela_id
+        ) e ON e.tabela_id = t.id
+        ORDER BY t.created_at ASC
+        """
+    ))
+
+
+def get_agendamento_tabela(tabela_id):
+    """Busca uma tabela configurada pelo id, ou None."""
+    def _buscar():
+        rows = execute_query(
+            "SELECT * FROM agendamento_importacao_tabelas WHERE id = %s", (tabela_id,)
+        )
+        return rows[0] if rows else None
+    return garantir_tabelas_e_executar(_buscar)
+
+
+def criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios):
+    """Cadastra uma nova tabela. `horarios` é uma lista de até 4 strings 'HH:MM' (ou None)."""
+    h = (list(horarios) + [None, None, None, None])[:4]
+    def _inserir():
+        result = execute_query(
+            """
+            INSERT INTO agendamento_importacao_tabelas
+                (tabela_origem, tabela_destino, campo_id, tamanho_lote,
+                 horario_1, horario_2, horario_3, horario_4, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'parada', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            RETURNING *
+            """,
+            (tabela_origem, tabela_destino, campo_id, tamanho_lote, h[0], h[1], h[2], h[3])
+        )
+        return result[0]
+    return garantir_tabelas_e_executar(_inserir)
+
+
+def atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios):
+    """Atualiza a configuração (status e histórico não mudam)."""
+    h = (list(horarios) + [None, None, None, None])[:4]
+    garantir_tabelas_e_executar(lambda: execute_query(
+        """
+        UPDATE agendamento_importacao_tabelas
+        SET tabela_origem = %s, tabela_destino = %s, campo_id = %s, tamanho_lote = %s,
+            horario_1 = %s, horario_2 = %s, horario_3 = %s, horario_4 = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (tabela_origem, tabela_destino, campo_id, tamanho_lote, h[0], h[1], h[2], h[3], tabela_id),
+        fetch=False
+    ))
+
+
+def atualizar_status_agendamento_tabela(tabela_id, status):
+    """Marca a tabela como 'ativa' ou 'parada' (liga/desliga os horários)."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        "UPDATE agendamento_importacao_tabelas SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+        (status, tabela_id), fetch=False
+    ))
+
+
+def atualizar_ultima_execucao_agendamento(tabela_id, ultimo_id):
+    """Marca quando a última execução rodou e o último ID visto no destino."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        """
+        UPDATE agendamento_importacao_tabelas
+        SET ultima_execucao = CURRENT_TIMESTAMP, ultimo_id_destino = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (ultimo_id, tabela_id), fetch=False
+    ))
+
+
+def excluir_agendamento_tabela(tabela_id):
+    """Remove a tabela configurada (cascade apaga execuções e registros)."""
+    garantir_tabelas_e_executar(lambda: execute_query(
+        "DELETE FROM agendamento_importacao_tabelas WHERE id = %s", (tabela_id,), fetch=False
+    ))
+
+
+LOG_EXECUCAO_MAX_LINHAS = 300
+LOTES_EXECUCAO_MAX_ITENS = 300
+
+
+def _log_execucao(job_id, nivel, mensagem):
+    """Adiciona uma linha ao log da execução (lido pela tela de acompanhamento)."""
+    job = get_background_job(job_id) or {}
+    log = list(job.get('log') or [])
+    log.append({'hora': datetime.now().strftime('%H:%M:%S'), 'nivel': nivel, 'mensagem': mensagem})
+    if len(log) > LOG_EXECUCAO_MAX_LINHAS:
+        log = log[-LOG_EXECUCAO_MAX_LINHAS:]
+    set_background_job(job_id, {**job, 'log': log})
+
+
+def _registrar_lote_execucao_no_job(job_id, numero, inseridos, atualizados, ja_existem, deletados, com_erro):
+    """Adiciona o resultado de um lote à lista de lotes do job."""
+    job = get_background_job(job_id) or {}
+    lotes = list(job.get('lotes') or [])
+    lotes.append({
+        'numero': numero, 'inseridos': inseridos, 'atualizados': atualizados,
+        'ja_existem': ja_existem, 'deletados': deletados, 'com_erro': com_erro,
+    })
+    if len(lotes) > LOTES_EXECUCAO_MAX_ITENS:
+        lotes = lotes[-LOTES_EXECUCAO_MAX_ITENS:]
+    set_background_job(job_id, {**job, 'lotes': lotes})
+
+
+def registrar_execucao_agendamento(conn, tabela_id, status, mensagem, inseridos, atualizados,
+                                    ja_existem, deletados, com_erro, total_lotes, tamanho_lote,
+                                    ultimo_id_destino):
+    """Grava o resumo de uma execução e retorna o id gerado."""
+    sql = """
+        INSERT INTO agendamento_importacao_execucoes
+            (tabela_id, status, mensagem, registros_inseridos, registros_atualizados,
+             registros_ja_existem, registros_deletados, registros_com_erro, total_lotes,
+             tamanho_lote, ultimo_id_destino, executado_em)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        RETURNING id
+    """
+    params = (tabela_id, status, mensagem, inseridos, atualizados, ja_existem, deletados,
+              com_erro, total_lotes, tamanho_lote, ultimo_id_destino)
+    try:
+        result = run_query_with_connection(conn, sql, params)
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
+        conn.rollback()
+        criar_tabelas_controle()
+        result = run_query_with_connection(conn, sql, params)
+    conn.commit()
+    return result[0]['id']
+
+
+def atualizar_execucao_agendamento(conn, execucao_id, status, mensagem, inseridos, atualizados,
+                                    ja_existem, deletados, com_erro, ultimo_id_destino):
+    """Fecha o resumo de uma execução já criada (registrar_execucao_agendamento cria o
+    registro no início, com contadores em zero; esta função atualiza com o resultado final).
+    """
+    sql = """
+        UPDATE agendamento_importacao_execucoes
+        SET status = %s, mensagem = %s, registros_inseridos = %s, registros_atualizados = %s,
+            registros_ja_existem = %s, registros_deletados = %s, registros_com_erro = %s,
+            ultimo_id_destino = %s
+        WHERE id = %s
+    """
+    params = (status, mensagem, inseridos, atualizados, ja_existem, deletados, com_erro,
+              ultimo_id_destino, execucao_id)
+    run_query_with_connection(conn, sql, params, fetch=False)
+    conn.commit()
+
+
+def gravar_registros_execucao(conn, execucao_id, registros):
+    """Grava o detalhe por chave de uma execução em uma única instrução (bulk, via unnest).
+    `registros` é uma lista de tuplas (chave_valor, status, erro_msg)."""
+    if not registros:
+        return
+
+    chaves = [str(r[0]) for r in registros]
+    status_list = [r[1] for r in registros]
+    erro_list = [r[2] for r in registros]
+
+    sql = """
+        INSERT INTO agendamento_importacao_execucao_registros (execucao_id, chave_valor, status, erro_msg)
+        SELECT %s, x.chave, x.status, x.erro
+        FROM unnest(%s::text[], %s::text[], %s::text[]) AS x(chave, status, erro)
+    """
+    params = (execucao_id, chaves, status_list, erro_list)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
+        conn.rollback()
+        criar_tabelas_controle()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    conn.commit()
+
+
+def _cancelar_execucao_agendamento(job_id, conn, staging, execucao_id=None, contadores=None):
+    """Chamado quando o usuário clica em 'Parar' com uma execução em andamento:
+    derruba a staging, fecha o registro da execução como cancelado (se já
+    tinha sido criado) e marca o job como cancelado."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS {staging}')
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    if execucao_id is not None:
+        try:
+            c = contadores or {}
+            atualizar_execucao_agendamento(
+                conn, execucao_id, 'cancelado', 'Execução interrompida pelo usuário.',
+                c.get('registros_inseridos', 0), c.get('registros_atualizados', 0),
+                c.get('registros_ja_existem', 0), c.get('registros_deletados', 0),
+                c.get('registros_com_erro', 0), c.get('ultimo_id_destino')
+            )
+        except Exception:
+            pass
+
+    set_background_job(job_id, {
+        **(get_background_job(job_id) or {}),
+        'status': 'cancelado',
+        'mensagem': 'Execução interrompida pelo usuário.',
+        'fim': datetime.now().isoformat(),
+    })
+    _log_execucao(job_id, 'aviso', 'Execução interrompida pelo usuário — staging removida.')
+
+
+def registrar_ciclo_auto_import(conn, tabela_id, status, mensagem, inseridos, atualizados,
+                                 ja_existem, nao_encontrados, com_erro, total_lotes, tamanho_lote,
+                                 id_inicio_faixa, ultimo_id_destino):
+    """Grava o resumo de um ciclo executado e retorna o id gerado."""
+    sql = """
+        INSERT INTO auto_importacao_ciclos
+            (tabela_id, status, mensagem, registros_inseridos, registros_atualizados,
+             registros_ja_existem, registros_nao_encontrados, registros_com_erro, total_lotes,
+             tamanho_lote, id_inicio_faixa, ultimo_id_destino, executado_em)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        RETURNING id
+    """
+    params = (tabela_id, status, mensagem, inseridos, atualizados, ja_existem, nao_encontrados,
+              com_erro, total_lotes, tamanho_lote, id_inicio_faixa, ultimo_id_destino)
+    try:
+        result = run_query_with_connection(conn, sql, params)
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
+        # Tabela/coluna ainda não existia nesta instalação — cria/atualiza (idempotente) e repete
+        conn.rollback()
+        criar_tabelas_controle()
+        result = run_query_with_connection(conn, sql, params)
+    conn.commit()
+    return result[0]['id']
+
+
+def gravar_registros_ciclo(conn, ciclo_id, registros):
+    """Grava o detalhe por chave de um ciclo em uma única instrução (bulk, via unnest).
+    `registros` é uma lista de tuplas (chave_valor, status, erro_msg)."""
+    if not registros:
+        return
+
+    chaves = [str(r[0]) for r in registros]
+    status_list = [r[1] for r in registros]
+    erro_list = [r[2] for r in registros]
+
+    sql = """
+        INSERT INTO auto_importacao_ciclo_registros (ciclo_id, chave_valor, status, erro_msg)
+        SELECT %s, x.chave, x.status, x.erro
+        FROM unnest(%s::text[], %s::text[], %s::text[]) AS x(chave, status, erro)
+    """
+    params = (ciclo_id, chaves, status_list, erro_list)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    except psycopg2.errors.UndefinedTable:
+        # Tabela ainda não existia nesta instalação — cria (idempotente) e repete
+        conn.rollback()
+        criar_tabelas_controle()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    conn.commit()
+
+
+# ============================================================
+# PROVISIONAMENTO: BANCO LOCAL, FDW, SCHEMA TEMP, TABELAS
+# ============================================================
+# Ações de configuração inicial usadas pela tela "Configurar Banco".
+# São idempotentes: rodar de novo não quebra nada que já existe.
+
+def criar_banco_local():
+    """Cria o banco configurado (via conexão à base de manutenção 'postgres'),
+    caso ele ainda não exista. Retorna True se criou agora, False se já existia."""
+    db_config = get_db_connection_config()
+    banco_alvo = db_config['database']
+
+    admin_config = db_config.copy()
+    admin_config['database'] = 'postgres'  # base de manutenção, sempre existe
+
+    conn = psycopg2.connect(**admin_config)
+    try:
+        conn.autocommit = True  # CREATE DATABASE não pode rodar dentro de transação
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1 FROM pg_database WHERE datname = %s', (banco_alvo,))
+            ja_existia = cur.fetchone() is not None
+            if not ja_existia:
+                cur.execute(f'CREATE DATABASE {quote_identifier(banco_alvo)}')
+        return not ja_existia
+    finally:
+        conn.close()
+
+
+def criar_tabelas_controle():
+    """Cria (se não existirem) as tabelas de controle de migração no schema de destino configurado."""
+    def _operacao(conn):
+        schema_destino = (get_db_config().get('schema_destino') or 'public').strip()
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema_destino)}')
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS controle_migracao (
+                    id SERIAL PRIMARY KEY,
+                    tabela_origem TEXT NOT NULL,
+                    tabela_destino TEXT NOT NULL,
+                    campo_id TEXT NOT NULL,
+                    sql_colunas_insert TEXT,
+                    sql_colunas_select TEXT,
+                    lote_atual INTEGER NOT NULL DEFAULT 0,
+                    total_registros INTEGER NOT NULL DEFAULT 0,
+                    registros_processados INTEGER NOT NULL DEFAULT 0,
+                    tamanho_lote INTEGER NOT NULL DEFAULT 1,
+                    id_maximo BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pendente',
+                    data_inicio TIMESTAMP,
+                    data_fim TIMESTAMP,
+                    erro_msg TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)  # colunas batem com create_migration_record() / rotas de leitura
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS controle_migracao_lotes (
+                    id SERIAL PRIMARY KEY,
+                    migracao_id INTEGER NOT NULL REFERENCES controle_migracao(id) ON DELETE CASCADE,
+                    numero_lote INTEGER NOT NULL DEFAULT 1,
+                    chave_valor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    erro_msg TEXT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (migracao_id, chave_valor)
+                )
+            """)  # UNIQUE necessário para o ON CONFLICT usado em gravar_status_lote
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_controle_migracao_lotes_migracao_status
+                ON controle_migracao_lotes (migracao_id, status)
+            """)  # acelera os filtros por status usados em /api/registros
+
+            # ---- Importação Automática: tabelas configuradas + histórico de ciclos ----
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auto_importacao_tabelas (
+                    id SERIAL PRIMARY KEY,
+                    tabela_origem TEXT NOT NULL,
+                    tabela_destino TEXT NOT NULL,
+                    campo_id TEXT NOT NULL,
+                    intervalo_min INTEGER NOT NULL DEFAULT 5,
+                    qtd_registros INTEGER NOT NULL DEFAULT 100,
+                    tamanho_lote INTEGER NOT NULL DEFAULT 500,
+                    status TEXT NOT NULL DEFAULT 'parada',
+                    ultimo_id_destino BIGINT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)  # status: 'parada' | 'ativa' — só controla a intenção; quem executa é o JS
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auto_importacao_ciclos (
+                    id SERIAL PRIMARY KEY,
+                    tabela_id INTEGER NOT NULL REFERENCES auto_importacao_tabelas(id) ON DELETE CASCADE,
+                    executado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT NOT NULL,
+                    mensagem TEXT,
+                    registros_inseridos INTEGER NOT NULL DEFAULT 0,
+                    registros_atualizados INTEGER NOT NULL DEFAULT 0,
+                    registros_ja_existem INTEGER NOT NULL DEFAULT 0,
+                    registros_nao_encontrados INTEGER NOT NULL DEFAULT 0,
+                    registros_com_erro INTEGER NOT NULL DEFAULT 0,
+                    total_lotes INTEGER NOT NULL DEFAULT 0,
+                    tamanho_lote INTEGER,
+                    id_inicio_faixa BIGINT,
+                    ultimo_id_destino BIGINT
+                )
+            """)  # status do ciclo: 'concluido' | 'erro' (reaproveita as classes CSS existentes)
+            cur.execute("""
+                ALTER TABLE auto_importacao_ciclos
+                ADD COLUMN IF NOT EXISTS registros_nao_encontrados INTEGER NOT NULL DEFAULT 0
+            """)  # instalações antigas não ganham a coluna nova só com CREATE TABLE IF NOT EXISTS
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_importacao_ciclos_tabela
+                ON auto_importacao_ciclos (tabela_id, executado_em DESC)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auto_importacao_ciclo_registros (
+                    id SERIAL PRIMARY KEY,
+                    ciclo_id INTEGER NOT NULL REFERENCES auto_importacao_ciclos(id) ON DELETE CASCADE,
+                    chave_valor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    erro_msg TEXT
+                )
+            """)  # status por registro: inserido | atualizado | ja_existe | erro
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_importacao_ciclo_registros_ciclo_status
+                ON auto_importacao_ciclo_registros (ciclo_id, status)
+            """)
+
+            # ---- Agendar Importação: sincronização completa (insert/update/delete) ----
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agendamento_importacao_tabelas (
+                    id SERIAL PRIMARY KEY,
+                    tabela_origem TEXT NOT NULL,
+                    tabela_destino TEXT NOT NULL,
+                    campo_id TEXT NOT NULL,
+                    tamanho_lote INTEGER NOT NULL DEFAULT 500,
+                    horario_1 TIME,
+                    horario_2 TIME,
+                    horario_3 TIME,
+                    horario_4 TIME,
+                    status TEXT NOT NULL DEFAULT 'parada',
+                    ultima_execucao TIMESTAMP,
+                    ultimo_id_destino BIGINT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)  # status: 'parada' | 'ativa' — controla se os horários estão ligados
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agendamento_importacao_execucoes (
+                    id SERIAL PRIMARY KEY,
+                    tabela_id INTEGER NOT NULL REFERENCES agendamento_importacao_tabelas(id) ON DELETE CASCADE,
+                    executado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT NOT NULL,
+                    mensagem TEXT,
+                    registros_inseridos INTEGER NOT NULL DEFAULT 0,
+                    registros_atualizados INTEGER NOT NULL DEFAULT 0,
+                    registros_ja_existem INTEGER NOT NULL DEFAULT 0,
+                    registros_deletados INTEGER NOT NULL DEFAULT 0,
+                    registros_com_erro INTEGER NOT NULL DEFAULT 0,
+                    total_lotes INTEGER NOT NULL DEFAULT 0,
+                    tamanho_lote INTEGER,
+                    ultimo_id_destino BIGINT
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agendamento_importacao_execucoes_tabela
+                ON agendamento_importacao_execucoes (tabela_id, executado_em DESC)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agendamento_importacao_execucao_registros (
+                    id SERIAL PRIMARY KEY,
+                    execucao_id INTEGER NOT NULL REFERENCES agendamento_importacao_execucoes(id) ON DELETE CASCADE,
+                    chave_valor TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    erro_msg TEXT
+                )
+            """)  # status por registro: inserido | atualizado | ja_existe | deletado | erro
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agendamento_importacao_execucao_registros_status
+                ON agendamento_importacao_execucao_registros (execucao_id, status)
+            """)
+        conn.commit()
+
+    execute_db_operation(_operacao, statement_timeout_ms=60000)
+
+
+def garantir_tabelas_controle_no_schema_ativo():
+    """Cria/verifica as tabelas de controle no schema de destino assim que a
+    conexão é salva/ativada, para o schema onde elas moram nunca ficar
+    dessincronizado do "Schema de destino" configurado (evita tabelas de
+    controle órfãs num schema antigo depois de trocar a configuração)."""
+    try:
+        criar_tabelas_controle()
+    except (OperationalError, InterfaceError):
+        pass  # sem conexão ainda (ex.: banco local não criado); usuário resolve no provisionamento
+    except Exception as e:
+        schema_destino = get_db_config().get('schema_destino') or 'public'
+        flash(f'Não foi possível criar as tabelas de controle no schema "{schema_destino}": {str(e)}', 'warning')
+
+
+def avisar_se_schema_destino_colide_com_fdw():
+    """Alerta quando o schema de destino é igual ao schema local do FDW —
+    misturaria as tabelas de controle/migração com as foreign tables somente
+    leitura da origem, que é exatamente a confusão que este aviso evita."""
+    schema_destino = (get_db_config().get('schema_destino') or '').strip().lower()
+    schema_fdw_local = (get_fdw_config().get('schema_local') or '').strip().lower()
+
+    if schema_destino and schema_fdw_local and schema_destino == schema_fdw_local:
+        flash(
+            f'Atenção: o "Schema de destino" ("{schema_destino}") é igual ao "Schema local do FDW". '
+            'O schema de destino deve ser um schema seu, separado do schema onde ficam as foreign '
+            'tables (somente leitura) da origem.',
+            'error'
+        )
+
+
+def criar_fdw(origem, port):
+    """Cria a extensão postgres_fdw, o servidor remoto, o user mapping e importa
+    as tabelas do schema remoto para o schema local. Idempotente: se o servidor ou
+    o mapping já existem, atualiza (ALTER); se as tabelas já foram importadas antes,
+    ignora o erro de duplicidade.
+    """
+    schema_local = origem['schema_local']
+    schema_remoto = origem['schema_remoto'] or 'public'
+    server_name = f'fdw_srv_{schema_local}'
+
+    def _preparar(conn):
+        # 1) Extensão + schema local — cada etapa comita separado para não perder
+        #    o que já foi feito caso uma etapa seguinte falhe.
+        with conn.cursor() as cur:
+            cur.execute('CREATE EXTENSION IF NOT EXISTS postgres_fdw')
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema_local)}')
+        conn.commit()
+
+        # 2) Servidor remoto (cria ou atualiza host/porta/banco)
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
+            if cur.fetchone():
+                cur.execute(
+                    f'ALTER SERVER {quote_identifier(server_name)} OPTIONS '
+                    f'(SET host %s, SET port %s, SET dbname %s)',
+                    (origem['host'], str(port), origem['database'])
+                )
+            else:
+                cur.execute(
+                    f'CREATE SERVER {quote_identifier(server_name)} FOREIGN DATA WRAPPER postgres_fdw '
+                    f'OPTIONS (host %s, port %s, dbname %s)',
+                    (origem['host'], str(port), origem['database'])
+                )
+        conn.commit()
+
+        # 3) User mapping (cria ou atualiza usuário/senha da origem)
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT 1 FROM pg_user_mappings WHERE srvname = %s AND usename = current_user',
+                (server_name,)
+            )
+            if cur.fetchone():
+                cur.execute(
+                    f'ALTER USER MAPPING FOR CURRENT_USER SERVER {quote_identifier(server_name)} '
+                    f'OPTIONS (SET user %s, SET password %s)',
+                    (origem['user'], origem['password'])
+                )
+            else:
+                cur.execute(
+                    f'CREATE USER MAPPING FOR CURRENT_USER SERVER {quote_identifier(server_name)} '
+                    f'OPTIONS (user %s, password %s)',
+                    (origem['user'], origem['password'])
+                )
+        conn.commit()
+
+        # 4) Importa as tabelas do schema remoto para o schema local
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f'IMPORT FOREIGN SCHEMA {quote_identifier(schema_remoto)} '
+                    f'FROM SERVER {quote_identifier(server_name)} '
+                    f'INTO {quote_identifier(schema_local)}'
+                )
+                conn.commit()
+            except psycopg2.errors.DuplicateTable:
+                conn.rollback()  # já importado numa execução anterior — não é erro
+
+    execute_db_operation(lambda conn: _preparar(conn), statement_timeout_ms=120000)
+
+
+
+@app.route('/configurar-banco', methods=['GET', 'POST'])
+def configurar_banco():
+    """Tela de configuração da conexão com o banco de dados."""
+    edit_connection = None
+    edit_id = request.args.get('editar')
+    if edit_id and edit_id.isdigit():
+        edit_connection = get_db_connection_by_id(int(edit_id))
+
+    db_form = get_db_form_data(edit_connection or get_db_config())
+    if request.method == 'POST':
+        db_form = get_posted_db_form_data(request.form)
+
+        try:
+            new_db_config = build_db_config(request.form)
+            profile_id = int(db_form['profile_id']) if db_form['profile_id'].isdigit() else None
+            saved_profile, created = save_db_connection_profile(new_db_config, profile_id=profile_id)
+            active_config = saved_profile.copy()
+            active_config['connection_mode'] = 'local' if active_config['host'] == 'localhost' else 'remote'
+            active_config['profile_id'] = saved_profile['id']
+            app.config['DB_CONFIG'] = active_config
+            app.config['DB_CONFIG_LOADED'] = True
+            persist_active_db_config()
+            flash(
+                'Conexão salva na lista e definida como ativa.' if created else 'Conexão atualizada e definida como ativa.',
+                'success'
+            )
+            avisar_se_schema_destino_colide_com_fdw()
+            garantir_tabelas_controle_no_schema_ativo()
+            return redirect(url_for('dashboard'))
+        except ValueError as error:
+            flash(str(error), 'error')
+
+    fdw_form = get_fdw_config().copy()
+    fdw_form['password'] = ''  # nunca reexibe a senha salva, só a reusa internamente
+
+    return render_template(
+        'configurar_banco.html',
+        db_config=db_form,
+        fdw_config=fdw_form,
+        temp_schema_name=TEMP_SCHEMA_NAME,
+        error_details=None,
+        saved_connections=[sanitize_db_connection(connection) for connection in get_saved_db_connections()]
+    )
+
+
+@app.route('/configurar-banco/usar/<int:connection_id>', methods=['POST'])
+def usar_conexao_salva(connection_id):
+    """Ativa uma conexão salva como configuração corrente da aplicação."""
+    connection = get_db_connection_by_id(connection_id)
+    if not connection:
+        flash('Conexão salva não encontrada.', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    active_config = connection.copy()
+    active_config['connection_mode'] = 'local' if active_config['host'] == 'localhost' else 'remote'
+    active_config['profile_id'] = connection['id']
+    app.config['DB_CONFIG'] = active_config
+    app.config['DB_CONFIG_LOADED'] = True
+    persist_active_db_config()
+    flash(f'Conexão "{connection["profile_name"]}" definida como ativa.', 'success')
+    avisar_se_schema_destino_colide_com_fdw()
+    garantir_tabelas_controle_no_schema_ativo()
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/configurar-banco/excluir/<int:connection_id>', methods=['POST'])
+def excluir_conexao_salva(connection_id):
+    """Remove uma conexão salva da lista persistida localmente."""
+    saved_connections = get_saved_db_connections()
+    connection = get_db_connection_by_id(connection_id)
+    if not connection:
+        flash('Conexão salva não encontrada.', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    saved_connections[:] = [item for item in saved_connections if item['id'] != connection_id]
+    persist_saved_db_connections()
+    current_profile_id = get_db_config().get('profile_id')
+    if current_profile_id == connection_id:
+        app.config['DB_CONFIG'] = DEFAULT_DB_CONFIG.copy()
+        app.config['DB_CONFIG_LOADED'] = True
+        persist_active_db_config()
+
+    flash(f'Conexão "{connection["profile_name"]}" removida da lista.', 'success')
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/configurar-banco/criar-banco-local', methods=['POST'])
+def criar_banco_local_route():
+    """Cria o banco de dados configurado no formulário acima, se ainda não existir."""
+    db_config = get_db_connection_config()
+    if not (db_config.get('host') and db_config.get('user') and db_config.get('password') and db_config.get('database')):
+        flash('Preencha e salve host, banco, usuário e senha antes de criar o banco local.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        criado_agora = criar_banco_local()
+        if criado_agora:
+            flash(f'Banco "{db_config["database"]}" criado com sucesso.', 'success')
+        else:
+            flash(f'Banco "{db_config["database"]}" já existia — nada a fazer.', 'info')
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao criar o banco local: {str(e)}', 'error')
+
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/configurar-banco/criar-fdw', methods=['POST'])
+def criar_fdw_route():
+    """Cria/atualiza a extensão postgres_fdw, o servidor, o user mapping e importa as tabelas da origem."""
+    if not is_db_configured():
+        flash('Configure e salve a conexão do banco local antes de criar o FDW.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    fdw_atual = get_fdw_config()
+    origem = {
+        'host': (request.form.get('fdw_host') or '').strip(),
+        'database': (request.form.get('fdw_database') or '').strip(),
+        'user': (request.form.get('fdw_user') or '').strip(),
+        # Senha em branco no form = mantém a última senha salva (mesmo padrão do form de banco)
+        'password': request.form.get('fdw_password') or fdw_atual.get('password') or '',
+        'schema_remoto': (request.form.get('fdw_schema_remoto') or 'public').strip(),
+        'schema_local': (request.form.get('fdw_schema_local') or 'fdw_externo').strip(),
+    }
+    porta_raw = (request.form.get('fdw_port') or '5432').strip()
+
+    if not origem['host'] or not origem['database'] or not origem['user'] or not origem['password']:
+        flash('Informe host, banco, usuário e senha da origem para criar o FDW.', 'error')
+        return redirect(url_for('configurar_banco'))
+    if not origem['schema_local']:
+        flash('Informe o schema local que vai receber as tabelas do FDW.', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    schema_destino_ativo = (get_db_config().get('schema_destino') or '').strip().lower()
+    if schema_destino_ativo and origem['schema_local'].strip().lower() == schema_destino_ativo:
+        flash(
+            f'O "Schema local do FDW" não pode ser igual ao "Schema de destino" ("{schema_destino_ativo}"). '
+            'Use um schema separado para as foreign tables (somente leitura) da origem.',
+            'error'
+        )
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        porta = int(porta_raw)
+    except ValueError:
+        flash('Porta da origem inválida.', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        criar_fdw(origem, porta)
+        origem['port'] = porta
+        persist_fdw_config(origem)
+        flash(
+            f'FDW criado/atualizado: schema local "{origem["schema_local"]}" '
+            f'apontando para {origem["host"]}:{porta}/{origem["database"]} (schema remoto "{origem["schema_remoto"]}").',
+            'success'
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao criar o FDW: {str(e)}', 'error')
+
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/configurar-banco/criar-schema-temp', methods=['POST'])
+def criar_schema_temp_route():
+    """Cria o schema de staging (temp) usado antes dos upserts em public."""
+    if not is_db_configured():
+        flash('Configure e salve a conexão antes de criar o schema temp.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        execute_db_operation(lambda conn: ensure_temp_schema(conn), statement_timeout_ms=30000)
+        flash(f'Schema "{TEMP_SCHEMA_NAME}" verificado/criado com sucesso.', 'success')
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao criar o schema temp: {str(e)}', 'error')
+
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/configurar-banco/criar-tabelas', methods=['POST'])
+def criar_tabelas_route():
+    """Cria as tabelas de controle de migração no schema public."""
+    if not is_db_configured():
+        flash('Configure e salve a conexão antes de criar as tabelas.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        criar_tabelas_controle()
+        flash(
+            'Tabelas de controle criadas/verificadas: migrações (controle_migracao, '
+            'controle_migracao_lotes) e importação automática (auto_importacao_tabelas, '
+            'auto_importacao_ciclos, auto_importacao_ciclo_registros).',
+            'success'
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao criar as tabelas: {str(e)}', 'error')
+
+    return redirect(url_for('configurar_banco'))
+
+
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    """Tela de login — nova página inicial da aplicação (index.html)."""
+    if session.get('usuario_id'):
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = verificar_login(username, password)
+        if user:
+            session.clear()
+            session['usuario_id'] = user['id']
+            session['username'] = user['username']
+            session['perfil'] = user['perfil']
+            destino = request.form.get('next') or url_for('dashboard')
+            return redirect(destino)
+        flash('Usuário ou senha inválidos.', 'error')
+
+    return render_template(
+        'index.html',
+        sem_usuarios=not get_users(),
+        next_url=request.args.get('next', '')
+    )
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Encerra a sessão do usuário logado."""
+    session.clear()
+    flash('Sessão encerrada.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/usuarios', methods=['GET', 'POST'])
+def usuarios():
+    """Tela de cadastro de usuários (perfis: usuario / administrador).
+    Acesso restrito a administradores — exceto enquanto não existir nenhum
+    usuário no sistema, para permitir criar o primeiro administrador.
+    """
+    if request.method == 'POST':
+        perfil_solicitado = request.form.get('perfil') or 'usuario'
+        # O primeiro usuário do sistema é sempre administrador (bootstrap)
+        perfil = 'administrador' if not get_users() else perfil_solicitado
+        try:
+            criar_usuario(request.form.get('username'), request.form.get('password'), perfil)
+            flash('Usuário criado com sucesso.', 'success')
+            return redirect(url_for('usuarios'))
+        except ValueError as error:
+            flash(str(error), 'error')
+
+    return render_template('usuarios.html', usuarios=get_users())
+
+
+@app.route('/usuarios/excluir/<int:user_id>', methods=['POST'])
+def excluir_usuario_route(user_id):
+    """Remove um usuário cadastrado (não permite excluir o próprio usuário logado)."""
+    if session.get('usuario_id') == user_id:
+        flash('Você não pode excluir o usuário com o qual está logado.', 'error')
+        return redirect(url_for('usuarios'))
+    try:
+        excluir_usuario(user_id)
+        flash('Usuário removido.', 'success')
+    except ValueError as error:
+        flash(str(error), 'error')
+    return redirect(url_for('usuarios'))
+
+
+@app.route('/dashboard')
+def dashboard():
+    """Página do Dashboard (antigo index.html, agora dashboard.html)."""
+    # Tabelas ativas da importação automática e do Agendar Importação — o
+    # dashboard também agenda os ciclos/execuções delas (igual as telas
+    # próprias já faziam), pra não depender de outra aba aberta pra ver
+    # algo acontecendo em tempo real.
+    try:
+        todas_auto_tabelas = get_auto_import_tabelas()
+    except Exception:
+        todas_auto_tabelas = []
+    tabelas_auto_ativas = [t for t in todas_auto_tabelas if t.get('status') == 'ativa']
+    resumo_auto = {'configuradas': len(todas_auto_tabelas), 'ativas': len(tabelas_auto_ativas)}
+
+    try:
+        todas_agendamento_tabelas = get_agendamento_tabelas()
+    except Exception:
+        todas_agendamento_tabelas = []
+    tabelas_agendamento_ativas = []
+    for t in todas_agendamento_tabelas:
+        if t.get('status') != 'ativa':
+            continue
+        # datetime.time não é serializável em JSON por padrão — converte
+        # pra string 'HH:MM' antes de embutir no template (tojson quebrava
+        # a página inteira com TypeError sempre que havia tabela ativa).
+        t = dict(t)
+        for campo in ('horario_1', 'horario_2', 'horario_3', 'horario_4'):
+            valor = t.get(campo)
+            t[campo] = valor.strftime('%H:%M') if valor is not None else None
+        t.pop('created_at', None)
+        t.pop('updated_at', None)
+        tabelas_agendamento_ativas.append(t)
+    resumo_agendamento = {'configuradas': len(todas_agendamento_tabelas), 'ativas': len(tabelas_agendamento_ativas)}
+
+    manual_em_execucao = contar_migracoes_manuais_em_execucao()
+
+    if not is_db_configured():
+        flash('Informe usuário e senha do banco na tela Banco para liberar as operações.', 'warning')
+        return render_template(
+            'dashboard.html', migracoes=[], totais={},
+            tabelas_auto_ativas=tabelas_auto_ativas,
+            tabelas_agendamento_ativas=tabelas_agendamento_ativas,
+            resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
+            manual_em_execucao=manual_em_execucao
+        )
+
+    try:
+        def _fetch_index(conn):
+            query = run_query_with_connection
+            migracoes = query(conn, """
+                SELECT * FROM controle_migracao
+                ORDER BY created_at DESC
+            """)
+
+            for m in migracoes:
+                # Último ID no destino
+                try:
+                    r = query(conn,
+                        f"SELECT MAX({m['campo_id']}) as ultimo_id FROM {m['tabela_destino']}")
+                    m['ultimo_id_destino'] = r[0].get('ultimo_id') or 0 if r else 0
+                except Exception:
+                    m['ultimo_id_destino'] = 0
+
+                # Último ID na origem (view)
+                try:
+                    r = query(conn,
+                        f"SELECT MAX({m['campo_id']}) as ultimo_id FROM {m['tabela_origem']}")
+                    m['ultimo_id_origem'] = r[0].get('ultimo_id') or 0 if r else 0
+                except Exception:
+                    m['ultimo_id_origem'] = m.get('id_maximo') or 0
+
+            return migracoes
+
+        migracoes = execute_db_operation(_fetch_index, statement_timeout_ms=120000)
+
+        # Totais agregados para KPIs
+        totais = {
+            'total_registros': sum(m.get('total_registros', 0) or 0 for m in migracoes),
+            'registros_processados': sum(m.get('registros_processados', 0) or 0 for m in migracoes),
+            'em_processamento': sum(1 for m in migracoes if m.get('status') == 'processando'),
+            'concluidas': sum(1 for m in migracoes if m.get('status') == 'concluido'),
+            'com_erro': sum(1 for m in migracoes if m.get('status') == 'erro'),
+            'pendentes': sum(1 for m in migracoes if m.get('status') in ('pendente', 'preparando')),
+        }
+        return render_template(
+            'dashboard.html', migracoes=migracoes, totais=totais,
+            tabelas_auto_ativas=tabelas_auto_ativas, tabelas_agendamento_ativas=tabelas_agendamento_ativas,
+            resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
+            manual_em_execucao=manual_em_execucao
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao carregar migrações: {str(e)}', 'error')
+        return render_template(
+            'dashboard.html', migracoes=[], totais={},
+            tabelas_auto_ativas=tabelas_auto_ativas, tabelas_agendamento_ativas=tabelas_agendamento_ativas,
+            resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
+            manual_em_execucao=manual_em_execucao
+        )
+
+@app.route('/nova-migracao', methods=['GET', 'POST'])
+def nova_migracao():
+    """Criar ou editar uma migração manual"""
+    if not is_db_configured():
+        if is_ajax_request():
+            return jsonify({
+                'status': 'erro',
+                'mensagem': 'Configure o banco antes de criar uma nova migração.',
+                'configurar_banco': url_for('configurar_banco')
+            }), 503
+        flash('Configure o banco antes de criar uma nova migração.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    if request.method == 'POST':
+        migracao_id_raw = (request.form.get('migracao_id') or '').strip()
+        editando_id = int(migracao_id_raw) if migracao_id_raw.isdigit() else None
+        tabela_origem_raw = request.form.get('tabela_origem')
+        tabela_destino_raw = request.form.get('tabela_destino')
+        campo_id = request.form.get('campo_id')
+        tamanho_lote = 1
+
+        try:
+            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
+        except (ValueError, OperationalError, InterfaceError) as error:
+            if is_ajax_request():
+                return jsonify({'status': 'erro', 'mensagem': str(error)}), 400
+            flash(str(error), 'error')
+            return render_template('nova_migracao.html', migracao_edicao={'id': editando_id} if editando_id else None)
+
+        try:
+            tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
+
+            if editando_id:
+                update_migration_record(
+                    migracao_id=editando_id,
+                    source_table=tabela_origem,
+                    target_table=tabela_destino,
+                    key_column=campo_id
+                )
+                migracao_id_resultado = editando_id
+                mensagem_sucesso = (
+                    f'Migração #{editando_id} atualizada! Recalculando colunas e totais em segundo plano.'
+                )
+            else:
+                migracao = create_migration_record(
+                    source_table=tabela_origem,
+                    target_table=tabela_destino,
+                    key_column=campo_id,
+                    batch_size=tamanho_lote
+                )
+                migracao_id_resultado = migracao['migracao_id']
+                mensagem_sucesso = (
+                    f'Migração #{migracao_id_resultado} registrada! '
+                    f'Acesse o controle para informar a faixa de IDs e iniciar o processamento.'
+                )
+
+            if tabela_criada_agora:
+                flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
+            if tabela_origem_raw and tabela_origem_raw.strip() != tabela_origem:
+                flash(f'Tabela origem resolvida automaticamente para: {tabela_origem}', 'info')
+            if tabela_destino_raw and tabela_destino_raw.strip() != tabela_destino:
+                flash(f'Tabela destino resolvida automaticamente para: {tabela_destino}', 'info')
+
+            # Preparar colunas e totais em segundo plano (apenas COUNT + MAX, não carrega IDs)
+            start_background_refresh_batches(migracao_id_resultado)
+
+            flash(mensagem_sucesso, 'success')
+
+            if is_ajax_request():
+                return jsonify({
+                    'status': 'sucesso',
+                    'mensagem': mensagem_sucesso,
+                    'migracao_id': migracao_id_resultado,
+                    'redirect_url': url_for('controle_migracao', id=migracao_id_resultado)
+                })
+
+            return redirect(url_for('controle_migracao', id=migracao_id_resultado))
+        except (OperationalError, InterfaceError) as error:
+            if is_ajax_request():
+                response = handle_db_connection_error(error, api=True)
+                return response
+            return handle_db_connection_error(error)
+        except Exception as e:
+            acao = 'atualizar' if editando_id else 'criar'
+            if is_ajax_request():
+                return jsonify({'status': 'erro', 'mensagem': f'Erro ao {acao} migração: {str(e)}'}), 500
+            flash(f'Erro ao {acao} migração: {str(e)}', 'error')
+
+    migracao_edicao = None
+    editar_id = request.args.get('editar')
+    if editar_id and editar_id.isdigit():
+        rows = execute_query(
+            "SELECT id, tabela_origem, tabela_destino, campo_id FROM controle_migracao WHERE id = %s",
+            (int(editar_id),)
+        )
+        migracao_edicao = rows[0] if rows else None
+        if migracao_edicao is None:
+            flash('Migração não encontrada para edição.', 'error')
+
+    return render_template('nova_migracao.html', migracao_edicao=migracao_edicao)
+
+
+@app.route('/importacao-automatica', methods=['GET', 'POST'])
+def importacao_automatica():
+    """Lista as tabelas configuradas para importação automática (como as
+    migrações) e permite cadastrar ou editar. Iniciar/Parar/Verificar/Excluir
+    ficam em rotas próprias, uma por tabela."""
+    if not is_db_configured():
+        flash('Configure o banco antes de acessar a importação automática.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    if request.method == 'POST':
+        tabela_id_raw = (request.form.get('tabela_id') or '').strip()
+        tabela_origem_raw = request.form.get('tabela_origem')
+        tabela_destino_raw = request.form.get('tabela_destino')
+        campo_id = (request.form.get('campo_id') or '').strip()
+
+        try:
+            intervalo_min = int(request.form.get('intervalo_min') or 5)
+            qtd_registros = int(request.form.get('qtd_registros') or 100)
+            tamanho_lote = int(request.form.get('tamanho_lote') or DEFAULT_TAMANHO_LOTE)
+        except (TypeError, ValueError):
+            flash('Intervalo, quantidade de registros e tamanho do lote devem ser números inteiros.', 'error')
+            return redirect(url_for('importacao_automatica'))
+
+        if intervalo_min <= 0 or qtd_registros <= 0 or tamanho_lote <= 0:
+            flash('Intervalo, quantidade de registros e tamanho do lote devem ser maiores que zero.', 'error')
+            return redirect(url_for('importacao_automatica'))
+        tamanho_lote = min(tamanho_lote, MAX_TAMANHO_LOTE)
+
+        try:
+            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
+            if not campo_id:
+                raise ValueError('Informe o campo chave (campo_id).')
+
+            tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
+
+            if tabela_id_raw.isdigit():
+                tabela_id = int(tabela_id_raw)
+                if not get_auto_import_tabela(tabela_id):
+                    raise ValueError('Tabela não encontrada para edição.')
+                atualizar_auto_import_tabela(
+                    tabela_id, tabela_origem, tabela_destino, campo_id,
+                    intervalo_min, qtd_registros, tamanho_lote
+                )
+                flash(f'Tabela "{tabela_destino}" atualizada.', 'success')
+            else:
+                criar_auto_import_tabela(tabela_origem, tabela_destino, campo_id, intervalo_min, qtd_registros, tamanho_lote)
+                flash(f'Tabela "{tabela_destino}" adicionada à importação automática.', 'success')
+
+            if tabela_criada_agora:
+                flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
+        except (ValueError, OperationalError, InterfaceError) as error:
+            flash(str(error), 'error')
+
+        return redirect(url_for('importacao_automatica'))
+
+    tabela_edicao = None
+    editar_id = request.args.get('editar')
+    if editar_id and editar_id.isdigit():
+        tabela_edicao = get_auto_import_tabela(int(editar_id))
+        if not tabela_edicao:
+            flash('Tabela não encontrada para edição.', 'error')
+
+    try:
+        tabelas = get_auto_import_tabelas()
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao carregar tabelas configuradas: {str(e)}', 'error')
+        tabelas = []
+
+    try:
+        migracoes_disponiveis = listar_migracoes_para_selecao()
+    except Exception:
+        migracoes_disponiveis = []
+
+    return render_template(
+        'importacao_automatica.html',
+        examples=AUTO_IMPORT_EXAMPLES,
+        tabelas=tabelas,
+        tabela_edicao=tabela_edicao,
+        migracoes_disponiveis=migracoes_disponiveis
+    )
+
+
+@app.route('/importacao-automatica/<int:tabela_id>/iniciar', methods=['POST'])
+def auto_import_iniciar(tabela_id):
+    """Marca a tabela como 'ativa' — o próprio navegador passa a chamar o ciclo no intervalo configurado."""
+    try:
+        if not get_auto_import_tabela(tabela_id):
+            return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+        atualizar_status_auto_import_tabela(tabela_id, 'ativa')
+        return jsonify({'status': 'sucesso'})
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+
+@app.route('/importacao-automatica/<int:tabela_id>/parar', methods=['POST'])
+def auto_import_parar(tabela_id):
+    """Marca a tabela como 'parada' e sinaliza cancelamento de um ciclo em
+    andamento (se houver) — o worker limpa a staging e para no meio do lote atual."""
+    try:
+        if not get_auto_import_tabela(tabela_id):
+            return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+        atualizar_status_auto_import_tabela(tabela_id, 'parada')
+
+        job_id = _generate_job_id('auto_ciclo', tabela_id)
+        job = get_background_job(job_id)
+        if job and job.get('status') in ('iniciando', 'processando'):
+            set_background_job(job_id, {**job, 'cancelar': True})
+
+        return jsonify({'status': 'sucesso'})
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+
+@app.route('/importacao-automatica/<int:tabela_id>/excluir', methods=['POST'])
+def auto_import_excluir(tabela_id):
+    """Remove a tabela da importação automática (e todo o histórico de ciclos dela)."""
+    try:
+        if not get_auto_import_tabela(tabela_id):
+            flash('Tabela não encontrada.', 'error')
+            return redirect(url_for('importacao_automatica'))
+        excluir_auto_import_tabela(tabela_id)
+        flash('Tabela removida da importação automática.', 'success')
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao excluir: {str(e)}', 'error')
+    return redirect(url_for('importacao_automatica'))
+
+
+@app.route('/importacao-automatica/<int:tabela_id>/ciclos')
+def auto_import_ciclos(tabela_id):
+    """Tela 'Verificar' — histórico de ciclos já executados para uma tabela."""
+    tabela = get_auto_import_tabela(tabela_id)
+    if not tabela:
+        flash('Tabela não encontrada.', 'error')
+        return redirect(url_for('importacao_automatica'))
+
+    try:
+        ciclos = execute_query(
+            "SELECT * FROM auto_importacao_ciclos WHERE tabela_id = %s ORDER BY executado_em DESC",
+            (tabela_id,)
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+
+    return render_template('importacao_automatica_ciclos.html', tabela=tabela, ciclos=ciclos)
+
+
+@app.route('/importacao-automatica/ciclo/<int:ciclo_id>/registros')
+def auto_import_ciclo_registros(ciclo_id):
+    """Detalhe de um ciclo — grid de registros processados, igual ao de uma migração."""
+    ciclo_rows = execute_query(
+        "SELECT * FROM auto_importacao_ciclos WHERE id = %s", (ciclo_id,)
+    )
+    if not ciclo_rows:
+        flash('Ciclo não encontrado.', 'error')
+        return redirect(url_for('importacao_automatica'))
+    ciclo = ciclo_rows[0]
+
+    tabela = get_auto_import_tabela(ciclo['tabela_id'])
+
+    try:
+        registros = execute_query(
+            "SELECT chave_valor, status, erro_msg FROM auto_importacao_ciclo_registros "
+            "WHERE ciclo_id = %s ORDER BY id",
+            (ciclo_id,)
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+
+    return render_template(
+        'importacao_automatica_ciclo_registros.html',
+        ciclo=ciclo, tabela=tabela, registros=registros
+    )
+
+@app.route('/migracao/<int:id>')
+def controle_migracao(id):
+    """Página de controle de uma migração específica"""
+    if not is_db_configured():
+        flash('Configure o banco antes de acessar o controle da migração.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        # Buscar informações da migração
+        migracao = execute_query(
+            "SELECT * FROM controle_migracao WHERE id = %s",
+            (id,)
+        )[0]
+        
+        total_registros = migracao['total_registros']
+        
+        return render_template(
+            'controle_migracao.html',
+            migracao=migracao,
+            total_registros=total_registros
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao carregar migração: {str(e)}', 'error')
+        return redirect(url_for('dashboard'))
+
+
+@app.route('/migracao/excluir/<int:id>', methods=['POST'])
+def excluir_migracao(id):
+    """Exclui um registro de controle de migração no dashboard."""
+    if not is_db_configured():
+        flash('Configure o banco antes de excluir uma migração.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    try:
+        execute_query(
+            "DELETE FROM controle_migracao WHERE id = %s",
+            (id,),
+            fetch=False
+        )
+        flash(f'Migração #{id} excluída com sucesso.', 'success')
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as error:
+        flash(f'Erro ao excluir migração: {str(error)}', 'error')
+
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/migracao/atualizar-lotes/<int:id>', methods=['POST'])
+def atualizar_lotes_migracao(id):
+    """Recalcula a consulta de diferenças e regenera os lotes pendentes da migração."""
+    if not is_db_configured():
+        flash('Configure o banco antes de atualizar os lotes.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    start_background_refresh_batches(id)
+    flash(
+        f'Migração #{id}: atualização de lotes iniciada em segundo plano.',
+        'success'
+    )
+
+    return redirect(url_for('controle_migracao', id=id))
+
+@app.route('/api/processar-lote', methods=['POST'])
+def api_processar_lote():
+    """API para processar um lote específico"""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    data = request.json
+    migracao_id = data.get('migracao_id')
+    numero_lote = data.get('numero_lote')
+    
+    try:
+        def processar_lote_na_mesma_conexao(conn):
+            result = run_query_with_connection(
+                conn,
+                "SELECT * FROM public.processar_lote(%s, %s)",
+                (migracao_id, numero_lote)
+            )[0]
+
+            progresso = run_query_with_connection(
+                conn,
+                "SELECT * FROM public.verificar_progresso(%s)",
+                (migracao_id,)
+            )[0]
+
+            if progresso['registros_processados'] >= progresso['total_registros']:
+                run_query_with_connection(
+                    conn,
+                    "SELECT public.finalizar_migracao(%s)",
+                    (migracao_id,),
+                    fetch=False
+                )
+                result['concluido'] = True
+                progresso = run_query_with_connection(
+                    conn,
+                    "SELECT * FROM public.verificar_progresso(%s)",
+                    (migracao_id,)
+                )[0]
+
+            result['progresso'] = dict(progresso)
+            return result
+
+        result = execute_db_operation(processar_lote_na_mesma_conexao)
+        return jsonify(result)
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({
+            'status': 'erro',
+            'mensagem': str(e),
+            'registros_inseridos': 0
+        }), 500
+
+
+@app.route('/api/processar-registro', methods=['POST'])
+def api_processar_registro():
+    """API para processar um registro específico por chave.
+
+    NOTA: continua consultando a origem diretamente (sem staging em temp).
+    Para um único ID, criar/copiar/derrubar tabela temp não compensa o custo.
+    """
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    data = request.json
+    migracao_id = data.get('migracao_id')
+    chave_valor = data.get('chave_valor')
+
+    if not chave_valor:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe a chave do registro.'}), 400
+
+    try:
+        def processar_registro_conexao(conn):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Ler config da migração
+                cur.execute("""
+                    SELECT tabela_origem, tabela_destino, campo_id,
+                           sql_colunas_insert, sql_colunas_select
+                    FROM controle_migracao WHERE id = %s
+                """, (migracao_id,))
+                cfg = cur.fetchone()
+
+                if not cfg:
+                    return {'registros_afetados': 0, 'status': 'erro', 'mensagem': 'Migração não encontrada'}
+
+                tab_orig = cfg['tabela_origem']
+                tab_dest = cfg['tabela_destino']
+                campo = cfg['campo_id']
+                cols_ins = cfg['sql_colunas_insert']
+                cols_sel = cfg['sql_colunas_select']
+
+                if not cols_ins or not cols_sel:
+                    return {'registros_afetados': 0, 'status': 'erro', 'mensagem': 'Colunas não preparadas'}
+
+                # 1) Inserir/atualizar conforme diferença entre origem e destino
+                sql_upsert_one = build_single_record_upsert_sql(tab_orig, tab_dest, campo, cols_ins, cols_sel)
+                chave_int = int(chave_valor)
+                cur.execute(sql_upsert_one, (chave_int,))
+                outcome = cur.fetchone() or {}
+                existe_origem = outcome.get('existe_origem')
+                inserido = outcome.get('inserido')
+
+                if not existe_origem:
+                    acao = 'nao_encontrado'
+                    rows = 0
+                elif inserido is True:
+                    acao = 'inserido'
+                    rows = 1
+                elif inserido is False:
+                    acao = 'atualizado'
+                    rows = 1
+                else:
+                    acao = 'ja_existe'
+                    rows = 0
+
+                # 3) Registrar no controle de lotes
+                cur.execute("""
+                    INSERT INTO controle_migracao_lotes
+                    (migracao_id, numero_lote, chave_valor, status, erro_msg, updated_at)
+                    VALUES (%s, 1, %s, %s, NULL, CURRENT_TIMESTAMP)
+                    ON CONFLICT (migracao_id, chave_valor) DO UPDATE
+                    SET status = EXCLUDED.status, erro_msg = NULL, updated_at = CURRENT_TIMESTAMP
+                """, (migracao_id, chave_valor, acao))
+
+                # 4) Atualizar contador se inserido/atualizado
+                if acao in ('inserido', 'atualizado'):
+                    cur.execute("""
+                        UPDATE controle_migracao
+                        SET registros_processados = registros_processados + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    """, (migracao_id,))
+
+                # 5) Buscar progresso
+                cur.execute("SELECT * FROM public.verificar_progresso(%s)", (migracao_id,))
+                progresso = cur.fetchone()
+
+            result = {
+                'registros_afetados': rows,
+                'status': 'nao_encontrado' if acao == 'nao_encontrado' else 'sucesso',
+                'mensagem': f'Registro {chave_valor}: {acao}'
+            }
+            if progresso:
+                result['progresso'] = dict(progresso)
+            return result
+
+        result = execute_db_operation(processar_registro_conexao, statement_timeout_ms=120000)
+        return jsonify(result)
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({
+            'status': 'erro',
+            'mensagem': str(e),
+            'registros_inseridos': 0
+        }), 500
+
+
+@app.route('/api/registros/<int:migracao_id>')
+def api_registros(migracao_id):
+    """Retorna os registros da migração com status para exibição no grid."""
+    if not is_db_configured():
+        return jsonify({'status': 'erro', 'mensagem': 'Banco não configurado.'}), 503
+
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 500, type=int)
+    status_filter = request.args.get('status', '').strip()
+    per_page = min(per_page, 2000)
+    offset = (page - 1) * per_page
+
+    try:
+        if status_filter:
+            registros = execute_query(
+                """SELECT id, chave_valor, status, erro_msg
+                   FROM controle_migracao_lotes
+                   WHERE migracao_id = %s AND status = %s
+                   ORDER BY id DESC LIMIT %s OFFSET %s""",
+                (migracao_id, status_filter, per_page, offset)
+            )
+        else:
+            registros = execute_query(
+                """SELECT id, chave_valor, status, erro_msg
+                   FROM controle_migracao_lotes
+                   WHERE migracao_id = %s
+                   ORDER BY id DESC LIMIT %s OFFSET %s""",
+                (migracao_id, per_page, offset)
+            )
+
+        stats = execute_query("""
+            SELECT
+                COUNT(*)::INTEGER as total,
+                COUNT(*) FILTER (WHERE status = 'inserido')::INTEGER as inseridos,
+                COUNT(*) FILTER (WHERE status = 'ja_existe')::INTEGER as ja_existem,
+                COUNT(*) FILTER (WHERE status = 'atualizado')::INTEGER as atualizados,
+                COUNT(*) FILTER (WHERE status = 'nao_encontrado')::INTEGER as nao_encontrados,
+                COUNT(*) FILTER (WHERE status = 'erro')::INTEGER as com_erro
+            FROM controle_migracao_lotes
+            WHERE migracao_id = %s
+        """, (migracao_id,))[0]
+
+        # Buscar o último registro existente na tabela destino
+        try:
+            cfg = execute_query(
+                "SELECT tabela_destino, campo_id FROM controle_migracao WHERE id = %s",
+                (migracao_id,)
+            )[0]
+            ultimo = execute_query(
+                f"SELECT MAX({cfg['campo_id']}) as ultimo_id FROM {cfg['tabela_destino']}"
+            )[0]
+            stats['ultimo_inserido'] = ultimo.get('ultimo_id')
+        except Exception:
+            stats['ultimo_inserido'] = None
+
+        return jsonify({
+            'registros': registros,
+            'stats': stats,
+            'page': page,
+            'per_page': per_page
+        })
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+
+@app.route('/api/importacao-automatica/ciclo', methods=['POST'])
+def api_importacao_automatica_ciclo():
+    """Executa um ciclo de atualização automática por diferenças em lote."""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    data = request.json or {}
+    mappings = data.get('mappings') or []
+
+    try:
+        batch_size = int(data.get('batch_size') or 100)
+    except (TypeError, ValueError):
+        return jsonify({'status': 'erro', 'mensagem': 'Informe um tamanho de lote válido.'}), 400
+
+    if batch_size <= 0:
+        return jsonify({'status': 'erro', 'mensagem': 'O tamanho do lote deve ser maior que zero.'}), 400
+
+    if not mappings:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe ao menos uma tabela para a importação automática.'}), 400
+
+    resultados = []
+    total_atualizados = 0
+
+    try:
+        for mapping in mappings:
+            try:
+                result = process_automatic_update_batch(
+                    source_relation=mapping.get('tabela_origem'),
+                    target_relation=mapping.get('tabela_destino'),
+                    key_column=mapping.get('campo_id'),
+                    batch_size=batch_size
+                )
+                result['status'] = 'sucesso'
+                total_atualizados += result['registros_atualizados']
+            except ValueError as error:
+                result = {
+                    'status': 'erro',
+                    'origem': mapping.get('tabela_origem'),
+                    'destino': mapping.get('tabela_destino'),
+                    'campo_id': mapping.get('campo_id'),
+                    'mensagem': str(error)
+                }
+
+            resultados.append(result)
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as error:
+        return jsonify({'status': 'erro', 'mensagem': str(error)}), 500
+
+    return jsonify({
+        'status': 'sucesso',
+        'resultados': resultados,
+        'total_tabelas': len(resultados),
+        'total_atualizados': total_atualizados
+    })
+
+def _cancelar_ciclo_auto_import(job_id, conn, staging):
+    """Chamado quando o usuário clica em 'Parar' com um ciclo em andamento:
+    derruba a staging (não deixa lixo em `temp`) e marca o job como cancelado."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS {staging}')
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    set_background_job(job_id, {
+        **(get_background_job(job_id) or {}),
+        'status': 'cancelado',
+        'mensagem': 'Ciclo interrompido pelo usuário.',
+        'fim': datetime.now().isoformat(),
+    })
+    _log_ciclo(job_id, 'aviso', 'Ciclo interrompido pelo usuário — staging removida.')
+
+
+LOG_CICLO_MAX_LINHAS = 300  # trava de tamanho do log em memória por ciclo
+LOTES_CICLO_MAX_ITENS = 300  # idem para o histórico de lotes
+
+
+def _log_ciclo(job_id, nivel, mensagem):
+    """Adiciona uma linha ao log do ciclo (lido pela tela de acompanhamento)."""
+    job = get_background_job(job_id) or {}
+    log = list(job.get('log') or [])
+    log.append({
+        'hora': datetime.now().strftime('%H:%M:%S'),
+        'nivel': nivel,  # 'info' | 'sucesso' | 'aviso' | 'erro'
+        'mensagem': mensagem,
+    })
+    if len(log) > LOG_CICLO_MAX_LINHAS:
+        log = log[-LOG_CICLO_MAX_LINHAS:]
+    set_background_job(job_id, {**job, 'log': log})
+
+
+def _registrar_lote_no_job(job_id, numero, inseridos, atualizados, ja_existem, com_erro):
+    """Adiciona o resultado de um lote à lista de lotes do job (tela de acompanhamento)."""
+    job = get_background_job(job_id) or {}
+    lotes = list(job.get('lotes') or [])
+    lotes.append({
+        'numero': numero,
+        'inseridos': inseridos,
+        'atualizados': atualizados,
+        'ja_existem': ja_existem,
+        'com_erro': com_erro,
+    })
+    if len(lotes) > LOTES_CICLO_MAX_ITENS:
+        lotes = lotes[-LOTES_CICLO_MAX_ITENS:]
+    set_background_job(job_id, {**job, 'lotes': lotes})
+
+
+def _background_auto_import_ciclo_worker(job_id, tabela_id):
+    """Executa um ciclo de importação automática em segundo plano.
+
+    Usa a MESMA arquitetura do worker de migração manual (só muda o nome da
+    staging, com prefixo `c_` em vez de `stg_mig_<id>`, pra nunca colidir):
+    monta uma lista explícita de IDs a verificar e processa em lotes; cada
+    lote copia só aqueles IDs da origem via `WHERE chave = ANY(...)` — a
+    mesma consulta que já funciona sem problemas em qualquer tabela na
+    migração, porque o postgres_fdw empurra o `= ANY(...)` pra origem usando
+    o índice, sem depender de ORDER BY/LIMIT (que é o que causava timeout).
+    Reaproveita direto as funções da migração: copiar_lote_para_staging,
+    processar_lote_bulk, processar_lote_fallback (nenhuma delas foi alterada).
+    """
+    job = get_background_job(job_id)
+    if not job:
+        return
+
+    set_background_job(job_id, {**job, 'status': 'processando', 'inicio': datetime.now().isoformat(), 'log': [], 'lotes': []})
+    _log_ciclo(job_id, 'info', 'Ciclo iniciado.')
+
+    tabela_cfg = get_auto_import_tabela(tabela_id)
+    if not tabela_cfg:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': 'Tabela não encontrada.'})
+        _log_ciclo(job_id, 'erro', 'Tabela não encontrada.')
+        return
+
+    try:
+        normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
+        normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
+    except ValueError as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_ciclo(job_id, 'erro', str(error))
+        return
+
+    normalized_key = tabela_cfg['campo_id']
+    qtd_registros = tabela_cfg['qtd_registros']
+    tamanho_lote = min(tabela_cfg['tamanho_lote'], MAX_TAMANHO_LOTE)
+    quoted_source = quote_qualified_relation(normalized_source)
+    quoted_target = quote_qualified_relation(normalized_target)
+    quoted_key = quote_identifier(normalized_key)
+
+    def abrir_conexao_auto():
+        for enc in get_db_client_encoding_candidates():
+            try:
+                c = open_db_connection(client_encoding=enc, statement_timeout_ms=120000)
+                persist_working_client_encoding(enc)
+                return c
+            except Exception:
+                continue
+        return open_db_connection(statement_timeout_ms=120000)
+
+    conn = None
+    registros_ciclo = []  # (chave, status, erro_msg) — vira o detalhe do ciclo
+    try:
+        conn = abrir_conexao_auto()
+        query = run_query_with_connection
+
+        # Trava por tabela: evita que duas execuções simultâneas colidam na
+        # mesma staging (temp.c_<tabela>).
+        lock_row = query(conn, "SELECT pg_try_advisory_lock(%s) AS locked", (tabela_id,))
+        if not (lock_row and lock_row[0]['locked']):
+            set_background_job(job_id, {
+                **get_background_job(job_id), 'status': 'erro',
+                'mensagem': 'Já existe um ciclo em andamento para esta tabela.',
+            })
+            return
+        # Trava de sessão: libera sozinha quando `conn.close()` roda.
+
+        # 1. Colunas comuns entre origem e destino (metadado local, rápido)
+        source_schema, source_table = normalized_source.split('.', 1)
+        target_schema, target_table = normalized_target.split('.', 1)
+
+        source_cols_raw = query(conn,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (source_schema, source_table))
+        source_columns = {r['column_name'] for r in source_cols_raw}
+
+        target_cols_raw = query(conn,
+            "SELECT column_name, is_identity, is_generated, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (target_schema, target_table))
+
+        if normalized_key not in source_columns:
+            raise ValueError(f'A coluna chave "{normalized_key}" não existe na tabela de origem {normalized_source}.')
+        if not any(c['column_name'] == normalized_key for c in target_cols_raw):
+            raise ValueError(f'A coluna chave "{normalized_key}" não existe na tabela de destino {normalized_target}.')
+
+        common_columns = [
+            c['column_name'] for c in target_cols_raw
+            if c['column_name'] != normalized_key
+            and c['column_name'] in source_columns
+            and c.get('is_generated') != 'ALWAYS'
+        ]
+
+        all_columns = [normalized_key] + common_columns
+        quoted_columns = [quote_identifier(c) for c in all_columns]
+        cols_ins = ', '.join(all_columns)  # CSV de nomes SEM aspas — copiar_lote_para_staging/
+                                            # montar_sql_upsert_lote fazem a própria quotação
+                                            # internamente (é o mesmo formato que sql_colunas_insert
+                                            # usa nas migrações manuais)
+        cols_select_source = ', '.join([f's.{qc}' for qc in quoted_columns])
+
+        # 2. MAX(campo_id) do destino e da origem. A migração recebe a faixa
+        #    (ID Inicial/Final) escolhida pelo usuário; aqui, como ninguém
+        #    escolhe na hora, precisamos descobrir sozinhos onde parar. Um
+        #    MAX com índice é rápido e sempre é empurrado pro FDW (vira
+        #    ORDER BY DESC LIMIT 1 remotamente).
+        # int(...) é necessário porque campo_id pode ser NUMERIC no Postgres
+        # (comum nesse sistema — ex.: "isn_marcacao > 132115::numeric" nos
+        # logs) e o psycopg2 devolve NUMERIC como Decimal, que o range()
+        # do Python não aceita ("'decimal.Decimal' object cannot be
+        # interpreted as an integer").
+        max_destino = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
+        ultimo_id_destino = int(max_destino[0]['ultimo_id']) if max_destino and max_destino[0]['ultimo_id'] is not None else 0
+
+        max_origem = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_source}")
+        ultimo_id_origem = int(max_origem[0]['ultimo_id']) if max_origem and max_origem[0]['ultimo_id'] is not None else 0
+
+        # 3. Faixa: id_fim é SEMPRE o máximo real da origem — nunca capado,
+        #    senão registros novos além do teto de segurança ficariam de fora
+        #    (bug real: com destino quase cheio e qtd_registros pequeno
+        #    perto do tamanho da tabela, o teto cortava antes de chegar nos
+        #    IDs novos). Quem se ajusta pelo teto é o INÍCIO da faixa: pega o
+        #    mais recente entre "dobro pra trás" (gaps) e "só os últimos N
+        #    antes do fim" (não deixa a janela estourar num destino vazio).
+        id_inicio = max(0, ultimo_id_destino - qtd_registros)
+        id_inicio_dobro = max(0, id_inicio - qtd_registros)
+        id_fim = ultimo_id_origem
+        limite_janela = qtd_registros * 2
+        id_inicio_faixa = max(0, id_inicio_dobro, id_fim - limite_janela)
+
+        ids_list = [str(v) for v in range(id_inicio_faixa + 1, id_fim + 1)] if id_fim > id_inicio_faixa else []
+
+        # 4. Staging em `temp` com prefixo c_ — mesma estrutura da migração
+        #    (só estrutura, WHERE FALSE), reaproveitada por todos os lotes.
+        staging = obter_staging_table_auto(normalized_target)
+        ensure_temp_schema(conn)
+
+        def _preparar_staging_vazia(c):
+            with c.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS {staging}')
+                cur.execute(
+                    f'CREATE UNLOGGED TABLE {staging} AS '
+                    f'SELECT {cols_select_source} FROM {quoted_source} s WHERE FALSE'
+                )
+            c.commit()
+
+        conn = executar_com_reconexao(_preparar_staging_vazia, abrir_conexao_auto, conn, job_id=job_id, etapa='origem (FDW)')
+
+        total_lotes = math.ceil(len(ids_list) / tamanho_lote) if ids_list else 0
+
+        set_background_job(job_id, {
+            **get_background_job(job_id),
+            'total_lotes': total_lotes,
+            'lote_atual': 0,
+            'tamanho_lote': tamanho_lote,
+            'mensagem': f'{len(ids_list)} id(s) a verificar em {total_lotes} lote(s)...',
+        })
+        _log_ciclo(
+            job_id, 'info',
+            f'{len(ids_list)} id(s) a verificar (faixa {id_inicio_faixa + 1}-{id_fim}) em {total_lotes} lote(s).'
+        )
+
+        # 5. Processa cada lote: copia só os IDs daquele lote pra staging
+        #    (WHERE chave = ANY(...), empurrado pro FDW via índice — mesma
+        #    lógica que já funciona sem problemas na migração manual, em
+        #    qualquer tabela) e faz o upsert em lote contra o destino.
+        #    Reaproveita as funções da migração sem alterar nenhuma delas.
+        registros_inseridos = 0
+        registros_atualizados = 0
+        registros_ja_existem = 0
+        registros_nao_encontrados = 0
+        registros_com_erro = 0
+
+        for lote_idx in range(total_lotes):
+            if (get_background_job(job_id) or {}).get('cancelar'):
+                _cancelar_ciclo_auto_import(job_id, conn, staging)
+                return
+
+            ids_lote = ids_list[lote_idx * tamanho_lote: (lote_idx + 1) * tamanho_lote]
+
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'mensagem': f'Lote {lote_idx + 1}/{total_lotes}: copiando {len(ids_lote)} registro(s) da origem...',
+            })
+
+            # Copia o lote pra staging — reconecta automaticamente (com mais
+            # paciência em conflito de recovery) se a origem cair no meio.
+            conn = executar_com_reconexao(
+                lambda c: copiar_lote_para_staging(c, staging, normalized_source, normalized_key, cols_ins, ids_lote),
+                abrir_conexao_auto, conn, job_id=job_id, etapa='origem (FDW)'
+            )
+
+            # Remove duplicatas de chave dentro do lote — algumas views de
+            # origem retornam mais de uma linha pra mesma chave (ex.: JOIN que
+            # multiplica linhas, comum em views de agendamento/telefone). Sem
+            # isso, o upsert em lote falha sempre com "ON CONFLICT ... cannot
+            # affect row a second time" e cai pro fallback lento em TODO
+            # lote. Mantém uma linha por chave (mesmo critério "arbitrário"
+            # que o fallback linha-a-linha já usa via LIMIT 1). Não mexe em
+            # nenhuma função da migração — só uma limpeza extra na staging
+            # da importação automática.
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'DELETE FROM {staging} a USING {staging} b '
+                    f'WHERE a.ctid < b.ctid AND a.{quoted_key} = b.{quoted_key}'
+                )
+            conn.commit()
+
+            # Upsert em lote (caminho rápido); se falhar, cai pro fallback
+            # registro a registro — mesmas funções que a migração usa.
+            try:
+                resultado = processar_lote_bulk(conn, staging, normalized_target, normalized_key, cols_ins, ids_lote)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _log_ciclo(job_id, 'aviso', f'Lote {lote_idx + 1}/{total_lotes}: upsert em lote falhou, reprocessando registro a registro...')
+                resultado = processar_lote_fallback(conn, staging, normalized_target, normalized_key, cols_ins, ids_lote)
+
+            lote_inseridos = len(resultado['inseridos'])
+            lote_atualizados = len(resultado['atualizados'])
+            lote_ja_existem = len(resultado['ja_existem'])
+            lote_nao_encontrados = len(resultado['nao_encontrados'])
+            lote_com_erro = len(resultado['com_erro'])
+
+            registros_inseridos += lote_inseridos
+            registros_atualizados += lote_atualizados
+            registros_ja_existem += lote_ja_existem
+            registros_nao_encontrados += lote_nao_encontrados
+            registros_com_erro += lote_com_erro
+
+            for chave in resultado['inseridos']:
+                registros_ciclo.append((chave, 'inserido', None))
+            for chave in resultado['atualizados']:
+                registros_ciclo.append((chave, 'atualizado', None))
+            for chave in resultado['ja_existem']:
+                registros_ciclo.append((chave, 'ja_existe', None))
+            for chave in resultado['nao_encontrados']:
+                registros_ciclo.append((chave, 'nao_encontrado', None))
+            for item in resultado['com_erro']:
+                registros_ciclo.append((item['chave'], 'erro', item['erro']))
+
+            _registrar_lote_no_job(job_id, lote_idx + 1, lote_inseridos, lote_atualizados, lote_ja_existem, lote_com_erro)
+
+            partes_lote = []
+            if lote_inseridos: partes_lote.append(f'{lote_inseridos} inserido(s)')
+            if lote_atualizados: partes_lote.append(f'{lote_atualizados} atualizado(s)')
+            if lote_ja_existem: partes_lote.append(f'{lote_ja_existem} já existente(s)')
+            if lote_nao_encontrados: partes_lote.append(f'{lote_nao_encontrados} não encontrado(s)')
+            if lote_com_erro: partes_lote.append(f'{lote_com_erro} com erro')
+            _log_ciclo(
+                job_id, 'erro' if lote_com_erro else 'info',
+                f'Lote {lote_idx + 1}/{total_lotes}: ' + (', '.join(partes_lote) if partes_lote else 'nada a fazer') + '.'
+            )
+
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'lote_atual': lote_idx + 1,
+                'total_lotes': total_lotes,
+                'registros_inseridos': registros_inseridos,
+                'registros_atualizados': registros_atualizados,
+                'registros_ja_existem': registros_ja_existem,
+                'registros_com_erro': registros_com_erro,
+                'mensagem': f'Lote {lote_idx + 1}/{total_lotes}...',
+            })
+
+        # 6. Staging é recriada do zero a cada ciclo — remove ao final
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS {staging}')
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        # 7. Novo MAX(campo_id) do destino
+        max_after = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
+        novo_ultimo_id = int(max_after[0]['ultimo_id']) if max_after and max_after[0]['ultimo_id'] is not None else 0
+
+        # 8. Grava o resumo do ciclo + o detalhe por chave (histórico persistido)
+        status_ciclo = 'erro' if (
+            registros_com_erro > 0
+            and registros_inseridos == 0 and registros_atualizados == 0 and registros_ja_existem == 0
+        ) else 'concluido'
+        partes_msg = []
+        if registros_inseridos: partes_msg.append(f'{registros_inseridos} inserido(s)')
+        if registros_atualizados: partes_msg.append(f'{registros_atualizados} atualizado(s)')
+        if registros_ja_existem: partes_msg.append(f'{registros_ja_existem} já existente(s)')
+        if registros_nao_encontrados: partes_msg.append(f'{registros_nao_encontrados} não encontrado(s)')
+        if registros_com_erro: partes_msg.append(f'{registros_com_erro} com erro')
+        mensagem_ciclo = ', '.join(partes_msg) if partes_msg else 'nenhum registro na janela'
+
+        ciclo_id = registrar_ciclo_auto_import(
+            conn, tabela_id, status_ciclo, mensagem_ciclo,
+            registros_inseridos, registros_atualizados, registros_ja_existem, registros_nao_encontrados,
+            registros_com_erro, total_lotes, tamanho_lote, id_inicio_faixa, novo_ultimo_id
+        )
+        gravar_registros_ciclo(conn, ciclo_id, registros_ciclo)
+
+    except ValueError as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_ciclo(job_id, 'erro', f'Ciclo interrompido: {error}')
+        return
+    except Exception as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_ciclo(job_id, 'erro', f'Erro fatal no ciclo: {error}')
+        return
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    try:
+        atualizar_ultimo_id_auto_import(tabela_id, novo_ultimo_id)
+    except Exception:
+        pass
+
+    _log_ciclo(job_id, 'sucesso', f'Ciclo concluído: {mensagem_ciclo}.')
+    set_background_job(job_id, {
+        **get_background_job(job_id),
+        'status': 'concluido',
+        'mensagem': mensagem_ciclo,
+        'ciclo_id': ciclo_id,
+        'ultimo_id_destino': novo_ultimo_id,
+        'id_inicio_faixa': id_inicio_faixa,
+        'tamanho_lote': tamanho_lote,
+        'total_lotes': total_lotes,
+        'lote_atual': total_lotes,
+        'registros_inseridos': registros_inseridos,
+        'registros_atualizados': registros_atualizados,
+        'registros_ja_existem': registros_ja_existem,
+        'registros_com_erro': registros_com_erro,
+        'fim': datetime.now().isoformat(),
+    })
+
+
+def _fechar_execucao_com_erro(conn, execucao_id, mensagem_erro, variaveis_locais):
+    """Se a execução já tinha criado o registro (status 'processando') quando
+    uma exceção interrompeu o worker, fecha esse registro como 'erro' em vez
+    de deixá-lo preso em 'processando' pra sempre. Best-effort: se a conexão
+    já estiver quebrada pelo mesmo erro, só desiste silenciosamente."""
+    if execucao_id is None or conn is None:
+        return
+    try:
+        atualizar_execucao_agendamento(
+            conn, execucao_id, 'erro', mensagem_erro[:500],
+            variaveis_locais.get('registros_inseridos', 0),
+            variaveis_locais.get('registros_atualizados', 0),
+            variaveis_locais.get('registros_ja_existem', 0),
+            variaveis_locais.get('registros_deletados', 0),
+            variaveis_locais.get('registros_com_erro', 0),
+            variaveis_locais.get('ultimo_id_destino')
+        )
+    except Exception:
+        pass
+
+
+def _background_agendamento_worker(job_id, tabela_id):
+    """Executa uma importação COMPLETA (insert/update/delete) em segundo plano.
+
+    Mesma arquitetura do worker de migração/importação automática — lista
+    explícita de IDs processada em lotes (WHERE chave = ANY(...), empurrado
+    pro FDW via índice) — mas cobrindo a faixa INTEIRA (1 até o maior ID
+    entre origem e destino), não uma janela recente, e com um passo extra de
+    DELETE pra remover do destino o que não existe mais na origem. Staging
+    com prefixo a_, pra nunca colidir com o stg_mig_<id> da migração nem com
+    o c_<tabela> da importação automática.
+    """
+    job = get_background_job(job_id)
+    if not job:
+        return
+
+    set_background_job(job_id, {**job, 'status': 'processando', 'inicio': datetime.now().isoformat(), 'log': [], 'lotes': []})
+    _log_execucao(job_id, 'info', 'Execução iniciada.')
+
+    tabela_cfg = get_agendamento_tabela(tabela_id)
+    if not tabela_cfg:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': 'Tabela não encontrada.'})
+        _log_execucao(job_id, 'erro', 'Tabela não encontrada.')
+        return
+
+    try:
+        normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
+        normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
+    except ValueError as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_execucao(job_id, 'erro', str(error))
+        return
+
+    normalized_key = tabela_cfg['campo_id']
+    tamanho_lote = min(tabela_cfg['tamanho_lote'], MAX_TAMANHO_LOTE)
+    quoted_source = quote_qualified_relation(normalized_source)
+    quoted_target = quote_qualified_relation(normalized_target)
+    quoted_key = quote_identifier(normalized_key)
+
+    def abrir_conexao_agendamento():
+        for enc in get_db_client_encoding_candidates():
+            try:
+                c = open_db_connection(client_encoding=enc, statement_timeout_ms=120000)
+                persist_working_client_encoding(enc)
+                return c
+            except Exception:
+                continue
+        return open_db_connection(statement_timeout_ms=120000)
+
+    conn = None
+    execucao_id = None
+    try:
+        conn = abrir_conexao_agendamento()
+        query = run_query_with_connection
+
+        # Trava por tabela — soma um deslocamento grande ao id pra não usar o
+        # mesmo número de trava que a importação automática usa pra essa
+        # mesma tabela_id (evitaria as duas rodarem juntas por engano).
+        lock_row = query(conn, "SELECT pg_try_advisory_lock(%s) AS locked", (200000000 + tabela_id,))
+        if not (lock_row and lock_row[0]['locked']):
+            set_background_job(job_id, {
+                **get_background_job(job_id), 'status': 'erro',
+                'mensagem': 'Já existe uma execução em andamento para esta tabela.',
+            })
+            return
+        # Trava de sessão: libera sozinha quando `conn.close()` roda.
+
+        # 1. Colunas comuns entre origem e destino (metadado local, rápido)
+        source_schema, source_table = normalized_source.split('.', 1)
+        target_schema, target_table = normalized_target.split('.', 1)
+
+        source_cols_raw = query(conn,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (source_schema, source_table))
+        source_columns = {r['column_name'] for r in source_cols_raw}
+
+        target_cols_raw = query(conn,
+            "SELECT column_name, is_identity, is_generated, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (target_schema, target_table))
+
+        if normalized_key not in source_columns:
+            raise ValueError(f'A coluna chave "{normalized_key}" não existe na tabela de origem {normalized_source}.')
+        if not any(c['column_name'] == normalized_key for c in target_cols_raw):
+            raise ValueError(f'A coluna chave "{normalized_key}" não existe na tabela de destino {normalized_target}.')
+
+        common_columns = [
+            c['column_name'] for c in target_cols_raw
+            if c['column_name'] != normalized_key
+            and c['column_name'] in source_columns
+            and c.get('is_generated') != 'ALWAYS'
+        ]
+
+        all_columns = [normalized_key] + common_columns
+        quoted_columns = [quote_identifier(c) for c in all_columns]
+        cols_ins = ', '.join(all_columns)  # CSV sem aspas — as funções da migração quotam sozinhas
+        cols_select_source = ', '.join([f's.{qc}' for qc in quoted_columns])
+
+        # 2. MAX(campo_id) do destino e da origem. int(...) porque campo_id
+        #    pode ser NUMERIC no Postgres (Decimal não funciona em range()).
+        max_destino = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
+        ultimo_id_destino = int(max_destino[0]['ultimo_id']) if max_destino and max_destino[0]['ultimo_id'] is not None else 0
+
+        max_origem = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_source}")
+        ultimo_id_origem = int(max_origem[0]['ultimo_id']) if max_origem and max_origem[0]['ultimo_id'] is not None else 0
+
+        # Libera a transação logo — sem isso a conexão fica "idle in
+        # transaction" seguradno o snapshot enquanto o Python monta a lista
+        # de lotes abaixo, o que pode travar VACUUM e outras operações no
+        # banco em tabelas grandes (psycopg2 não usa autocommit por padrão).
+        conn.commit()
+
+        # 3. Faixa COMPLETA: 1 até o maior ID entre origem e destino — sem
+        #    isso, um ID que só existe no destino (e deveria ser deletado)
+        #    nunca entraria na lista de verificação.
+        #
+        # IMPORTANTE: NÃO materializa a lista inteira de IDs em memória (um
+        # `range(1, id_fim + 1)` convertido em lista de strings, pra uma
+        # tabela com milhões de linhas, consome memória e CPU excessivos —
+        # foi isso que travou o banco). Cada lote calcula só os IDs que
+        # precisa, na hora, via slice do range.
+        id_fim = max(ultimo_id_destino, ultimo_id_origem)
+        total_lotes = math.ceil(id_fim / tamanho_lote) if id_fim > 0 else 0
+
+        def ids_do_lote(lote_idx):
+            inicio = lote_idx * tamanho_lote + 1
+            fim = min((lote_idx + 1) * tamanho_lote, id_fim)
+            return [str(v) for v in range(inicio, fim + 1)]
+
+        # 4. Staging em `temp` com prefixo a_ — mesma estrutura da migração
+        #    (só estrutura, WHERE FALSE), reaproveitada por todos os lotes.
+        staging = obter_staging_table_agendamento(normalized_target)
+        ensure_temp_schema(conn)
+
+        def _preparar_staging_vazia(c):
+            with c.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS {staging}')
+                cur.execute(
+                    f'CREATE UNLOGGED TABLE {staging} AS '
+                    f'SELECT {cols_select_source} FROM {quoted_source} s WHERE FALSE'
+                )
+            c.commit()
+
+        conn = executar_com_reconexao(_preparar_staging_vazia, abrir_conexao_agendamento, conn, job_id=job_id, etapa='origem (FDW)')
+
+        set_background_job(job_id, {
+            **get_background_job(job_id),
+            'total_lotes': total_lotes,
+            'lote_atual': 0,
+            'tamanho_lote': tamanho_lote,
+            'mensagem': f'{id_fim} id(s) a verificar em {total_lotes} lote(s)...',
+        })
+        _log_execucao(
+            job_id, 'info',
+            f'{id_fim} id(s) a verificar (faixa completa 1-{id_fim}) em {total_lotes} lote(s).'
+        )
+
+        # Cria o registro da execução JÁ AGORA (contadores em zero, status
+        # 'processando') em vez de só no final — permite gravar o detalhe
+        # por chave lote a lote (evita acumular milhões de linhas em memória
+        # pra tabelas grandes, e evita uma única instrução gigante no final).
+        execucao_id = registrar_execucao_agendamento(
+            conn, tabela_id, 'processando', 'em andamento...',
+            0, 0, 0, 0, 0, total_lotes, tamanho_lote, ultimo_id_destino
+        )
+
+        # 5. Processa cada lote: copia os IDs daquele lote pra staging (mesma
+        #    função da migração), faz o upsert em lote e, pra quem não foi
+        #    encontrado na origem, apaga do destino (se existir lá).
+        registros_inseridos = 0
+        registros_atualizados = 0
+        registros_ja_existem = 0
+        registros_deletados = 0
+        registros_com_erro = 0
+
+        for lote_idx in range(total_lotes):
+            if (get_background_job(job_id) or {}).get('cancelar'):
+                _cancelar_execucao_agendamento(job_id, conn, staging, execucao_id, {
+                    'registros_inseridos': registros_inseridos,
+                    'registros_atualizados': registros_atualizados,
+                    'registros_ja_existem': registros_ja_existem,
+                    'registros_deletados': registros_deletados,
+                    'registros_com_erro': registros_com_erro,
+                    'ultimo_id_destino': ultimo_id_destino,
+                })
+                return
+
+            ids_lote = ids_do_lote(lote_idx)
+
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'mensagem': f'Lote {lote_idx + 1}/{total_lotes}: copiando {len(ids_lote)} registro(s) da origem...',
+            })
+
+            # Copia o lote pra staging — reconecta automaticamente (com mais
+            # paciência em conflito de recovery) se a origem cair no meio.
+            conn = executar_com_reconexao(
+                lambda c: copiar_lote_para_staging(c, staging, normalized_source, normalized_key, cols_ins, ids_lote),
+                abrir_conexao_agendamento, conn, job_id=job_id, etapa='origem (FDW)'
+            )
+
+            # Remove duplicatas de chave dentro do lote — mesma razão da
+            # importação automática (view de origem pode ter JOIN que
+            # multiplica linhas, o que quebraria o upsert em lote).
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'DELETE FROM {staging} a USING {staging} b '
+                    f'WHERE a.ctid < b.ctid AND a.{quoted_key} = b.{quoted_key}'
+                )
+            conn.commit()
+
+            # Upsert em lote (caminho rápido); se falhar, cai pro fallback
+            # registro a registro — mesmas funções que a migração usa.
+            try:
+                resultado = processar_lote_bulk(conn, staging, normalized_target, normalized_key, cols_ins, ids_lote)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _log_execucao(job_id, 'aviso', f'Lote {lote_idx + 1}/{total_lotes}: upsert em lote falhou, reprocessando registro a registro...')
+                resultado = processar_lote_fallback(conn, staging, normalized_target, normalized_key, cols_ins, ids_lote)
+
+            # DELETE: chaves deste lote que não existem na origem — se também
+            # não existirem no destino, o DELETE só não afeta nenhuma linha
+            # (inofensivo). RETURNING confirma quais realmente foram apagadas.
+            deletados_lote = []
+            if resultado['nao_encontrados']:
+                try:
+                    del_ids = [int(v) for v in resultado['nao_encontrados']]
+                    del_result = query(
+                        conn,
+                        f'DELETE FROM {quoted_target} WHERE {quoted_key} = ANY(%s) RETURNING {quoted_key} AS chave',
+                        (del_ids,)
+                    )
+                    conn.commit()
+                    deletados_lote = [str(r['chave']) for r in del_result]
+                except Exception as del_error:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    _log_execucao(job_id, 'erro', f'Lote {lote_idx + 1}/{total_lotes}: erro ao deletar — {str(del_error)[:300]}')
+
+            lote_inseridos = len(resultado['inseridos'])
+            lote_atualizados = len(resultado['atualizados'])
+            lote_ja_existem = len(resultado['ja_existem'])
+            lote_deletados = len(deletados_lote)
+            lote_com_erro = len(resultado['com_erro'])
+
+            registros_inseridos += lote_inseridos
+            registros_atualizados += lote_atualizados
+            registros_ja_existem += lote_ja_existem
+            registros_deletados += lote_deletados
+            registros_com_erro += lote_com_erro
+
+            registros_deste_lote = []
+            for chave in resultado['inseridos']:
+                registros_deste_lote.append((chave, 'inserido', None))
+            for chave in resultado['atualizados']:
+                registros_deste_lote.append((chave, 'atualizado', None))
+            for chave in resultado['ja_existem']:
+                registros_deste_lote.append((chave, 'ja_existe', None))
+            for chave in deletados_lote:
+                registros_deste_lote.append((chave, 'deletado', None))
+            for item in resultado['com_erro']:
+                registros_deste_lote.append((item['chave'], 'erro', item['erro']))
+
+            # Grava o detalhe deste lote já (no máximo `tamanho_lote` linhas
+            # de cada vez) em vez de acumular tudo em memória pra escrever
+            # numa instrução só no final — essencial pra tabelas grandes.
+            gravar_registros_execucao(conn, execucao_id, registros_deste_lote)
+
+            _registrar_lote_execucao_no_job(job_id, lote_idx + 1, lote_inseridos, lote_atualizados, lote_ja_existem, lote_deletados, lote_com_erro)
+
+            partes_lote = []
+            if lote_inseridos: partes_lote.append(f'{lote_inseridos} inserido(s)')
+            if lote_atualizados: partes_lote.append(f'{lote_atualizados} atualizado(s)')
+            if lote_ja_existem: partes_lote.append(f'{lote_ja_existem} já existente(s)')
+            if lote_deletados: partes_lote.append(f'{lote_deletados} deletado(s)')
+            if lote_com_erro: partes_lote.append(f'{lote_com_erro} com erro')
+            _log_execucao(
+                job_id, 'erro' if lote_com_erro else 'info',
+                f'Lote {lote_idx + 1}/{total_lotes}: ' + (', '.join(partes_lote) if partes_lote else 'nada a fazer') + '.'
+            )
+
+            set_background_job(job_id, {
+                **get_background_job(job_id),
+                'lote_atual': lote_idx + 1,
+                'total_lotes': total_lotes,
+                'registros_inseridos': registros_inseridos,
+                'registros_atualizados': registros_atualizados,
+                'registros_ja_existem': registros_ja_existem,
+                'registros_deletados': registros_deletados,
+                'registros_com_erro': registros_com_erro,
+                'mensagem': f'Lote {lote_idx + 1}/{total_lotes}...',
+            })
+
+        # 6. Staging é recriada do zero a cada execução — remove ao final
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS {staging}')
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        # 7. Novo MAX(campo_id) do destino
+        max_after = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
+        novo_ultimo_id = int(max_after[0]['ultimo_id']) if max_after and max_after[0]['ultimo_id'] is not None else 0
+
+        # 8. Fecha o resumo da execução (o registro já existe desde o início,
+        #    e o detalhe por chave já foi gravado lote a lote acima).
+        status_execucao = 'erro' if (
+            registros_com_erro > 0
+            and registros_inseridos == 0 and registros_atualizados == 0
+            and registros_ja_existem == 0 and registros_deletados == 0
+        ) else 'concluido'
+        partes_msg = []
+        if registros_inseridos: partes_msg.append(f'{registros_inseridos} inserido(s)')
+        if registros_atualizados: partes_msg.append(f'{registros_atualizados} atualizado(s)')
+        if registros_ja_existem: partes_msg.append(f'{registros_ja_existem} já existente(s)')
+        if registros_deletados: partes_msg.append(f'{registros_deletados} deletado(s)')
+        if registros_com_erro: partes_msg.append(f'{registros_com_erro} com erro')
+        mensagem_execucao = ', '.join(partes_msg) if partes_msg else 'nenhuma alteração'
+
+        atualizar_execucao_agendamento(
+            conn, execucao_id, status_execucao, mensagem_execucao,
+            registros_inseridos, registros_atualizados, registros_ja_existem, registros_deletados,
+            registros_com_erro, novo_ultimo_id
+        )
+
+    except ValueError as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_execucao(job_id, 'erro', f'Execução interrompida: {error}')
+        _fechar_execucao_com_erro(conn, execucao_id, str(error), locals())
+        return
+    except Exception as error:
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
+        _log_execucao(job_id, 'erro', f'Erro fatal na execução: {error}')
+        _fechar_execucao_com_erro(conn, execucao_id, str(error), locals())
+        return
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    try:
+        atualizar_ultima_execucao_agendamento(tabela_id, novo_ultimo_id)
+    except Exception:
+        pass
+
+    _log_execucao(job_id, 'sucesso', f'Execução concluída: {mensagem_execucao}.')
+    set_background_job(job_id, {
+        **get_background_job(job_id),
+        'status': 'concluido',
+        'mensagem': mensagem_execucao,
+        'execucao_id': execucao_id,
+        'ultimo_id_destino': novo_ultimo_id,
+        'tamanho_lote': tamanho_lote,
+        'total_lotes': total_lotes,
+        'lote_atual': total_lotes,
+        'registros_inseridos': registros_inseridos,
+        'registros_atualizados': registros_atualizados,
+        'registros_ja_existem': registros_ja_existem,
+        'registros_deletados': registros_deletados,
+        'registros_com_erro': registros_com_erro,
+        'fim': datetime.now().isoformat(),
+    })
+
+
+@app.route('/api/importacao-automatica/<int:tabela_id>/ciclo', methods=['POST'])
+def api_importacao_automatica_executar_ciclo(tabela_id):
+    """Dispara um ciclo de importação automática em segundo plano e retorna
+    na hora — o progresso é acompanhado via GET .../ciclo/status."""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    tabela_cfg = get_auto_import_tabela(tabela_id)
+    if not tabela_cfg:
+        return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+
+    if tabela_cfg['status'] != 'ativa':
+        return jsonify({'status': 'erro', 'mensagem': 'Esta tabela está parada.'}), 409
+
+    job_id = _generate_job_id('auto_ciclo', tabela_id)
+    job_existente = get_background_job(job_id)
+    if job_existente and job_existente.get('status') in ('iniciando', 'processando'):
+        return jsonify({'status': 'erro', 'mensagem': 'Já existe um ciclo em andamento para esta tabela.'}), 409
+
+    set_background_job(job_id, {
+        'job_id': job_id,
+        'tipo': 'auto_ciclo',
+        'tabela_id': tabela_id,
+        'status': 'iniciando',
+        'mensagem': 'Preparando ciclo...',
+        'total_lotes': 0,
+        'lote_atual': 0,
+        'registros_inseridos': 0,
+        'registros_atualizados': 0,
+        'registros_ja_existem': 0,
+        'registros_com_erro': 0,
+        'log': [],
+        'lotes': [],
+    })
+
+    thread = threading.Thread(
+        target=_background_auto_import_ciclo_worker,
+        args=(job_id, tabela_id),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({'status': 'sucesso', 'job_id': job_id})
+
+
+@app.route('/api/importacao-automatica/<int:tabela_id>/ciclo/status')
+def api_importacao_automatica_ciclo_status(tabela_id):
+    """Status do ciclo em segundo plano desta tabela (polling do progresso)."""
+    job_id = _generate_job_id('auto_ciclo', tabela_id)
+    job = get_background_job(job_id)
+    if not job:
+        return jsonify({'status': 'inativo'})
+    return jsonify(job)
+
+
+@app.route('/agendar-importacao', methods=['GET', 'POST'])
+def agendar_importacao():
+    """Lista as tabelas configuradas para importação completa agendada
+    (insert/update/delete, até 4 horários por dia) e permite cadastrar/editar."""
+    if not is_db_configured():
+        flash('Configure o banco antes de acessar o Agendar Importação.', 'warning')
+        return redirect(url_for('configurar_banco'))
+
+    if request.method == 'POST':
+        tabela_id_raw = (request.form.get('tabela_id') or '').strip()
+        tabela_origem_raw = request.form.get('tabela_origem')
+        tabela_destino_raw = request.form.get('tabela_destino')
+        campo_id = (request.form.get('campo_id') or '').strip()
+        horarios = [
+            (request.form.get('horario_1') or '').strip() or None,
+            (request.form.get('horario_2') or '').strip() or None,
+            (request.form.get('horario_3') or '').strip() or None,
+            (request.form.get('horario_4') or '').strip() or None,
+        ]
+
+        try:
+            tamanho_lote = int(request.form.get('tamanho_lote') or DEFAULT_TAMANHO_LOTE)
+        except (TypeError, ValueError):
+            flash('Tamanho do lote deve ser um número inteiro.', 'error')
+            return redirect(url_for('agendar_importacao'))
+
+        if tamanho_lote <= 0:
+            flash('O tamanho do lote deve ser maior que zero.', 'error')
+            return redirect(url_for('agendar_importacao'))
+        tamanho_lote = min(tamanho_lote, MAX_TAMANHO_LOTE)
+
+        if not any(horarios):
+            flash('Informe pelo menos um horário de execução.', 'error')
+            return redirect(url_for('agendar_importacao'))
+
+        try:
+            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
+            if not campo_id:
+                raise ValueError('Informe o campo chave (campo_id).')
+
+            tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
+
+            if tabela_id_raw.isdigit():
+                tabela_id = int(tabela_id_raw)
+                if not get_agendamento_tabela(tabela_id):
+                    raise ValueError('Tabela não encontrada para edição.')
+                atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios)
+                flash(f'Tabela "{tabela_destino}" atualizada.', 'success')
+            else:
+                criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios)
+                flash(f'Tabela "{tabela_destino}" adicionada ao Agendar Importação.', 'success')
+
+            if tabela_criada_agora:
+                flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
+        except (ValueError, OperationalError, InterfaceError) as error:
+            flash(str(error), 'error')
+
+        return redirect(url_for('agendar_importacao'))
+
+    tabela_edicao = None
+    editar_id = request.args.get('editar')
+    if editar_id and editar_id.isdigit():
+        tabela_edicao = get_agendamento_tabela(int(editar_id))
+        if not tabela_edicao:
+            flash('Tabela não encontrada para edição.', 'error')
+
+    try:
+        tabelas = get_agendamento_tabelas()
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao carregar tabelas configuradas: {str(e)}', 'error')
+        tabelas = []
+
+    try:
+        migracoes_disponiveis = listar_migracoes_para_selecao()
+    except Exception:
+        migracoes_disponiveis = []
+
+    return render_template(
+        'agendar_importacao.html',
+        examples=AUTO_IMPORT_EXAMPLES,
+        tabelas=tabelas,
+        tabela_edicao=tabela_edicao,
+        migracoes_disponiveis=migracoes_disponiveis
+    )
+
+
+@app.route('/agendar-importacao/<int:tabela_id>/iniciar', methods=['POST'])
+def agendamento_iniciar(tabela_id):
+    """Liga os horários desta tabela (o navegador passa a disparar nos horários configurados)."""
+    try:
+        if not get_agendamento_tabela(tabela_id):
+            return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+        atualizar_status_agendamento_tabela(tabela_id, 'ativa')
+        return jsonify({'status': 'sucesso'})
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+
+@app.route('/agendar-importacao/<int:tabela_id>/parar', methods=['POST'])
+def agendamento_parar(tabela_id):
+    """Desliga os horários e sinaliza cancelamento de uma execução em andamento (se houver)."""
+    try:
+        if not get_agendamento_tabela(tabela_id):
+            return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+        atualizar_status_agendamento_tabela(tabela_id, 'parada')
+
+        job_id = _generate_job_id('agendamento', tabela_id)
+        job = get_background_job(job_id)
+        if job and job.get('status') in ('iniciando', 'processando'):
+            set_background_job(job_id, {**job, 'cancelar': True})
+
+        return jsonify({'status': 'sucesso'})
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+
+@app.route('/agendar-importacao/<int:tabela_id>/excluir', methods=['POST'])
+def agendamento_excluir(tabela_id):
+    """Remove a tabela do Agendar Importação (e todo o histórico de execuções dela)."""
+    try:
+        if not get_agendamento_tabela(tabela_id):
+            flash('Tabela não encontrada.', 'error')
+            return redirect(url_for('agendar_importacao'))
+        excluir_agendamento_tabela(tabela_id)
+        flash('Tabela removida do Agendar Importação.', 'success')
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except Exception as e:
+        flash(f'Erro ao excluir: {str(e)}', 'error')
+    return redirect(url_for('agendar_importacao'))
+
+
+@app.route('/agendar-importacao/<int:tabela_id>/execucoes')
+def agendamento_execucoes(tabela_id):
+    """Tela 'Verificar' — histórico de execuções já rodadas para uma tabela."""
+    tabela = get_agendamento_tabela(tabela_id)
+    if not tabela:
+        flash('Tabela não encontrada.', 'error')
+        return redirect(url_for('agendar_importacao'))
+
+    try:
+        execucoes = execute_query(
+            "SELECT * FROM agendamento_importacao_execucoes WHERE tabela_id = %s ORDER BY executado_em DESC",
+            (tabela_id,)
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+
+    return render_template('agendar_importacao_execucoes.html', tabela=tabela, execucoes=execucoes)
+
+
+@app.route('/agendar-importacao/execucao/<int:execucao_id>/registros')
+def agendamento_execucao_registros(execucao_id):
+    """Detalhe de uma execução — grid de registros processados, igual à migração."""
+    execucao_rows = execute_query(
+        "SELECT * FROM agendamento_importacao_execucoes WHERE id = %s", (execucao_id,)
+    )
+    if not execucao_rows:
+        flash('Execução não encontrada.', 'error')
+        return redirect(url_for('agendar_importacao'))
+    execucao = execucao_rows[0]
+
+    tabela = get_agendamento_tabela(execucao['tabela_id'])
+
+    try:
+        registros = execute_query(
+            "SELECT chave_valor, status, erro_msg FROM agendamento_importacao_execucao_registros "
+            "WHERE execucao_id = %s ORDER BY id",
+            (execucao_id,)
+        )
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+
+    return render_template(
+        'agendar_importacao_execucao_registros.html',
+        execucao=execucao, tabela=tabela, registros=registros
+    )
+
+
+@app.route('/api/agendar-importacao/<int:tabela_id>/executar', methods=['POST'])
+def api_agendamento_executar(tabela_id):
+    """Dispara uma execução completa em segundo plano e retorna na hora —
+    o progresso é acompanhado via GET .../executar/status."""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    tabela_cfg = get_agendamento_tabela(tabela_id)
+    if not tabela_cfg:
+        return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+
+    job_id = _generate_job_id('agendamento', tabela_id)
+    job_existente = get_background_job(job_id)
+    if job_existente and job_existente.get('status') in ('iniciando', 'processando'):
+        return jsonify({'status': 'erro', 'mensagem': 'Já existe uma execução em andamento para esta tabela.'}), 409
+
+    set_background_job(job_id, {
+        'job_id': job_id,
+        'tipo': 'agendamento',
+        'tabela_id': tabela_id,
+        'status': 'iniciando',
+        'mensagem': 'Preparando execução...',
+        'total_lotes': 0,
+        'lote_atual': 0,
+        'registros_inseridos': 0,
+        'registros_atualizados': 0,
+        'registros_ja_existem': 0,
+        'registros_deletados': 0,
+        'registros_com_erro': 0,
+        'log': [],
+        'lotes': [],
+    })
+
+    thread = threading.Thread(
+        target=_background_agendamento_worker,
+        args=(job_id, tabela_id),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({'status': 'sucesso', 'job_id': job_id})
+
+
+@app.route('/api/agendar-importacao/<int:tabela_id>/executar/status')
+def api_agendamento_executar_status(tabela_id):
+    """Status da execução em segundo plano desta tabela (polling do progresso)."""
+    job_id = _generate_job_id('agendamento', tabela_id)
+    job = get_background_job(job_id)
+    if not job:
+        return jsonify({'status': 'inativo'})
+    return jsonify(job)
+
+
+@app.route('/api/progresso/<int:id>')
+def api_progresso(id):
+    """API para verificar progresso em tempo real"""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    try:
+        result = execute_query(
+            "SELECT * FROM public.verificar_progresso(%s)",
+            (id,)
+        )[0]
+        return jsonify(result)
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+@app.route('/api/processar-automatico', methods=['POST'])
+def api_processar_automatico():
+    """API para processar múltiplos lotes automaticamente com delay"""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    data = request.json
+    migracao_id = data.get('migracao_id')
+    lote_inicial = data.get('lote_inicial', 1)
+    quantidade_lotes = data.get('quantidade_lotes', 1)
+    try:
+        migracao = execute_query(
+            "SELECT total_registros, registros_processados, tamanho_lote FROM controle_migracao WHERE id = %s",
+            (migracao_id,)
+        )[0]
+    except IndexError:
+        return jsonify({'status': 'erro', 'mensagem': 'Migração não encontrada.'}), 404
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+
+    total_lotes = (migracao['total_registros'] + migracao['tamanho_lote'] - 1) // migracao['tamanho_lote']
+    lote_atual = migracao['registros_processados'] // migracao['tamanho_lote']
+    lotes_restantes = max(0, total_lotes - lote_atual)
+
+    if quantidade_lotes > lotes_restantes:
+        return jsonify({
+            'status': 'erro',
+            'mensagem': f'A quantidade solicitada ({quantidade_lotes}) excede os lotes restantes ({lotes_restantes}).',
+            'lotes_restantes': lotes_restantes,
+            'total_lotes': total_lotes
+        }), 400
+    
+    resultados = []
+    lotes_com_erro_encoding = []
+
+    def processar_todos_lotes(conn):
+        resultados.clear()
+        lotes_com_erro_encoding.clear()
+        for i in range(quantidade_lotes):
+            numero_lote = lote_inicial + i
+            result = run_query_with_connection(
+                conn,
+                "SELECT * FROM public.processar_lote(%s, %s)",
+                (migracao_id, numero_lote)
+            )[0]
+
+            result['lote'] = numero_lote
+
+            try:
+                progresso = run_query_with_connection(
+                    conn,
+                    "SELECT * FROM public.verificar_progresso(%s)",
+                    (migracao_id,)
+                )[0]
+                result['progresso'] = dict(progresso)
+            except Exception:
+                pass
+
+            conn.commit()
+            resultados.append(result)
+
+            if result.get('status') == 'erro':
+                if _is_encoding_error(result.get('mensagem') or ''):
+                    lotes_com_erro_encoding.append(numero_lote)
+                    continue
+                break
+
+        return resultados
+
+    try:
+        execute_db_operation(processar_todos_lotes)
+    except (OperationalError, InterfaceError) as error:
+        if resultados:
+            return jsonify({
+                'resultados': resultados,
+                'total_processado': len(resultados),
+                'erro_conexao': str(error),
+                'lotes_encoding': lotes_com_erro_encoding
+            })
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        if resultados:
+            return jsonify({
+                'resultados': resultados,
+                'total_processado': len(resultados),
+                'erro': str(e),
+                'lotes_encoding': lotes_com_erro_encoding
+            })
+        return jsonify({
+            'status': 'erro',
+            'mensagem': str(e),
+        }), 500
+
+    return jsonify({
+        'resultados': resultados,
+        'total_processado': len(resultados),
+        'lotes_encoding': lotes_com_erro_encoding
+    })
+
+@app.route('/api/dashboard/stats')
+def api_dashboard_stats():
+    """Retorna estatísticas atualizadas das migrações para polling do dashboard."""
+    try:
+        todas_auto_tabelas = get_auto_import_tabelas()
+    except Exception:
+        todas_auto_tabelas = []
+    resumo_auto = {
+        'configuradas': len(todas_auto_tabelas),
+        'ativas': sum(1 for t in todas_auto_tabelas if t.get('status') == 'ativa'),
+    }
+
+    try:
+        todas_agendamento_tabelas = get_agendamento_tabelas()
+    except Exception:
+        todas_agendamento_tabelas = []
+    resumo_agendamento = {
+        'configuradas': len(todas_agendamento_tabelas),
+        'ativas': sum(1 for t in todas_agendamento_tabelas if t.get('status') == 'ativa'),
+    }
+
+    manual_em_execucao = contar_migracoes_manuais_em_execucao()
+
+    if not is_db_configured():
+        return jsonify({
+            'migracoes': [], 'totais': {},
+            'resumo_auto': resumo_auto, 'resumo_agendamento': resumo_agendamento,
+            'manual_em_execucao': manual_em_execucao
+        })
+    try:
+        def _fetch_stats(conn):
+            query = run_query_with_connection
+            migracoes = query(conn, """
+                SELECT id, tabela_origem, tabela_destino, campo_id,
+                       total_registros, registros_processados, id_maximo, status
+                FROM controle_migracao ORDER BY created_at DESC
+            """)
+
+            for m in migracoes:
+                # Último ID no destino
+                try:
+                    r = query(conn,
+                        f"SELECT MAX({m['campo_id']}) as ultimo_id FROM {m['tabela_destino']}")
+                    m['ultimo_id_destino'] = r[0].get('ultimo_id') or 0 if r else 0
+                except Exception:
+                    m['ultimo_id_destino'] = 0
+
+                # Último ID na origem (view) para progresso real
+                try:
+                    r = query(conn,
+                        f"SELECT MAX({m['campo_id']}) as ultimo_id FROM {m['tabela_origem']}")
+                    m['ultimo_id_origem'] = r[0].get('ultimo_id') or 0 if r else 0
+                except Exception:
+                    m['ultimo_id_origem'] = m.get('id_maximo') or 0
+
+            return migracoes
+
+        migracoes = execute_db_operation(_fetch_stats, statement_timeout_ms=120000)
+
+        totais = {
+            'total_registros': sum(m.get('total_registros', 0) or 0 for m in migracoes),
+            'registros_processados': sum(m.get('registros_processados', 0) or 0 for m in migracoes),
+            'em_processamento': sum(1 for m in migracoes if m.get('status') == 'processando'),
+            'concluidas': sum(1 for m in migracoes if m.get('status') == 'concluido'),
+            'com_erro': sum(1 for m in migracoes if m.get('status') == 'erro'),
+            'pendentes': sum(1 for m in migracoes if m.get('status') in ('pendente', 'preparando')),
+        }
+        return jsonify({
+            'migracoes': migracoes, 'totais': totais,
+            'resumo_auto': resumo_auto, 'resumo_agendamento': resumo_agendamento,
+            'manual_em_execucao': manual_em_execucao
+        })
+    except Exception as e:
+        return jsonify({
+            'migracoes': [], 'totais': {}, 'erro': str(e),
+            'resumo_auto': resumo_auto, 'resumo_agendamento': resumo_agendamento,
+            'manual_em_execucao': manual_em_execucao
+        })
+
+@app.route('/api/background/iniciar', methods=['POST'])
+def api_background_iniciar():
+    """Inicia o processamento de registros por faixa de IDs em segundo plano.
+
+    A faixa é dividida em lotes (tamanho_lote). Cada lote é copiado para uma
+    tabela em `temp` (staging) e só então processado em bloco contra o
+    schema public. Ver _background_migracao_worker / processar_lote_bulk.
+    """
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    data = request.json or {}
+    migracao_id = data.get('migracao_id')
+    id_inicio = data.get('id_inicio')
+    id_fim = data.get('id_fim')
+    delay_segundos = data.get('delay_segundos', 1)
+    apenas_erros = data.get('apenas_erros', False)
+
+    # Tamanho do lote enviado pelo front; valida e trava dentro de um limite seguro
+    try:
+        tamanho_lote = int(data.get('tamanho_lote') or DEFAULT_TAMANHO_LOTE)
+    except (TypeError, ValueError):
+        return jsonify({'status': 'erro', 'mensagem': 'Tamanho do lote deve ser um número inteiro.'}), 400
+
+    if tamanho_lote <= 0:
+        return jsonify({'status': 'erro', 'mensagem': 'O tamanho do lote deve ser maior que zero.'}), 400
+    tamanho_lote = min(tamanho_lote, MAX_TAMANHO_LOTE)  # evita staging gigante
+
+    if not migracao_id:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe o ID da migração.'}), 400
+
+    if not apenas_erros:
+        if not id_inicio or not id_fim:
+            return jsonify({'status': 'erro', 'mensagem': 'Informe o ID inicial e o ID final.'}), 400
+
+        try:
+            id_inicio = int(id_inicio)
+            id_fim = int(id_fim)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'erro', 'mensagem': 'IDs devem ser números inteiros.'}), 400
+
+        if id_inicio < 1:
+            return jsonify({'status': 'erro', 'mensagem': 'O ID inicial deve ser maior que zero.'}), 400
+
+        if id_fim < id_inicio:
+            return jsonify({'status': 'erro', 'mensagem': 'O ID final deve ser maior ou igual ao ID inicial.'}), 400
+
+        total_faixa = id_fim - id_inicio + 1
+
+        # Validar contra id_maximo
+        try:
+            migracao = execute_query(
+                "SELECT id_maximo FROM controle_migracao WHERE id = %s",
+                (migracao_id,)
+            )[0]
+            id_maximo = migracao.get('id_maximo', 0) or 0
+            if id_maximo > 0 and id_fim > id_maximo:
+                return jsonify({'status': 'erro', 'mensagem': f'O ID final ({id_fim}) excede o ID máximo da origem ({id_maximo}).'}), 400
+        except Exception:
+            pass
+    else:
+        id_inicio = 0
+        id_fim = 0
+
+    job_id = _generate_job_id('migracao', migracao_id)
+    existing = get_background_job(job_id)
+    if existing and existing.get('status') == 'processando':
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Já existe um processamento em segundo plano para esta migração.',
+            'job_id': job_id,
+        }), 409
+
+    set_background_job(job_id, {
+        'job_id': job_id,
+        'tipo': 'migracao',
+        'migracao_id': migracao_id,
+        'status': 'iniciando',
+        'id_inicio': id_inicio,
+        'id_fim': id_fim,
+        'total_faixa': id_fim - id_inicio + 1 if not apenas_erros else 0,
+        'ids_verificados': 0,
+        'delay_segundos': delay_segundos,
+        'tamanho_lote': tamanho_lote,
+        'registros_inseridos': 0,
+        'registros_ja_existem': 0,
+        'registros_atualizados': 0,
+        'registros_nao_encontrados': 0,
+        'registros_com_erro': [],
+        'registro_atual': None,
+        'ultimo_progresso': None,
+        'cancelar': False,
+        'apenas_erros': apenas_erros,
+        # Mensagem inicial já cita o processamento em lote
+        'mensagem': f'Preparando processamento em lotes de {tamanho_lote}...',
+    })
+
+    thread = threading.Thread(
+        target=_background_migracao_worker,
+        args=(job_id, migracao_id, id_inicio, id_fim, delay_segundos, apenas_erros, tamanho_lote),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({
+        'status': 'sucesso',
+        'mensagem': 'Processamento em segundo plano iniciado.',
+        'job_id': job_id,
+    })
+
+
+@app.route('/api/background/parar', methods=['POST'])
+def api_background_parar():
+    """Solicita a parada do processamento em segundo plano."""
+    data = request.json or {}
+    migracao_id = data.get('migracao_id')
+
+    if not migracao_id:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe o ID da migração.'}), 400
+
+    job_id = _generate_job_id('migracao', migracao_id)
+    job = get_background_job(job_id)
+
+    if not job:
+        return jsonify({'status': 'erro', 'mensagem': 'Nenhum processamento em segundo plano encontrado.'}), 404
+
+    if job.get('status') not in ('processando', 'iniciando'):
+        return jsonify({
+            'status': 'info',
+            'mensagem': f'O processamento já está no estado: {job.get("status")}.',
+            'job': job,
+        })
+
+    set_background_job(job_id, {**job, 'cancelar': True})
+
+    return jsonify({
+        'status': 'sucesso',
+        'mensagem': 'Solicitação de parada enviada. O lote atual será concluído antes de parar.',
+    })
+
+
+@app.route('/api/background/status')
+def api_background_status():
+    """Retorna o estado do processamento em segundo plano."""
+    migracao_id = request.args.get('migracao_id', type=int)
+    job_type = request.args.get('tipo', 'migracao')
+
+    if not migracao_id:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe o ID da migração.'}), 400
+
+    job_id = _generate_job_id(job_type, migracao_id)
+    job = get_background_job(job_id)
+
+    if not job:
+        return jsonify({'status': 'inativo', 'mensagem': 'Nenhum processamento em segundo plano encontrado.'})
+
+    return jsonify(job)
+
+
+@app.route('/api/background/todos')
+def api_background_todos():
+    """Retorna os jobs de segundo plano, separados em migrações, importação
+    automática e agendar importação — cada um já com o nome da tabela sendo processada."""
+    with background_jobs_lock:
+        jobs = list(background_jobs.values())
+
+    jobs_migracao = []
+    jobs_auto = []
+    jobs_agendamento = []
+
+    for job in jobs:
+        tipo = job.get('tipo')
+        job_enriquecido = dict(job)
+
+        if tipo in ('migracao', 'refresh'):
+            try:
+                migracao_id = job.get('migracao_id')
+                rows = execute_query(
+                    "SELECT tabela_origem, tabela_destino FROM controle_migracao WHERE id = %s",
+                    (migracao_id,)
+                ) if migracao_id else []
+                if rows:
+                    job_enriquecido['tabela_origem'] = rows[0]['tabela_origem']
+                    job_enriquecido['tabela_destino'] = rows[0]['tabela_destino']
+            except Exception:
+                pass
+            jobs_migracao.append(job_enriquecido)
+
+        elif tipo == 'auto_ciclo':
+            try:
+                tabela_id = job.get('tabela_id')
+                tabela = get_auto_import_tabela(tabela_id) if tabela_id else None
+                if tabela:
+                    job_enriquecido['tabela_origem'] = tabela['tabela_origem']
+                    job_enriquecido['tabela_destino'] = tabela['tabela_destino']
+            except Exception:
+                pass
+            jobs_auto.append(job_enriquecido)
+
+        elif tipo == 'agendamento':
+            try:
+                tabela_id = job.get('tabela_id')
+                tabela = get_agendamento_tabela(tabela_id) if tabela_id else None
+                if tabela:
+                    job_enriquecido['tabela_origem'] = tabela['tabela_origem']
+                    job_enriquecido['tabela_destino'] = tabela['tabela_destino']
+            except Exception:
+                pass
+            jobs_agendamento.append(job_enriquecido)
+
+    return jsonify({
+        'jobs_migracao': jobs_migracao,
+        'jobs_auto_importacao': jobs_auto,
+        'jobs_agendamento': jobs_agendamento,
+    })
+
+
+@app.route('/api/background/limpar', methods=['POST'])
+def api_background_limpar():
+    """Remove o registro de um job já finalizado."""
+    data = request.json or {}
+    migracao_id = data.get('migracao_id')
+    job_type = data.get('tipo', 'migracao')
+
+    if not migracao_id:
+        return jsonify({'status': 'erro', 'mensagem': 'Informe o ID da migração.'}), 400
+
+    job_id = _generate_job_id(job_type, migracao_id)
+    job = get_background_job(job_id)
+
+    if job and job.get('status') == 'processando':
+        return jsonify({'status': 'erro', 'mensagem': 'Não é possível limpar um job em andamento.'}), 409
+
+    remove_background_job(job_id)
+    return jsonify({'status': 'sucesso', 'mensagem': 'Job removido.'})
+
+
+@app.route('/api/cancelar-migracao/<int:id>', methods=['POST'])
+def api_cancelar_migracao(id):
+    """Cancela uma migração em andamento"""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    try:
+        execute_query(
+            "UPDATE controle_migracao SET status = 'cancelado' WHERE id = %s",
+            (id,),
+            fetch=False
+        )
+        return jsonify({'status': 'sucesso', 'mensagem': 'Migração cancelada'})
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error, api=True)
+    except Exception as e:
+        return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5310)

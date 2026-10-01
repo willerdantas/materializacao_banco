@@ -1,0 +1,780 @@
+<!-- templates/dashboard.html -->
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Sistema de Migração{% endblock %}
+
+{% block content %}
+<!-- KPI Cards -->
+{% set ra = resumo_auto or {} %}
+{% set rg = resumo_agendamento or {} %}
+<div class="kpi-grid">
+    <div class="kpi-card primary">
+        <div class="kpi-label">Migrações Manuais</div>
+        <div class="kpi-value" id="kpi-total-migracoes">{{ migracoes|length }}</div>
+        <div class="kpi-sublabel" id="kpi-sublabel-migracoes">
+            {{ migracoes|length }} configurada{{ 's' if migracoes|length != 1 }} ·
+            {{ manual_em_execucao or 0 }} em execução
+        </div>
+    </div>
+    <div class="kpi-card secondary">
+        <div class="kpi-label">Importações Automáticas</div>
+        <div class="kpi-value" id="kpi-auto-configuradas">{{ ra.get('configuradas', 0) }}</div>
+        <div class="kpi-sublabel" id="kpi-sublabel-auto">
+            {{ ra.get('configuradas', 0) }} configurada{{ 's' if ra.get('configuradas', 0) != 1 }} ·
+            {{ ra.get('ativas', 0) }} em execução
+        </div>
+    </div>
+    <div class="kpi-card accent">
+        <div class="kpi-label">Importações Agendadas</div>
+        <div class="kpi-value" id="kpi-agendamento-configuradas">{{ rg.get('configuradas', 0) }}</div>
+        <div class="kpi-sublabel" id="kpi-sublabel-agendamento">
+            {{ rg.get('configuradas', 0) }} configurada{{ 's' if rg.get('configuradas', 0) != 1 }} ·
+            {{ rg.get('ativas', 0) }} em execução
+        </div>
+    </div>
+</div>
+
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Lista de Migrações Manuais</h2>
+            <p class="card-subtitle">Gerencie suas importações de dados</p>
+        </div>
+        <div class="btn-group">
+            <button type="button" id="btn-refresh-dashboard" class="btn btn-outline">🔄 Atualizar</button>
+            <a href="{{ url_for('nova_migracao') }}" class="btn btn-primary">
+                <span>+</span>
+                <span>Nova Migração</span>
+            </a>
+        </div>
+    </div>
+    
+    {% if migracoes %}
+    <div class="table-container table-container-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Tabela Origem</th>
+                    <th>Tabela Destino</th>
+                    <th style="text-align: right;">Total</th>
+                    <th style="text-align: right;">Último ID</th>
+                    <th>Progresso</th>
+                    <th>Status</th>
+                    <th style="text-align: center;">Ações</th>
+                </tr>
+            </thead>
+            <tbody id="migracoes-tbody">
+                {% for m in migracoes %}
+                <tr data-migracao-id="{{ m.id }}">
+                    <td><strong>#{{ m.id }}</strong></td>
+                    <td>{{ m.tabela_origem }}</td>
+                    <td>{{ m.tabela_destino }}</td>
+                    <td class="col-total" style="text-align: right;">{{ "{:,}".format(m.total_registros).replace(",", ".") }}</td>
+                    <td class="col-processados" style="text-align: right;">{{ "{:,}".format(m.ultimo_id_destino or 0).replace(",", ".") }}</td>
+                    <td style="width: 220px;">
+                        {% set id_dest = m.ultimo_id_destino or 0 %}
+                        {% set id_orig = m.ultimo_id_origem or m.id_maximo or 0 %}
+                        {% set percentual_raw = (id_dest / id_orig * 100) if id_orig > 0 else 0 %}
+                        {% set percentual = 100.0 if id_dest >= id_orig and id_orig > 0 else ([percentual_raw, 99.99] | min) %}
+                        <div class="progress-container" style="height: 18px; margin: 0; border-radius: 9px;">
+                            <div class="progress-bar row-progress" data-progress="{{ percentual }}" style="border-radius: 9px; font-size: 0.7rem; padding-right: 8px; justify-content: center;">
+                                {{ "%.2f"|format(percentual) }}%
+                            </div>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin-top: 4px;">
+                            <small class="col-resumo" style="color: var(--color-gray); font-size: 0.7rem;">Último ID: {{ "{:,}".format(id_dest).replace(",", ".") }} / {{ "{:,}".format(id_orig).replace(",", ".") }} (faltam {{ "{:,}".format(id_orig - id_dest).replace(",", ".") }})</small>
+                        </div>
+                    </td>
+                    <td>
+                        <span class="status status-{{ m.status }} col-status">{{ m.status }}</span>
+                    </td>
+                    <td style="text-align: center;">
+                        <div class="actions" style="justify-content: center;">
+                            <a href="{{ url_for('controle_migracao', id=m.id) }}" class="btn btn-primary btn-sm">
+                                Gerenciar
+                            </a>
+                            <a href="{{ url_for('nova_migracao', editar=m.id) }}" class="btn btn-secondary btn-sm">
+                                Editar
+                            </a>
+                            <form method="POST" action="{{ url_for('excluir_migracao', id=m.id) }}" onsubmit="return confirm('Excluir a migração #{{ m.id }}?');">
+                                <button type="submit" class="btn btn-danger btn-sm">Excluir</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">📋</div>
+        <h3>Nenhuma migração encontrada</h3>
+        <p>Clique em "Nova Migração" para começar a importar seus dados do sistema integrado.</p>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Barra de acompanhamento de migrações em segundo plano -->
+<div id="background-jobs-panel-migracao" class="card animate-fade-in" style="display: none; margin-top: 24px; border-left: 4px solid var(--color-primary);">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">⚙️ Migrações em Segundo Plano</h2>
+            <p class="card-subtitle">Continuam rodando mesmo quando você muda de tela.</p>
+        </div>
+        <span id="bg-jobs-count-migracao" class="status status-processando"></span>
+    </div>
+    <div id="background-jobs-list-migracao"></div>
+</div>
+
+<!-- Barra de acompanhamento de importação automática em segundo plano -->
+<div id="background-jobs-panel-auto" class="card animate-fade-in" style="display: none; margin-top: 24px; border-left: 4px solid var(--color-accent);">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">⟳ Importação Automática em Segundo Plano</h2>
+            <p class="card-subtitle">Ciclos rodando agora, um por tabela configurada.</p>
+        </div>
+        <span id="bg-jobs-count-auto" class="status status-processando"></span>
+    </div>
+    <div id="background-jobs-list-auto"></div>
+</div>
+
+<!-- Barra de acompanhamento do Agendar Importação em segundo plano -->
+<div id="background-jobs-panel-agendamento" class="card animate-fade-in" style="display: none; margin-top: 24px; border-left: 4px solid #6B21A8;">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">🕓 Agendar Importação em Segundo Plano</h2>
+            <p class="card-subtitle">Execuções completas (insert/update/delete) rodando agora.</p>
+        </div>
+        <span id="bg-jobs-count-agendamento" class="status status-processando"></span>
+    </div>
+    <div id="background-jobs-list-agendamento"></div>
+</div>
+
+<!-- Tabelas ativas da importação automática — o dashboard usa isso pra
+     agendar os ciclos, igual a tela de Importação Automática já faz. -->
+<script type="application/json" id="tabelas-auto-ativas-json">{{ tabelas_auto_ativas|tojson }}</script>
+
+<!-- Tabelas ativas do Agendar Importação — mesma lógica, pelos horários configurados. -->
+<script type="application/json" id="tabelas-agendamento-ativas-json">{{ tabelas_agendamento_ativas|tojson }}</script>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.progress-bar[data-progress]').forEach(function (element) {
+        const progressValue = Number(element.dataset.progress || 0);
+        const normalizedValue = Math.max(0, Math.min(100, progressValue));
+        element.style.width = normalizedValue + '%';
+    });
+});
+
+function fmt(n) {
+    return (n || 0).toLocaleString('pt-BR');
+}
+
+// Cache compartilhado: última leitura de /api/dashboard/stats, por ID de migração.
+// Usado pela barra de segundo plano para saber o "último ID no banco" de cada migração.
+let latestMigracoesById = {};
+
+// ============================================================
+// Polling de KPIs e tabela de migrações
+// ============================================================
+(function() {
+    function updateProgressBar(bar, pct) {
+        bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+        bar.dataset.progress = pct;
+    }
+
+    async function pollDashboardStats() {
+        try {
+            const resp = await fetch('/api/dashboard/stats');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const t = data.totais || {};
+            const migracoes = data.migracoes || [];
+
+            // Atualiza o cache usado pela barra de segundo plano
+            const novoCache = {};
+            migracoes.forEach(m => { novoCache[m.id] = m; });
+            latestMigracoesById = novoCache;
+
+            const resumoAuto = data.resumo_auto || {};
+            const resumoAgendamento = data.resumo_agendamento || {};
+            const manualEmExecucao = data.manual_em_execucao || 0;
+
+            // KPI 1 - Migrações Manuais
+            const kpiTotal = document.getElementById('kpi-total-migracoes');
+            if (kpiTotal) kpiTotal.textContent = migracoes.length;
+
+            const kpiSub = document.getElementById('kpi-sublabel-migracoes');
+            if (kpiSub) {
+                kpiSub.textContent = `${migracoes.length} configurada${migracoes.length !== 1 ? 's' : ''} · ${manualEmExecucao} em execução`;
+            }
+
+            // KPI 2 - Importações Automáticas
+            const kpiAuto = document.getElementById('kpi-auto-configuradas');
+            if (kpiAuto) kpiAuto.textContent = resumoAuto.configuradas || 0;
+
+            const kpiSubAuto = document.getElementById('kpi-sublabel-auto');
+            if (kpiSubAuto) {
+                const configuradas = resumoAuto.configuradas || 0;
+                kpiSubAuto.textContent = `${configuradas} configurada${configuradas !== 1 ? 's' : ''} · ${resumoAuto.ativas || 0} em execução`;
+            }
+
+            // KPI 3 - Importações Agendadas
+            const kpiAgendamento = document.getElementById('kpi-agendamento-configuradas');
+            if (kpiAgendamento) kpiAgendamento.textContent = resumoAgendamento.configuradas || 0;
+
+            const kpiSubAgendamento = document.getElementById('kpi-sublabel-agendamento');
+            if (kpiSubAgendamento) {
+                const configuradas = resumoAgendamento.configuradas || 0;
+                kpiSubAgendamento.textContent = `${configuradas} configurada${configuradas !== 1 ? 's' : ''} · ${resumoAgendamento.ativas || 0} em execução`;
+            }
+
+            // Tabela - atualizar cada linha
+            migracoes.forEach(m => {
+                const row = document.querySelector(`tr[data-migracao-id="${m.id}"]`);
+                if (!row) return;
+
+                const idDest = m.ultimo_id_destino || 0;
+                const idOrig = m.ultimo_id_origem || m.id_maximo || 0;
+                let pct = idOrig > 0 ? (idDest / idOrig * 100) : 0;
+                // Só mostra 100% se realmente completo
+                if (pct > 99.99 && idDest < idOrig) pct = 99.99;
+
+                const colTotal = row.querySelector('.col-total');
+                if (colTotal) colTotal.textContent = fmt(m.total_registros);
+
+                const colProc = row.querySelector('.col-processados');
+                if (colProc) colProc.textContent = fmt(idDest);
+
+                const bar = row.querySelector('.row-progress');
+                if (bar) {
+                    updateProgressBar(bar, pct);
+                    bar.textContent = pct.toFixed(2) + '%';
+                }
+
+                const colResumo = row.querySelector('.col-resumo');
+                if (colResumo) colResumo.textContent = `Último ID: ${fmt(idDest)} / ${fmt(idOrig)} (faltam ${fmt(idOrig - idDest)})`;
+
+                const colStatus = row.querySelector('.col-status');
+                if (colStatus) {
+                    colStatus.className = `status status-${m.status} col-status`;
+                    colStatus.textContent = m.status;
+                }
+            });
+        } catch (_) {}
+    }
+
+    pollDashboardStats();
+    setInterval(pollDashboardStats, 5000);
+
+    // Botão atualizar manual
+    const btnRefresh = document.getElementById('btn-refresh-dashboard');
+    if (btnRefresh) {
+        btnRefresh.addEventListener('click', async () => {
+            btnRefresh.disabled = true;
+            btnRefresh.textContent = '⏳ Atualizando...';
+            await pollDashboardStats();
+            btnRefresh.disabled = false;
+            btnRefresh.textContent = '🔄 Atualizar';
+        });
+    }
+})();
+
+// ============================================================
+// Polling de jobs em segundo plano — migrações e importação
+// automática em painéis separados
+// ============================================================
+(function() {
+    const panelMigracao = document.getElementById('background-jobs-panel-migracao');
+    const listMigracao = document.getElementById('background-jobs-list-migracao');
+    const countMigracao = document.getElementById('bg-jobs-count-migracao');
+
+    const panelAuto = document.getElementById('background-jobs-panel-auto');
+    const listAuto = document.getElementById('background-jobs-list-auto');
+    const countAuto = document.getElementById('bg-jobs-count-auto');
+
+    const panelAgendamento = document.getElementById('background-jobs-panel-agendamento');
+    const listAgendamento = document.getElementById('background-jobs-list-agendamento');
+    const countAgendamento = document.getElementById('bg-jobs-count-agendamento');
+
+    let knownJobs = {};
+
+    function statusLabel(status) {
+        const map = {
+            'iniciando': '🔄 Iniciando',
+            'processando': '⏳ Processando',
+            'concluido': '✅ Concluído',
+            'erro': '❌ Erro',
+            'cancelado': '⏹️ Cancelado'
+        };
+        return map[status] || status || 'inativo';
+    }
+
+    function statusClass(status) {
+        const map = {
+            'iniciando': 'processando',
+            'processando': 'processando',
+            'concluido': 'concluido',
+            'erro': 'erro',
+            'cancelado': 'cancelado'
+        };
+        return map[status] || 'pendente';
+    }
+
+    // ---------- Migrações ----------
+
+    function calcPercentualPorLote(job) {
+        const total = job.total_faixa || 0;
+        const verificados = job.ids_verificados || 0;
+        if (!total) return 0;
+        return Math.min(100, Math.round((verificados / total) * 1000) / 10);
+    }
+
+    function calcPercentualMigracao(job) {
+        if (job.tipo === 'refresh') {
+            return job.status === 'concluido' ? 100 : 0;
+        }
+        if (job.apenas_erros || !job.id_fim || job.id_fim <= job.id_inicio) {
+            return calcPercentualPorLote(job);
+        }
+        const faixa = job.id_fim - job.id_inicio;
+        if (faixa <= 0) return 0;
+        const idProcessado = parseInt(job.registro_atual, 10);
+        if (!Number.isFinite(idProcessado)) {
+            return calcPercentualPorLote(job);
+        }
+        const avancado = Math.max(0, Math.min(faixa, idProcessado - job.id_inicio));
+        return Math.min(100, Math.round((avancado / faixa) * 1000) / 10);
+    }
+
+    function renderJobMigracao(job) {
+        const pct = calcPercentualMigracao(job);
+        const origem = job.tabela_origem || (job.ultimo_progresso && job.ultimo_progresso.tabela_origem) || '-';
+        const destino = job.tabela_destino || (job.ultimo_progresso && job.ultimo_progresso.tabela_destino) || '-';
+        const registroAtual = job.registro_atual || '-';
+        const erros = (job.registros_com_erro || []).length;
+        const isActive = job.status === 'processando' || job.status === 'iniciando';
+
+        const infoFaixa = (job.id_inicio || job.id_fim)
+            ? `Faixa ID ${fmt(job.id_inicio)} – ${fmt(job.id_fim)}`
+            : 'Reprocessando erros';
+        const infoAtual = (registroAtual !== '-') ? ` &nbsp;|&nbsp; ID processado: ${fmt(registroAtual)}` : '';
+
+        return `
+            <div class="bg-job-item" data-job-id="${job.job_id}" style="padding: 12px 16px; border-bottom: 1px solid var(--border-color);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <strong>${destino}</strong>
+                        <span style="font-size: 0.75rem; color: var(--color-gray);">${origem} → ${destino}</span>
+                        <span class="status status-${statusClass(job.status)}" style="font-size: 0.7rem;">${statusLabel(job.status)}</span>
+                        ${erros > 0 ? `<span style="color: var(--color-orange); font-size: 0.75rem;">⚠ ${erros} registro(s) com erro</span>` : ''}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <button class="btn btn-success btn-sm bg-mig-iniciar" data-migracao-id="${job.migracao_id}" data-id-inicio="${job.id_inicio || ''}" data-id-fim="${job.id_fim || ''}" data-delay="${job.delay_segundos || 1}" data-apenas-erros="${job.apenas_erros ? '1' : ''}" style="padding: 2px 10px; font-size: 0.7rem;" ${isActive ? 'disabled' : ''}>▶️ Iniciar</button>
+                        <button class="btn btn-danger btn-sm bg-mig-parar" data-migracao-id="${job.migracao_id}" style="padding: 2px 10px; font-size: 0.7rem;" ${!isActive ? 'disabled' : ''}>⏹️ Parar</button>
+                        <a href="/migracao/${job.migracao_id}" class="btn btn-outline btn-sm" style="padding: 2px 10px; font-size: 0.7rem;">🔍 Ver</a>
+                    </div>
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-gray); margin-bottom: 6px;">
+                    ${infoFaixa}${infoAtual}
+                </div>
+                <div class="progress-container" style="height: 18px; margin: 0; border-radius: 9px;">
+                    <div class="progress-bar" style="width: ${pct}%; transition: width 0.5s ease; border-radius: 9px; font-size: 0.7rem; justify-content: center;">
+                        ${pct}%
+                    </div>
+                </div>
+                ${job.mensagem && !isActive ? `<div style="font-size: 0.75rem; margin-top: 4px; color: ${job.status === 'erro' ? 'var(--color-red)' : 'var(--color-gray)'};">${job.mensagem}</div>` : ''}
+            </div>
+        `;
+    }
+
+    function updatePanelMigracao(jobs) {
+        if (!jobs || jobs.length === 0) {
+            panelMigracao.style.display = 'none';
+            return;
+        }
+        panelMigracao.style.display = '';
+        const ativos = jobs.filter(j => j.status === 'processando' || j.status === 'iniciando');
+        countMigracao.textContent = ativos.length > 0 ? `${ativos.length} ativa(s)` : 'Finalizado';
+        countMigracao.className = 'status status-' + (ativos.length > 0 ? 'processando' : 'concluido');
+
+        listMigracao.innerHTML = jobs.map(renderJobMigracao).join('');
+
+        listMigracao.querySelectorAll('.bg-mig-parar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                btn.disabled = true;
+                btn.textContent = 'Parando...';
+                try {
+                    await fetch('/api/background/parar', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ migracao_id: parseInt(btn.dataset.migracaoId) })
+                    });
+                } catch (_) {}
+            });
+        });
+
+        listMigracao.querySelectorAll('.bg-mig-iniciar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                if (!btn.dataset.idInicio || !btn.dataset.idFim) return; // sem faixa conhecida, nada a repetir
+                btn.disabled = true;
+                btn.textContent = 'Iniciando...';
+                try {
+                    await fetch('/api/background/iniciar', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            migracao_id: parseInt(btn.dataset.migracaoId),
+                            id_inicio: parseInt(btn.dataset.idInicio),
+                            id_fim: parseInt(btn.dataset.idFim),
+                            delay_segundos: parseInt(btn.dataset.delay) || 1,
+                            apenas_erros: !!btn.dataset.apenasErros
+                        })
+                    });
+                } catch (_) {}
+            });
+        });
+    }
+
+    // ---------- Importação Automática ----------
+
+    function calcPercentualAuto(job) {
+        const total = job.total_lotes || 0;
+        const atual = job.lote_atual || 0;
+        return total > 0 ? Math.round((atual / total) * 1000) / 10 : 0;
+    }
+
+    function renderJobAuto(job) {
+        const pct = calcPercentualAuto(job);
+        const origem = job.tabela_origem || '-';
+        const destino = job.tabela_destino || '-';
+        const isActive = job.status === 'processando' || job.status === 'iniciando';
+        const erros = job.registros_com_erro || 0;
+
+        return `
+            <div class="bg-job-item" data-job-id="${job.job_id}" style="padding: 12px 16px; border-bottom: 1px solid var(--border-color);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <strong>${destino}</strong>
+                        <span style="font-size: 0.75rem; color: var(--color-gray);">${origem} → ${destino}</span>
+                        <span class="status status-${statusClass(job.status)}" style="font-size: 0.7rem;">${statusLabel(job.status)}</span>
+                        ${erros > 0 ? `<span style="color: var(--color-orange); font-size: 0.75rem;">⚠ ${erros} registro(s) com erro</span>` : ''}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <button class="btn btn-success btn-sm bg-auto-iniciar" data-tabela-id="${job.tabela_id}" style="padding: 2px 10px; font-size: 0.7rem;" ${isActive ? 'disabled' : ''}>▶️ Iniciar</button>
+                        <button class="btn btn-danger btn-sm bg-auto-parar" data-tabela-id="${job.tabela_id}" style="padding: 2px 10px; font-size: 0.7rem;" ${!isActive ? 'disabled' : ''}>⏹️ Parar</button>
+                        <a href="/importacao-automatica/${job.tabela_id}/ciclos" class="btn btn-outline btn-sm" style="padding: 2px 10px; font-size: 0.7rem;">🔍 Ver</a>
+                    </div>
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-gray); margin-bottom: 6px;">
+                    ${job.mensagem || ''}
+                </div>
+                <div class="progress-container" style="height: 18px; margin: 0; border-radius: 9px;">
+                    <div class="progress-bar" style="width: ${pct}%; transition: width 0.5s ease; border-radius: 9px; font-size: 0.7rem; justify-content: center;">
+                        ${pct}%
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    function updatePanelAuto(jobs) {
+        if (!jobs || jobs.length === 0) {
+            panelAuto.style.display = 'none';
+            return;
+        }
+        panelAuto.style.display = '';
+        const ativos = jobs.filter(j => j.status === 'processando' || j.status === 'iniciando');
+        countAuto.textContent = ativos.length > 0 ? `${ativos.length} ativa(s)` : 'Finalizado';
+        countAuto.className = 'status status-' + (ativos.length > 0 ? 'processando' : 'concluido');
+
+        listAuto.innerHTML = jobs.map(renderJobAuto).join('');
+
+        listAuto.querySelectorAll('.bg-auto-parar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                btn.disabled = true;
+                btn.textContent = 'Parando...';
+                try {
+                    await fetch(`/importacao-automatica/${btn.dataset.tabelaId}/parar`, { method: 'POST' });
+                } catch (_) {}
+            });
+        });
+
+        listAuto.querySelectorAll('.bg-auto-iniciar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                btn.disabled = true;
+                btn.textContent = 'Iniciando...';
+                try {
+                    await fetch(`/importacao-automatica/${btn.dataset.tabelaId}/iniciar`, { method: 'POST' });
+                    await fetch(`/api/importacao-automatica/${btn.dataset.tabelaId}/ciclo`, { method: 'POST' });
+                } catch (_) {}
+            });
+        });
+    }
+
+    // ---------- Agendar Importação ----------
+
+    function calcPercentualAgendamento(job) {
+        const total = job.total_lotes || 0;
+        const atual = job.lote_atual || 0;
+        return total > 0 ? Math.round((atual / total) * 1000) / 10 : 0;
+    }
+
+    function renderJobAgendamento(job) {
+        const pct = calcPercentualAgendamento(job);
+        const origem = job.tabela_origem || '-';
+        const destino = job.tabela_destino || '-';
+        const isActive = job.status === 'processando' || job.status === 'iniciando';
+        const erros = job.registros_com_erro || 0;
+        const deletados = job.registros_deletados || 0;
+
+        return `
+            <div class="bg-job-item" data-job-id="${job.job_id}" style="padding: 12px 16px; border-bottom: 1px solid var(--border-color);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <strong>${destino}</strong>
+                        <span style="font-size: 0.75rem; color: var(--color-gray);">${origem} → ${destino}</span>
+                        <span class="status status-${statusClass(job.status)}" style="font-size: 0.7rem;">${statusLabel(job.status)}</span>
+                        ${deletados > 0 ? `<span style="color: #6B21A8; font-size: 0.75rem;">🗑 ${deletados} deletado(s)</span>` : ''}
+                        ${erros > 0 ? `<span style="color: var(--color-orange); font-size: 0.75rem;">⚠ ${erros} registro(s) com erro</span>` : ''}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <button class="btn btn-success btn-sm bg-agendamento-iniciar" data-tabela-id="${job.tabela_id}" style="padding: 2px 10px; font-size: 0.7rem;" ${isActive ? 'disabled' : ''}>⚡ Executar</button>
+                        <button class="btn btn-danger btn-sm bg-agendamento-parar" data-tabela-id="${job.tabela_id}" style="padding: 2px 10px; font-size: 0.7rem;" ${!isActive ? 'disabled' : ''}>⏹️ Parar</button>
+                        <a href="/agendar-importacao/${job.tabela_id}/execucoes" class="btn btn-outline btn-sm" style="padding: 2px 10px; font-size: 0.7rem;">🔍 Ver</a>
+                    </div>
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-gray); margin-bottom: 6px;">
+                    ${job.mensagem || ''}
+                </div>
+                <div class="progress-container" style="height: 18px; margin: 0; border-radius: 9px;">
+                    <div class="progress-bar" style="width: ${pct}%; transition: width 0.5s ease; border-radius: 9px; font-size: 0.7rem; justify-content: center; background: #6B21A8;">
+                        ${pct}%
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    function updatePanelAgendamento(jobs) {
+        if (!jobs || jobs.length === 0) {
+            panelAgendamento.style.display = 'none';
+            return;
+        }
+        panelAgendamento.style.display = '';
+        const ativos = jobs.filter(j => j.status === 'processando' || j.status === 'iniciando');
+        countAgendamento.textContent = ativos.length > 0 ? `${ativos.length} ativa(s)` : 'Finalizado';
+        countAgendamento.className = 'status status-' + (ativos.length > 0 ? 'processando' : 'concluido');
+
+        listAgendamento.innerHTML = jobs.map(renderJobAgendamento).join('');
+
+        listAgendamento.querySelectorAll('.bg-agendamento-parar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                btn.disabled = true;
+                btn.textContent = 'Parando...';
+                try {
+                    await fetch(`/agendar-importacao/${btn.dataset.tabelaId}/parar`, { method: 'POST' });
+                } catch (_) {}
+            });
+        });
+
+        listAgendamento.querySelectorAll('.bg-agendamento-iniciar').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                btn.disabled = true;
+                btn.textContent = 'Executando...';
+                try {
+                    await fetch(`/api/agendar-importacao/${btn.dataset.tabelaId}/executar`, { method: 'POST' });
+                } catch (_) {}
+            });
+        });
+    }
+
+    // ---------- Polling geral ----------
+
+    async function pollBackgroundJobs() {
+        try {
+            const resp = await fetch('/api/background/todos');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const jobsMigracao = data.jobs_migracao || [];
+            const jobsAuto = data.jobs_auto_importacao || [];
+            const jobsAgendamento = data.jobs_agendamento || [];
+
+            updatePanelMigracao(jobsMigracao);
+            updatePanelAuto(jobsAuto);
+            updatePanelAgendamento(jobsAgendamento);
+
+            // Limpar jobs de migração concluídos após 30s (importação automática
+            // não usa /api/background/limpar — o job dela expira sozinho no próximo ciclo)
+            jobsMigracao.forEach(job => {
+                if (job.status !== 'processando' && job.status !== 'iniciando') {
+                    if (!knownJobs[job.job_id]) {
+                        knownJobs[job.job_id] = Date.now();
+                    } else if (Date.now() - knownJobs[job.job_id] > 30000) {
+                        fetch('/api/background/limpar', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ migracao_id: job.migracao_id, tipo: job.tipo || 'migracao' })
+                        }).catch(() => {});
+                        delete knownJobs[job.job_id];
+                    }
+                } else {
+                    delete knownJobs[job.job_id];
+                }
+            });
+        } catch (_) {}
+    }
+
+    pollBackgroundJobs();
+    // Poll mais rápido que o das migrações (2s em vez de 4s) — ciclos de
+    // importação automática costumam ser curtos, então um intervalo maior
+    // corria o risco de nunca pegar o job "processando" a tempo.
+    setInterval(pollBackgroundJobs, 2000);
+})();
+
+// ============================================================
+// Agenda os ciclos das tabelas de importação automática ativas — mesma
+// lógica da tela de Importação Automática (dispara na hora + repete no
+// intervalo configurado). Isso existe pra os ciclos acontecerem (e
+// aparecerem em tempo real no painel acima) mesmo que ninguém tenha aquela
+// outra tela aberta em nenhuma aba — sem isso, nada dispara sozinho.
+// ============================================================
+(function() {
+    let tabelasAtivas = [];
+    try {
+        const el = document.getElementById('tabelas-auto-ativas-json');
+        tabelasAtivas = el ? JSON.parse(el.textContent) : [];
+    } catch (_) {
+        tabelasAtivas = [];
+    }
+
+    const emExecucao = {};
+
+    async function executarCicloAgendado(tabela) {
+        if (emExecucao[tabela.id]) return; // ciclo anterior desta tabela ainda rodando
+        emExecucao[tabela.id] = true;
+        try {
+            // Dispara e não espera terminar — o painel "Importação Automática
+            // em Segundo Plano" acima já mostra o progresso via polling.
+            // Se já tiver um ciclo rodando (disparado por outra aba), o
+            // servidor recusa com 409 — inofensivo, só não faz nada.
+            await fetch(`/api/importacao-automatica/${tabela.id}/ciclo`, { method: 'POST' });
+        } catch (_) {
+            // falha isolada de rede — tenta de novo no próximo intervalo
+        } finally {
+            emExecucao[tabela.id] = false;
+        }
+    }
+
+    tabelasAtivas.forEach(tabela => {
+        const intervaloMs = (tabela.intervalo_min || 5) * 60 * 1000;
+        const ultimoCicloMs = tabela.ultimo_ciclo_em ? new Date(tabela.ultimo_ciclo_em).getTime() : null;
+        const decorridoMs = ultimoCicloMs ? (Date.now() - ultimoCicloMs) : null;
+        // Se o último ciclo já rodou há menos tempo que o intervalo configurado,
+        // espera o restante antes do primeiro disparo — evita reiniciar um ciclo
+        // só porque a página foi recarregada ou o dashboard foi reaberto.
+        const atrasoInicialMs = (decorridoMs !== null && decorridoMs < intervaloMs) ? (intervaloMs - decorridoMs) : 0;
+
+        setTimeout(() => {
+            executarCicloAgendado(tabela);
+            setInterval(() => executarCicloAgendado(tabela), intervaloMs);
+        }, atrasoInicialMs);
+    });
+})();
+
+// ============================================================
+// Agenda as execuções do Agendar Importação (sincronização completa,
+// insert/update/delete) nos horários configurados — mesma lógica de
+// tolerância e reset diário da tela própria, pra funcionar mesmo sem
+// aquela aba aberta.
+// ============================================================
+(function() {
+    let tabelasAtivas = [];
+    try {
+        const el = document.getElementById('tabelas-agendamento-ativas-json');
+        tabelasAtivas = el ? JSON.parse(el.textContent) : [];
+    } catch (_) {
+        tabelasAtivas = [];
+    }
+    if (tabelasAtivas.length === 0) return;
+
+    const emExecucao = {};
+    const jaDisparadoHoje = {}; // { 'tabelaId_HH:MM_AAAA-MM-DD': true }
+
+    function dataDeHojeStr() {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    // Mesma tolerância de 5 min da tela de Agendar Importação — evita perder
+    // o disparo por causa de throttle do navegador em aba em segundo plano.
+    function horarioDentroDaJanela(horario) {
+        const agora = new Date();
+        const [h, m] = horario.split(':').map(Number);
+        if (Number.isNaN(h) || Number.isNaN(m)) return false;
+        const alvo = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate(), h, m, 0);
+        const diffMs = agora - alvo;
+        return diffMs >= 0 && diffMs < 5 * 60 * 1000;
+    }
+
+    async function executarAgendamento(tabelaId) {
+        if (emExecucao[tabelaId]) return;
+        emExecucao[tabelaId] = true;
+        try {
+            // Dispara e não espera terminar — o painel "Agendar Importação em
+            // Segundo Plano" acima já mostra o progresso via polling. Se já
+            // tiver uma execução rodando (disparada por outra aba), o
+            // servidor recusa com 409 — inofensivo, só não faz nada.
+            await fetch(`/api/agendar-importacao/${tabelaId}/executar`, { method: 'POST' });
+        } catch (_) {
+            // falha isolada de rede — tenta de novo no próximo check
+        } finally {
+            emExecucao[tabelaId] = false;
+        }
+    }
+
+    function verificarHorariosAgendamento() {
+        const hoje = dataDeHojeStr();
+        tabelasAtivas.forEach(tabela => {
+            const horarios = [tabela.horario_1, tabela.horario_2, tabela.horario_3, tabela.horario_4].filter(Boolean);
+            horarios.forEach(h => {
+                const chave = `${tabela.id}_${h}_${hoje}`;
+                if (horarioDentroDaJanela(h) && !jaDisparadoHoje[chave]) {
+                    jaDisparadoHoje[chave] = true;
+                    executarAgendamento(tabela.id);
+                }
+            });
+        });
+    }
+
+    // Marca como já disparado hoje qualquer horário cuja última execução
+    // registrada no servidor caiu dentro da mesma janela de tolerância —
+    // evita reexecutar ao recarregar a página/reabrir o dashboard.
+    function inicializarJaDisparadoHoje() {
+        tabelasAtivas.forEach(tabela => {
+            if (!tabela.ultima_execucao) return;
+            const executadoEm = new Date(tabela.ultima_execucao);
+            if (Number.isNaN(executadoEm.getTime())) return;
+            const hoje = dataDeHojeStr();
+            const horarios = [tabela.horario_1, tabela.horario_2, tabela.horario_3, tabela.horario_4].filter(Boolean);
+            horarios.forEach(h => {
+                const [hh, mm] = h.split(':').map(Number);
+                if (Number.isNaN(hh) || Number.isNaN(mm)) return;
+                const alvo = new Date(executadoEm.getFullYear(), executadoEm.getMonth(), executadoEm.getDate(), hh, mm, 0);
+                if (Math.abs(executadoEm - alvo) < 5 * 60 * 1000) {
+                    jaDisparadoHoje[`${tabela.id}_${h}_${hoje}`] = true;
+                }
+            });
+        });
+    }
+
+    inicializarJaDisparadoHoje();
+    verificarHorariosAgendamento();
+    setInterval(verificarHorariosAgendamento, 10000);
+})();
+</script>
+{% endblock %}

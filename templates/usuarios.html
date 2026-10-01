@@ -1,0 +1,120 @@
+<!-- templates/usuarios.html -->
+{% extends "base.html" %}
+
+{% block title %}Usuários - Sistema de Migração{% endblock %}
+
+{% block content %}
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Novo Usuário</h2>
+            <p class="card-subtitle">
+                Perfil <strong>usuario</strong>: acessa Dashboard, Nova Migração, Migrações e Importação Automática.
+                Perfil <strong>administrador</strong>: acesso completo, incluindo Configurar Banco e esta tela.
+            </p>
+        </div>
+        {% if usuarios %}
+        <a href="{{ url_for('dashboard') }}" class="btn-back">← Voltar ao Dashboard</a>
+        {% endif %}
+    </div>
+
+    {% if not usuarios %}
+    <div class="alert alert-warning" style="margin-bottom: 16px;">
+        <span class="alert-icon">⚠</span>
+        <div>
+            <strong>Nenhum usuário cadastrado ainda.</strong>
+            <div>O primeiro usuário criado aqui vira administrador automaticamente.</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('usuarios') }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label" for="username">Usuário</label>
+                <input type="text"
+                       id="username"
+                       name="username"
+                       class="form-control"
+                       placeholder="Ex: joao.silva"
+                       autocomplete="off"
+                       required>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="password">Senha</label>
+                <input type="password"
+                       id="password"
+                       name="password"
+                       class="form-control"
+                       placeholder="Defina uma senha"
+                       autocomplete="new-password"
+                       required>
+            </div>
+            {% if usuarios %}
+            <div class="form-group">
+                <label class="form-label" for="perfil">Perfil</label>
+                <select id="perfil" name="perfil" class="form-control">
+                    <option value="usuario">Usuário (telas básicas)</option>
+                    <option value="administrador">Administrador (acesso total)</option>
+                </select>
+            </div>
+            {% endif %}
+        </div>
+        <div class="btn-group mt-2">
+            <button type="submit" class="btn btn-primary">
+                {{ 'Criar Administrador' if not usuarios else 'Criar Usuário' }}
+            </button>
+        </div>
+    </form>
+</div>
+
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Usuários Cadastrados</h2>
+            <p class="card-subtitle">Lista de contas com acesso ao sistema.</p>
+        </div>
+    </div>
+
+    {% if usuarios %}
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Usuário</th>
+                    <th>Perfil</th>
+                    <th>Criado em</th>
+                    <th style="text-align: center;">Ações</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in usuarios %}
+                <tr>
+                    <td><strong>{{ u.username }}</strong>{% if u.id == session.usuario_id %} <span class="form-text">(você)</span>{% endif %}</td>
+                    <td>
+                        <span class="status status-{{ 'concluido' if u.perfil == 'administrador' else 'pendente' }}">
+                            {{ u.perfil }}
+                        </span>
+                    </td>
+                    <td>{{ u.created_at[:10] if u.created_at else '-' }}</td>
+                    <td style="text-align: center;">
+                        <div class="actions" style="justify-content: center;">
+                            <form method="POST" action="{{ url_for('excluir_usuario_route', user_id=u.id) }}" onsubmit="return confirm('Excluir o usuário &quot;{{ u.username }}&quot;?');">
+                                <button type="submit" class="btn btn-danger btn-sm" {% if u.id == session.usuario_id %}disabled title="Você não pode excluir seu próprio usuário"{% endif %}>Excluir</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">👤</div>
+        <h3>Nenhum usuário cadastrado</h3>
+        <p>Use o formulário acima para criar o primeiro administrador.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
