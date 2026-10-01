@@ -944,7 +944,9 @@ def get_posted_db_form_data(form_data):
 def build_db_config(form_data):
     """Valida e normaliza os dados da conexão recebidos pelo formulário."""
     connection_mode = (form_data.get('connection_mode') or 'local').strip().lower()
-    host = 'localhost' if connection_mode == 'local' else (form_data.get('host') or '').strip()
+    host = (form_data.get('host') or '').strip()
+    if connection_mode == 'local' and not host:
+        host = 'localhost'
     database = (form_data.get('database') or 'postgres').strip()
     user = (form_data.get('user') or '').strip()
     password = form_data.get('password') or ''
