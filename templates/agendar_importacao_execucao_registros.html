@@ -49,13 +49,12 @@
     <div class="lotes-header">
         <div>
             <h2 class="card-title">Registros Processados</h2>
-            <p class="card-subtitle">{{ registros|length }} registro(s) nesta execução</p>
+            <p class="card-subtitle">{{ registros|length }} registro(s) nesta execução (os já existentes aparecem só no total acima)</p>
         </div>
         <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
             <button type="button" class="btn btn-sm btn-outline filtro-btn active" data-status="">Todos</button>
             <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="inserido">Inseridos</button>
             <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="atualizado">Atualizados</button>
-            <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="ja_existe">Já Existem</button>
             <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="deletado">Deletados</button>
             <button type="button" class="btn btn-sm btn-outline filtro-btn" data-status="erro">Com Erro</button>
         </div>

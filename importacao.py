@@ -1968,9 +1968,21 @@ def atualizar_execucao_agendamento(conn, execucao_id, status, mensagem, inserido
     conn.commit()
 
 
+# Status que NÃO viram linha de detalhe: "ja_existe" é a imensa maioria das
+# chaves de cada ciclo/execução (centenas de milhares por rodada) e gravá-lo
+# estourou a sequence INTEGER de auto_importacao_ciclo_registros (2^31). O
+# total continua no resumo (registros_ja_existem); só o detalhe por chave some.
+STATUS_SEM_DETALHE = frozenset({'ja_existe'})
+
+
+def _filtrar_registros_detalhe(registros):
+    return [r for r in registros if r[1] not in STATUS_SEM_DETALHE]
+
+
 def gravar_registros_execucao(conn, execucao_id, registros):
     """Grava o detalhe por chave de uma execução em uma única instrução (bulk, via unnest).
     `registros` é uma lista de tuplas (chave_valor, status, erro_msg)."""
+    registros = _filtrar_registros_detalhe(registros)
     if not registros:
         return
 
@@ -2058,6 +2070,7 @@ def registrar_ciclo_auto_import(conn, tabela_id, status, mensagem, inseridos, at
 def gravar_registros_ciclo(conn, ciclo_id, registros):
     """Grava o detalhe por chave de um ciclo em uma única instrução (bulk, via unnest).
     `registros` é uma lista de tuplas (chave_valor, status, erro_msg)."""
+    registros = _filtrar_registros_detalhe(registros)
     if not registros:
         return
 
@@ -2199,7 +2212,7 @@ def criar_tabelas_controle():
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS auto_importacao_ciclo_registros (
-                    id SERIAL PRIMARY KEY,
+                    id BIGSERIAL PRIMARY KEY,
                     ciclo_id INTEGER NOT NULL REFERENCES auto_importacao_ciclos(id) ON DELETE CASCADE,
                     chave_valor TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -2253,7 +2266,7 @@ def criar_tabelas_controle():
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS agendamento_importacao_execucao_registros (
-                    id SERIAL PRIMARY KEY,
+                    id BIGSERIAL PRIMARY KEY,
                     execucao_id INTEGER NOT NULL REFERENCES agendamento_importacao_execucoes(id) ON DELETE CASCADE,
                     chave_valor TEXT NOT NULL,
                     status TEXT NOT NULL,
