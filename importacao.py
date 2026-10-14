@@ -2004,6 +2004,12 @@ def gravar_registros_execucao(conn, execucao_id, registros):
         criar_tabelas_controle()
         with conn.cursor() as cur:
             cur.execute(sql, params)
+    except psycopg2.errors.SequenceGeneratorLimitExceeded:
+        # id ainda INTEGER e a sequence chegou em 2^31 — migra pra BIGINT e repete
+        conn.rollback()
+        migrar_tabelas_detalhe_para_bigint()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
     conn.commit()
 
 
@@ -2093,7 +2099,121 @@ def gravar_registros_ciclo(conn, ciclo_id, registros):
         criar_tabelas_controle()
         with conn.cursor() as cur:
             cur.execute(sql, params)
+    except psycopg2.errors.SequenceGeneratorLimitExceeded:
+        # id ainda INTEGER e a sequence chegou em 2^31 — migra pra BIGINT e repete
+        conn.rollback()
+        migrar_tabelas_detalhe_para_bigint()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
     conn.commit()
+
+
+# ============================================================
+# MIGRAÇÃO AUTOMÁTICA: TABELAS DE DETALHE PARA BIGINT
+# ============================================================
+# Instalações antigas criaram as tabelas de detalhe com id SERIAL (INTEGER) e
+# gravavam uma linha por chave "ja_existe" a cada ciclo — a sequence estoura em
+# 2^31 ("nextval: reached maximum value of sequence"). CREATE TABLE IF NOT
+# EXISTS não corrige tabela já existente, então aqui a tabela é recriada com id
+# BIGINT copiando só os status relevantes (os "ja_existe" antigos são
+# descartados). Mesmo procedimento do limpeza_registros_detalhe.sql.
+
+# Chave do advisory lock: serializa a migração entre processos/workers
+LOCK_MIGRACAO_DETALHE = 300000000
+
+# (tabela, coluna FK, tabela pai, status mantidos, nome do índice)
+TABELAS_DETALHE = (
+    ('auto_importacao_ciclo_registros', 'ciclo_id', 'auto_importacao_ciclos',
+     ['inserido', 'atualizado', 'nao_encontrado', 'erro'],
+     'idx_auto_importacao_ciclo_registros_ciclo_status'),
+    ('agendamento_importacao_execucao_registros', 'execucao_id', 'agendamento_importacao_execucoes',
+     ['inserido', 'atualizado', 'deletado', 'erro'],
+     'idx_agendamento_importacao_execucao_registros_status'),
+)
+
+
+def _migrar_tabela_detalhe_para_bigint(conn, tabela, coluna_pai, tabela_pai, status_mantidos, indice):
+    """Recria `tabela` com id BIGINT se ainda for INTEGER. Retorna True se migrou."""
+    with conn.cursor() as cur:
+        # Bloqueante: um segundo processo espera e, ao entrar, já vê BIGINT e sai
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_MIGRACAO_DETALHE,))
+        cur.execute("""
+            SELECT n.nspname, format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE a.attrelid = to_regclass(%s) AND a.attname = 'id'
+        """, (tabela,))
+        row = cur.fetchone()
+        if not row or row[1] != 'integer':
+            return False
+
+        schema = psycopg2.extensions.quote_ident(row[0], conn)
+        antiga = f'{schema}.{tabela}'
+        novo = f'{tabela}_novo'
+        pai = f'{schema}.{tabela_pai}'
+
+        # Força a cópia a usar o índice (fk, status) por registro pai em vez
+        # de varrer a tabela inteira (centenas de GB nos casos reais)
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute("SET LOCAL enable_hashjoin = off")
+        cur.execute("SET LOCAL enable_mergejoin = off")
+        cur.execute(f"LOCK TABLE {antiga} IN EXCLUSIVE MODE")
+        cur.execute(f"DROP TABLE IF EXISTS {schema}.{novo}")
+        cur.execute(f"""
+            CREATE TABLE {schema}.{novo} (
+                id BIGSERIAL PRIMARY KEY,
+                {coluna_pai} INTEGER NOT NULL REFERENCES {pai}(id) ON DELETE CASCADE,
+                chave_valor TEXT NOT NULL,
+                status TEXT NOT NULL,
+                erro_msg TEXT
+            )
+        """)
+        cur.execute(f"""
+            INSERT INTO {schema}.{novo} ({coluna_pai}, chave_valor, status, erro_msg)
+            SELECT r.{coluna_pai}, r.chave_valor, r.status, r.erro_msg
+            FROM {pai} p
+            JOIN {antiga} r ON r.{coluna_pai} = p.id AND r.status = ANY(%s)
+            ORDER BY r.{coluna_pai}, r.id
+        """, (status_mantidos,))
+        cur.execute(f"DROP TABLE {antiga}")
+        cur.execute(f"ALTER TABLE {schema}.{novo} RENAME TO {tabela}")
+        cur.execute(f"ALTER SEQUENCE {schema}.{novo}_id_seq RENAME TO {tabela}_id_seq")
+        cur.execute(f"ALTER INDEX {schema}.{novo}_pkey RENAME TO {tabela}_pkey")
+        cur.execute(f"CREATE INDEX {indice} ON {antiga} ({coluna_pai}, status)")
+    return True
+
+
+def migrar_tabelas_detalhe_para_bigint():
+    """Migra (uma transação por tabela, sem statement_timeout) as tabelas de
+    detalhe que ainda tenham id INTEGER. Idempotente: não faz nada se já forem BIGINT."""
+    migradas = []
+    for tabela, coluna_pai, tabela_pai, status_mantidos, indice in TABELAS_DETALHE:
+        migrou = execute_db_operation(
+            lambda conn, t=tabela, c=coluna_pai, p=tabela_pai, st=status_mantidos, i=indice:
+                _migrar_tabela_detalhe_para_bigint(conn, t, c, p, st, i),
+            statement_timeout_ms=0
+        )
+        if migrou:
+            migradas.append(tabela)
+    return migradas
+
+
+def _migrar_tabelas_detalhe_worker():
+    try:
+        migradas = migrar_tabelas_detalhe_para_bigint()
+        if migradas:
+            app.logger.warning('Tabelas de detalhe migradas para BIGINT: %s', ', '.join(migradas))
+    except Exception:
+        app.logger.exception('Falha ao migrar tabelas de detalhe para BIGINT')
+
+
+def iniciar_migracao_tabelas_detalhe():
+    """Dispara a migração em segundo plano na subida do app (pode levar minutos
+    em tabelas grandes; não pode travar o servidor web)."""
+    if not is_db_configured():
+        return
+    threading.Thread(target=_migrar_tabelas_detalhe_worker, daemon=True).start()
 
 
 # ============================================================
@@ -5021,6 +5141,8 @@ def api_cancelar_migracao(id):
 # ============================================================
 # EXECUÇÃO
 # ============================================================
+
+iniciar_migracao_tabelas_detalhe()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5310)
