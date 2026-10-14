@@ -40,6 +40,10 @@ DEFAULT_DB_CONFIG = {
     'schema_destino': os.getenv('DB_SCHEMA_DESTINO', 'public')
 }
 DB_CLIENT_ENCODING_CANDIDATES = ('WIN1252', 'LATIN1', 'UTF8', 'LATIN9', 'SQL_ASCII')
+# SQL_ASCII só serve de último recurso pontual: com ele o psycopg2 codifica todo
+# texto em ASCII e qualquer acento enviado ao banco ("já", "não"...) quebra com
+# "'ascii' codec can't encode character". Nunca é memorizado nem vai pra frente.
+DB_CLIENT_ENCODING_ULTIMO_RECURSO = 'SQL_ASCII'
 DB_CONNECT_KEYS = ('host', 'database', 'user', 'password', 'port')
 APP_DATA_DIR = os.path.join(app.root_path, 'data')
 SAVED_CONNECTIONS_FILE = os.path.join(APP_DATA_DIR, 'db_saved_connections.json')
@@ -823,7 +827,7 @@ PUBLIC_ENDPOINTS = {'login', 'logout', 'static'}
 # Endpoints restritos ao perfil administrador
 ADMIN_ONLY_ENDPOINTS = {
     'configurar_banco', 'usar_conexao_salva', 'excluir_conexao_salva',
-    'criar_banco_local_route', 'criar_fdw_route', 'criar_schema_temp_route', 'criar_tabelas_route',
+    'criar_banco_local_route', 'criar_fdw_route', 'criar_schema_temp_route', 'revisar_tabelas_route',
     'usuarios', 'excluir_usuario_route',
 }
 
@@ -873,7 +877,7 @@ def get_db_client_encoding_candidates():
     configured_encoding = (get_db_config().get('client_encoding') or '').strip().upper()
     candidates = []
 
-    if configured_encoding:
+    if configured_encoding and configured_encoding != DB_CLIENT_ENCODING_ULTIMO_RECURSO:
         candidates.append(configured_encoding)
 
     for encoding in DB_CLIENT_ENCODING_CANDIDATES:
@@ -1236,7 +1240,7 @@ def open_db_connection(client_encoding=None, statement_timeout_ms=300000):
 
 def persist_working_client_encoding(client_encoding):
     """Memoriza o encoding que funcionou para evitar novas tentativas desnecessárias."""
-    if not client_encoding:
+    if not client_encoding or client_encoding.upper() == DB_CLIENT_ENCODING_ULTIMO_RECURSO:
         return
 
     db_config = get_db_config()
@@ -1265,6 +1269,7 @@ def _is_encoding_error(error):
         'character with byte sequence',
         'untranslatable character',
         "codec can't decode",
+        "codec can't encode",
         'unicode decode error',
         # Português (PostgreSQL com locale pt_BR)
         'sequ\u00eancia de bytes',
@@ -1317,7 +1322,7 @@ def execute_db_operation(operation, statement_timeout_ms=300000):
             conn.commit()
             persist_working_client_encoding(client_encoding)
             return result
-        except UnicodeDecodeError as error:
+        except (UnicodeDecodeError, UnicodeEncodeError) as error:
             last_error = error
             if conn is not None:
                 conn.rollback()
@@ -1947,6 +1952,7 @@ def registrar_execucao_agendamento(conn, tabela_id, status, mensagem, inseridos,
         criar_tabelas_controle()
         result = run_query_with_connection(conn, sql, params)
     conn.commit()
+    _limpar_logs_importacao_sem_falhar(conn, 'agendamento_importacao_execucoes')
     return result[0]['id']
 
 
@@ -2070,6 +2076,7 @@ def registrar_ciclo_auto_import(conn, tabela_id, status, mensagem, inseridos, at
         criar_tabelas_controle()
         result = run_query_with_connection(conn, sql, params)
     conn.commit()
+    _limpar_logs_importacao_sem_falhar(conn, 'auto_importacao_ciclos')
     return result[0]['id']
 
 
@@ -2109,16 +2116,24 @@ def gravar_registros_ciclo(conn, ciclo_id, registros):
 
 
 # ============================================================
-# MIGRAÇÃO AUTOMÁTICA: TABELAS DE DETALHE PARA BIGINT
+# REVISÃO DAS TABELAS DE CONTROLE DE IMPORTAÇÃO + RETENÇÃO DE LOGS
 # ============================================================
 # Instalações antigas criaram as tabelas de detalhe com id SERIAL (INTEGER) e
 # gravavam uma linha por chave "ja_existe" a cada ciclo — a sequence estoura em
 # 2^31 ("nextval: reached maximum value of sequence"). CREATE TABLE IF NOT
 # EXISTS não corrige tabela já existente, então aqui a tabela é recriada com id
-# BIGINT copiando só os status relevantes (os "ja_existe" antigos são
-# descartados). Mesmo procedimento do limpeza_registros_detalhe.sql.
+# BIGINT copiando só o detalhe relevante dos logs mantidos.
+#
+# Retenção: só os últimos LOGS_IMPORTACAO_MANTIDOS ciclos/execuções por tabela
+# configurada ficam no banco; os mais antigos (e o detalhe, via ON DELETE
+# CASCADE) são apagados a cada novo log, pra não encher o disco.
 
-# Chave do advisory lock: serializa a migração entre processos/workers
+LOGS_IMPORTACAO_MANTIDOS = int(os.getenv('LOGS_IMPORTACAO_MANTIDOS', '20'))
+
+# Tabelas de log (resumo): uma linha por ciclo/execução, com tabela_id + executado_em
+TABELAS_LOG_IMPORTACAO = ('auto_importacao_ciclos', 'agendamento_importacao_execucoes')
+
+# Chave do advisory lock: serializa a revisão entre processos/workers
 LOCK_MIGRACAO_DETALHE = 300000000
 
 # (tabela, coluna FK, tabela pai, status mantidos, nome do índice)
@@ -2132,84 +2147,175 @@ TABELAS_DETALHE = (
 )
 
 
-def _migrar_tabela_detalhe_para_bigint(conn, tabela, coluna_pai, tabela_pai, status_mantidos, indice):
-    """Recria `tabela` com id BIGINT se ainda for INTEGER. Retorna True se migrou."""
+def _sql_ids_logs_mantidos(tabela_log):
+    """SELECT dos ids dos últimos LOGS_IMPORTACAO_MANTIDOS logs de cada tabela configurada."""
+    return f"""
+        SELECT id FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY tabela_id ORDER BY executado_em DESC, id DESC
+            ) AS posicao
+            FROM {tabela_log}
+        ) ranking
+        WHERE posicao <= {int(LOGS_IMPORTACAO_MANTIDOS)}
+    """
+
+
+def limpar_logs_importacao_antigos(conn, tabela_log):
+    """Apaga os logs além dos últimos LOGS_IMPORTACAO_MANTIDOS por tabela (o
+    detalhe vai junto pelo ON DELETE CASCADE). Retorna quantos logs apagou."""
+    assert tabela_log in TABELAS_LOG_IMPORTACAO
     with conn.cursor() as cur:
-        # Bloqueante: um segundo processo espera e, ao entrar, já vê BIGINT e sai
+        cur.execute(f"DELETE FROM {tabela_log} WHERE id NOT IN ({_sql_ids_logs_mantidos(tabela_log)})")
+        return cur.rowcount
+
+
+def _limpar_logs_importacao_sem_falhar(conn, tabela_log):
+    """Retenção chamada a cada novo log: uma falha aqui não pode derrubar o ciclo."""
+    try:
+        limpar_logs_importacao_antigos(conn, tabela_log)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        app.logger.exception('Falha ao limpar logs antigos de %s', tabela_log)
+
+
+def _tipo_id_e_schema(cur, tabela):
+    cur.execute("""
+        SELECT n.nspname, format_type(a.atttypid, a.atttypmod)
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE a.attrelid = to_regclass(%s) AND a.attname = 'id'
+    """, (tabela,))
+    return cur.fetchone()
+
+
+def _recriar_tabela_detalhe_bigint(cur, schema, tabela, coluna_pai, tabela_pai, status_mantidos, indice):
+    """Recria `tabela` com id BIGINT, copiando só o detalhe relevante dos logs mantidos."""
+    antiga = f'{schema}.{tabela}'
+    novo = f'{tabela}_novo'
+    pai = f'{schema}.{tabela_pai}'
+
+    # Força a cópia a usar o índice (fk, status) por log em vez de varrer a
+    # tabela inteira (centenas de GB nos casos reais)
+    cur.execute("SET LOCAL enable_seqscan = off")
+    cur.execute("SET LOCAL enable_hashjoin = off")
+    cur.execute("SET LOCAL enable_mergejoin = off")
+    cur.execute(f"LOCK TABLE {antiga} IN EXCLUSIVE MODE")
+    cur.execute(f"DROP TABLE IF EXISTS {schema}.{novo}")
+    cur.execute(f"""
+        CREATE TABLE {schema}.{novo} (
+            id BIGSERIAL PRIMARY KEY,
+            {coluna_pai} INTEGER NOT NULL REFERENCES {pai}(id) ON DELETE CASCADE,
+            chave_valor TEXT NOT NULL,
+            status TEXT NOT NULL,
+            erro_msg TEXT
+        )
+    """)
+    cur.execute(f"""
+        INSERT INTO {schema}.{novo} ({coluna_pai}, chave_valor, status, erro_msg)
+        SELECT r.{coluna_pai}, r.chave_valor, r.status, r.erro_msg
+        FROM ({_sql_ids_logs_mantidos(pai)}) p
+        JOIN {antiga} r ON r.{coluna_pai} = p.id AND r.status = ANY(%s)
+        ORDER BY r.{coluna_pai}, r.id
+    """, (status_mantidos,))
+    copiados = cur.rowcount
+    cur.execute(f"DROP TABLE {antiga}")
+    cur.execute(f"ALTER TABLE {schema}.{novo} RENAME TO {tabela}")
+    cur.execute(f"ALTER SEQUENCE {schema}.{novo}_id_seq RENAME TO {tabela}_id_seq")
+    cur.execute(f"ALTER INDEX {schema}.{novo}_pkey RENAME TO {tabela}_pkey")
+    cur.execute(f"CREATE INDEX {indice} ON {antiga} ({coluna_pai}, status)")
+    cur.execute("RESET enable_seqscan")
+    cur.execute("RESET enable_hashjoin")
+    cur.execute("RESET enable_mergejoin")
+    return copiados
+
+
+def _revisar_tabela_detalhe(conn, tabela, coluna_pai, tabela_pai, status_mantidos, indice):
+    """Corrige `tabela` se estiver errada. Retorna a descrição do que fez, ou None."""
+    with conn.cursor() as cur:
+        # Bloqueante: um segundo processo espera e, ao entrar, já vê tudo certo e sai
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_MIGRACAO_DETALHE,))
-        cur.execute("""
-            SELECT n.nspname, format_type(a.atttypid, a.atttypmod)
-            FROM pg_attribute a
-            JOIN pg_class c ON c.oid = a.attrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE a.attrelid = to_regclass(%s) AND a.attname = 'id'
-        """, (tabela,))
-        row = cur.fetchone()
-        if not row or row[1] != 'integer':
-            return False
-
+        row = _tipo_id_e_schema(cur, tabela)
+        if not row:
+            return None
         schema = psycopg2.extensions.quote_ident(row[0], conn)
-        antiga = f'{schema}.{tabela}'
-        novo = f'{tabela}_novo'
-        pai = f'{schema}.{tabela_pai}'
 
-        # Força a cópia a usar o índice (fk, status) por registro pai em vez
-        # de varrer a tabela inteira (centenas de GB nos casos reais)
-        cur.execute("SET LOCAL enable_seqscan = off")
-        cur.execute("SET LOCAL enable_hashjoin = off")
-        cur.execute("SET LOCAL enable_mergejoin = off")
-        cur.execute(f"LOCK TABLE {antiga} IN EXCLUSIVE MODE")
-        cur.execute(f"DROP TABLE IF EXISTS {schema}.{novo}")
-        cur.execute(f"""
-            CREATE TABLE {schema}.{novo} (
-                id BIGSERIAL PRIMARY KEY,
-                {coluna_pai} INTEGER NOT NULL REFERENCES {pai}(id) ON DELETE CASCADE,
-                chave_valor TEXT NOT NULL,
-                status TEXT NOT NULL,
-                erro_msg TEXT
+        if row[1] == 'integer':
+            copiados = _recriar_tabela_detalhe_bigint(
+                cur, schema, tabela, coluna_pai, tabela_pai, status_mantidos, indice
             )
-        """)
-        cur.execute(f"""
-            INSERT INTO {schema}.{novo} ({coluna_pai}, chave_valor, status, erro_msg)
-            SELECT r.{coluna_pai}, r.chave_valor, r.status, r.erro_msg
-            FROM {pai} p
-            JOIN {antiga} r ON r.{coluna_pai} = p.id AND r.status = ANY(%s)
-            ORDER BY r.{coluna_pai}, r.id
-        """, (status_mantidos,))
-        cur.execute(f"DROP TABLE {antiga}")
-        cur.execute(f"ALTER TABLE {schema}.{novo} RENAME TO {tabela}")
-        cur.execute(f"ALTER SEQUENCE {schema}.{novo}_id_seq RENAME TO {tabela}_id_seq")
-        cur.execute(f"ALTER INDEX {schema}.{novo}_pkey RENAME TO {tabela}_pkey")
-        cur.execute(f"CREATE INDEX {indice} ON {antiga} ({coluna_pai}, status)")
-    return True
+            # Logs antigos ficaram sem detalhe — apaga já (cascata na tabela nova, pequena)
+            logs_removidos = limpar_logs_importacao_antigos(conn, tabela_pai)
+            return (
+                f'{tabela}: recriada com id BIGINT ({copiados} registro(s) de detalhe mantido(s), '
+                f'{logs_removidos} log(s) antigo(s) de {tabela_pai} removido(s)).'
+            )
+
+        # Coluna já BIGINT mas sequence ainda INTEGER (ex.: ALTER COLUMN feito à mão)
+        cur.execute("""
+            SELECT s.seqrelid::regclass::text
+            FROM pg_sequence s
+            WHERE s.seqrelid = to_regclass(pg_get_serial_sequence(%s, 'id'))
+              AND s.seqtypid = 'integer'::regtype
+        """, (f'{schema}.{tabela}',))
+        seq = cur.fetchone()
+        if seq:
+            cur.execute(f"ALTER SEQUENCE {seq[0]} AS BIGINT")
+            return f'{tabela}: sequence {seq[0]} convertida para BIGINT.'
+    return None
 
 
 def migrar_tabelas_detalhe_para_bigint():
-    """Migra (uma transação por tabela, sem statement_timeout) as tabelas de
-    detalhe que ainda tenham id INTEGER. Idempotente: não faz nada se já forem BIGINT."""
-    migradas = []
+    """Revisa as tabelas de detalhe (uma transação por tabela, sem
+    statement_timeout). Idempotente: não faz nada se já estiverem certas.
+    Retorna a lista do que foi corrigido."""
+    acoes = []
     for tabela, coluna_pai, tabela_pai, status_mantidos, indice in TABELAS_DETALHE:
-        migrou = execute_db_operation(
+        acao = execute_db_operation(
             lambda conn, t=tabela, c=coluna_pai, p=tabela_pai, st=status_mantidos, i=indice:
-                _migrar_tabela_detalhe_para_bigint(conn, t, c, p, st, i),
+                _revisar_tabela_detalhe(conn, t, c, p, st, i),
             statement_timeout_ms=0
         )
-        if migrou:
-            migradas.append(tabela)
-    return migradas
+        if acao:
+            acoes.append(acao)
+    return acoes
+
+
+def revisar_tabelas_controle_importacao():
+    """Botão "Revisar e Corrigir" da tela Configurar Banco: cria o que faltar,
+    recria tabelas de detalhe erradas e aplica a retenção de logs.
+    Retorna a lista de mensagens do que foi feito."""
+    criar_tabelas_controle()
+    acoes = ['Tabelas, colunas e índices de controle verificados/criados.']
+    acoes += migrar_tabelas_detalhe_para_bigint()
+
+    removidos = execute_db_operation(
+        lambda conn: {t: limpar_logs_importacao_antigos(conn, t) for t in TABELAS_LOG_IMPORTACAO},
+        statement_timeout_ms=0
+    )
+    acoes.append(
+        f'Logs antigos removidos: {removidos["auto_importacao_ciclos"]} ciclo(s) da importação automática e '
+        f'{removidos["agendamento_importacao_execucoes"]} execução(ões) agendada(s) '
+        f'(mantidos os últimos {LOGS_IMPORTACAO_MANTIDOS} por tabela).'
+    )
+    return acoes
 
 
 def _migrar_tabelas_detalhe_worker():
     try:
-        migradas = migrar_tabelas_detalhe_para_bigint()
-        if migradas:
-            app.logger.warning('Tabelas de detalhe migradas para BIGINT: %s', ', '.join(migradas))
+        acoes = migrar_tabelas_detalhe_para_bigint()
+        if acoes:
+            app.logger.warning('Tabelas de detalhe corrigidas: %s', ' '.join(acoes))
     except Exception:
-        app.logger.exception('Falha ao migrar tabelas de detalhe para BIGINT')
+        app.logger.exception('Falha ao revisar as tabelas de detalhe')
 
 
 def iniciar_migracao_tabelas_detalhe():
-    """Dispara a migração em segundo plano na subida do app (pode levar minutos
+    """Dispara a revisão em segundo plano na subida do app (pode levar minutos
     em tabelas grandes; não pode travar o servidor web)."""
     if not is_db_configured():
         return
@@ -2543,6 +2649,7 @@ def configurar_banco():
         db_config=db_form,
         fdw_config=fdw_form,
         temp_schema_name=TEMP_SCHEMA_NAME,
+        logs_importacao_mantidos=LOGS_IMPORTACAO_MANTIDOS,
         error_details=None,
         saved_connections=[sanitize_db_connection(connection) for connection in get_saved_db_connections()]
     )
@@ -2739,25 +2846,21 @@ def criar_schema_temp_route():
     return redirect(url_for('configurar_banco'))
 
 
-@app.route('/configurar-banco/criar-tabelas', methods=['POST'])
-def criar_tabelas_route():
-    """Cria as tabelas de controle de migração no schema public."""
+@app.route('/configurar-banco/revisar-tabelas', methods=['POST'])
+def revisar_tabelas_route():
+    """Revisa as tabelas de controle de importação: cria o que faltar, recria as
+    que estiverem erradas e apaga os logs além dos últimos LOGS_IMPORTACAO_MANTIDOS."""
     if not is_db_configured():
-        flash('Configure e salve a conexão antes de criar as tabelas.', 'warning')
+        flash('Configure e salve a conexão antes de revisar as tabelas.', 'warning')
         return redirect(url_for('configurar_banco'))
 
     try:
-        criar_tabelas_controle()
-        flash(
-            'Tabelas de controle criadas/verificadas: migrações (controle_migracao, '
-            'controle_migracao_lotes) e importação automática (auto_importacao_tabelas, '
-            'auto_importacao_ciclos, auto_importacao_ciclo_registros).',
-            'success'
-        )
+        for acao in revisar_tabelas_controle_importacao():
+            flash(acao, 'success')
     except (OperationalError, InterfaceError) as error:
         return handle_db_connection_error(error)
     except Exception as e:
-        flash(f'Erro ao criar as tabelas: {str(e)}', 'error')
+        flash(f'Erro ao revisar as tabelas de controle: {str(e)}', 'error')
 
     return redirect(url_for('configurar_banco'))
 

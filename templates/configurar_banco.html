@@ -273,8 +273,7 @@
             <code>auto_importacao_tabelas</code>, <code>auto_importacao_ciclos</code> e
             <code>auto_importacao_ciclo_registros</code> já são criadas/verificadas
             automaticamente no schema de destino sempre que você salva a conexão acima
-            (seção 1) ou troca a conexão ativa na lista de conexões salvas. Use o botão
-            abaixo só se quiser forçar a verificação de novo sem resalvar a conexão.
+            (seção 1) ou troca a conexão ativa na lista de conexões salvas.
         </p>
         <div class="form-text" style="color: var(--color-orange);">
             ⚠️ As funções SQL usadas em outras telas (<code>processar_lote</code>,
@@ -282,8 +281,16 @@
             <code>atualizar_lotes_migracao</code>, <code>finalizar_migracao</code>) não são
             criadas por aqui — precisam existir separadamente no banco.
         </div>
-        <form method="POST" action="{{ url_for('criar_tabelas_route') }}">
-            <button type="submit" class="btn btn-secondary mt-2">Verificar Tabelas de Controle</button>
+        <div class="form-text" style="margin-top: 8px;">
+            <strong>Revisar e Corrigir</strong> confere as tabelas de controle de importação:
+            cria o que faltar, recria com id <code>BIGINT</code> as tabelas de detalhe antigas
+            (id <code>INTEGER</code>, que estouram em 2,1 bilhões) e apaga os logs de importação
+            mais antigos — ficam só os últimos <strong>{{ logs_importacao_mantidos }}</strong>
+            ciclos/execuções de cada tabela (essa limpeza também roda sozinha a cada novo log).
+        </div>
+        <form method="POST" action="{{ url_for('revisar_tabelas_route') }}"
+              onsubmit="const b = this.querySelector('button'); b.disabled = true; b.textContent = 'Revisando... (pode levar alguns minutos)';">
+            <button type="submit" class="btn btn-secondary mt-2">Revisar e Corrigir Tabelas de Controle</button>
         </form>
     </div>
 </div>
