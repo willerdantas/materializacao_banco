@@ -151,13 +151,6 @@
     </div>
     <div id="background-jobs-list-agendamento"></div>
 </div>
-
-<!-- Tabelas ativas da importação automática — o dashboard usa isso pra
-     agendar os ciclos, igual a tela de Importação Automática já faz. -->
-<script type="application/json" id="tabelas-auto-ativas-json">{{ tabelas_auto_ativas|tojson }}</script>
-
-<!-- Tabelas ativas do Agendar Importação — mesma lógica, pelos horários configurados. -->
-<script type="application/json" id="tabelas-agendamento-ativas-json">{{ tabelas_agendamento_ativas|tojson }}</script>
 {% endblock %}
 
 {% block extra_js %}
@@ -509,8 +502,8 @@ let latestMigracoesById = {};
                 btn.disabled = true;
                 btn.textContent = 'Iniciando...';
                 try {
+                    // Só reativa — o agendador do servidor dispara o ciclo
                     await fetch(`/importacao-automatica/${btn.dataset.tabelaId}/iniciar`, { method: 'POST' });
-                    await fetch(`/api/importacao-automatica/${btn.dataset.tabelaId}/ciclo`, { method: 'POST' });
                 } catch (_) {}
             });
         });
@@ -634,147 +627,6 @@ let latestMigracoesById = {};
     // importação automática costumam ser curtos, então um intervalo maior
     // corria o risco de nunca pegar o job "processando" a tempo.
     setInterval(pollBackgroundJobs, 2000);
-})();
-
-// ============================================================
-// Agenda os ciclos das tabelas de importação automática ativas — mesma
-// lógica da tela de Importação Automática (dispara na hora + repete no
-// intervalo configurado). Isso existe pra os ciclos acontecerem (e
-// aparecerem em tempo real no painel acima) mesmo que ninguém tenha aquela
-// outra tela aberta em nenhuma aba — sem isso, nada dispara sozinho.
-// ============================================================
-(function() {
-    let tabelasAtivas = [];
-    try {
-        const el = document.getElementById('tabelas-auto-ativas-json');
-        tabelasAtivas = el ? JSON.parse(el.textContent) : [];
-    } catch (_) {
-        tabelasAtivas = [];
-    }
-
-    const emExecucao = {};
-
-    async function executarCicloAgendado(tabela) {
-        if (emExecucao[tabela.id]) return; // ciclo anterior desta tabela ainda rodando
-        emExecucao[tabela.id] = true;
-        try {
-            // Dispara e não espera terminar — o painel "Importação Automática
-            // em Segundo Plano" acima já mostra o progresso via polling.
-            // Se já tiver um ciclo rodando (disparado por outra aba), o
-            // servidor recusa com 409 — inofensivo, só não faz nada.
-            await fetch(`/api/importacao-automatica/${tabela.id}/ciclo`, { method: 'POST' });
-        } catch (_) {
-            // falha isolada de rede — tenta de novo no próximo intervalo
-        } finally {
-            emExecucao[tabela.id] = false;
-        }
-    }
-
-    tabelasAtivas.forEach(tabela => {
-        const intervaloMs = (tabela.intervalo_min || 5) * 60 * 1000;
-        const ultimoCicloMs = tabela.ultimo_ciclo_em ? new Date(tabela.ultimo_ciclo_em).getTime() : null;
-        const decorridoMs = ultimoCicloMs ? (Date.now() - ultimoCicloMs) : null;
-        // Se o último ciclo já rodou há menos tempo que o intervalo configurado,
-        // espera o restante antes do primeiro disparo — evita reiniciar um ciclo
-        // só porque a página foi recarregada ou o dashboard foi reaberto.
-        const atrasoInicialMs = (decorridoMs !== null && decorridoMs < intervaloMs) ? (intervaloMs - decorridoMs) : 0;
-
-        setTimeout(() => {
-            executarCicloAgendado(tabela);
-            setInterval(() => executarCicloAgendado(tabela), intervaloMs);
-        }, atrasoInicialMs);
-    });
-})();
-
-// ============================================================
-// Agenda as execuções do Agendar Importação (sincronização completa,
-// insert/update/delete) nos horários configurados — mesma lógica de
-// tolerância e reset diário da tela própria, pra funcionar mesmo sem
-// aquela aba aberta.
-// ============================================================
-(function() {
-    let tabelasAtivas = [];
-    try {
-        const el = document.getElementById('tabelas-agendamento-ativas-json');
-        tabelasAtivas = el ? JSON.parse(el.textContent) : [];
-    } catch (_) {
-        tabelasAtivas = [];
-    }
-    if (tabelasAtivas.length === 0) return;
-
-    const emExecucao = {};
-    const jaDisparadoHoje = {}; // { 'tabelaId_HH:MM_AAAA-MM-DD': true }
-
-    function dataDeHojeStr() {
-        const d = new Date();
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    }
-
-    // Mesma tolerância de 5 min da tela de Agendar Importação — evita perder
-    // o disparo por causa de throttle do navegador em aba em segundo plano.
-    function horarioDentroDaJanela(horario) {
-        const agora = new Date();
-        const [h, m] = horario.split(':').map(Number);
-        if (Number.isNaN(h) || Number.isNaN(m)) return false;
-        const alvo = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate(), h, m, 0);
-        const diffMs = agora - alvo;
-        return diffMs >= 0 && diffMs < 5 * 60 * 1000;
-    }
-
-    async function executarAgendamento(tabelaId) {
-        if (emExecucao[tabelaId]) return;
-        emExecucao[tabelaId] = true;
-        try {
-            // Dispara e não espera terminar — o painel "Agendar Importação em
-            // Segundo Plano" acima já mostra o progresso via polling. Se já
-            // tiver uma execução rodando (disparada por outra aba), o
-            // servidor recusa com 409 — inofensivo, só não faz nada.
-            await fetch(`/api/agendar-importacao/${tabelaId}/executar`, { method: 'POST' });
-        } catch (_) {
-            // falha isolada de rede — tenta de novo no próximo check
-        } finally {
-            emExecucao[tabelaId] = false;
-        }
-    }
-
-    function verificarHorariosAgendamento() {
-        const hoje = dataDeHojeStr();
-        tabelasAtivas.forEach(tabela => {
-            const horarios = [tabela.horario_1, tabela.horario_2, tabela.horario_3, tabela.horario_4].filter(Boolean);
-            horarios.forEach(h => {
-                const chave = `${tabela.id}_${h}_${hoje}`;
-                if (horarioDentroDaJanela(h) && !jaDisparadoHoje[chave]) {
-                    jaDisparadoHoje[chave] = true;
-                    executarAgendamento(tabela.id);
-                }
-            });
-        });
-    }
-
-    // Marca como já disparado hoje qualquer horário cuja última execução
-    // registrada no servidor caiu dentro da mesma janela de tolerância —
-    // evita reexecutar ao recarregar a página/reabrir o dashboard.
-    function inicializarJaDisparadoHoje() {
-        tabelasAtivas.forEach(tabela => {
-            if (!tabela.ultima_execucao) return;
-            const executadoEm = new Date(tabela.ultima_execucao);
-            if (Number.isNaN(executadoEm.getTime())) return;
-            const hoje = dataDeHojeStr();
-            const horarios = [tabela.horario_1, tabela.horario_2, tabela.horario_3, tabela.horario_4].filter(Boolean);
-            horarios.forEach(h => {
-                const [hh, mm] = h.split(':').map(Number);
-                if (Number.isNaN(hh) || Number.isNaN(mm)) return;
-                const alvo = new Date(executadoEm.getFullYear(), executadoEm.getMonth(), executadoEm.getDate(), hh, mm, 0);
-                if (Math.abs(executadoEm - alvo) < 5 * 60 * 1000) {
-                    jaDisparadoHoje[`${tabela.id}_${h}_${hoje}`] = true;
-                }
-            });
-        });
-    }
-
-    inicializarJaDisparadoHoje();
-    verificarHorariosAgendamento();
-    setInterval(verificarHorariosAgendamento, 10000);
 })();
 </script>
 {% endblock %}

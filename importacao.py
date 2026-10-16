@@ -12,7 +12,7 @@ import os
 import threading
 import time
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'importacao-intergash-dev-key')
@@ -97,6 +97,52 @@ def remove_background_job(job_id):
     """Remove um job da lista."""
     with background_jobs_lock:
         background_jobs.pop(job_id, None)
+
+
+JOB_STATUS_ATIVOS = ('iniciando', 'processando')
+
+# Thread de cada job disparado por iniciar_background_job — usada pelo
+# agendador pra liberar jobs "órfãos" (thread morreu sem fechar o status, o
+# que travava a tabela com 409 "já existe um ciclo em andamento" pra sempre).
+background_threads = {}
+
+
+def iniciar_background_job(job_id, data, target, args):
+    """Reserva o job e dispara a thread, de forma atômica: devolve False (sem
+    disparar nada) se já houver um job ativo com esse id."""
+    with background_jobs_lock:
+        atual = background_jobs.get(job_id)
+        if atual and atual.get('status') in JOB_STATUS_ATIVOS:
+            return False
+        background_jobs[job_id] = data
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        background_threads[job_id] = thread
+    thread.start()
+    return True
+
+
+def liberar_jobs_orfaos():
+    """Fecha como 'erro' os jobs ativos cuja thread já terminou."""
+    with background_jobs_lock:
+        for job_id, thread in list(background_threads.items()):
+            if thread.is_alive():
+                continue
+            background_threads.pop(job_id, None)
+            job = background_jobs.get(job_id)
+            if job and job.get('status') in JOB_STATUS_ATIVOS:
+                background_jobs[job_id] = {
+                    **job, 'status': 'erro',
+                    'mensagem': 'Execução encerrada inesperadamente — liberada para o próximo disparo.',
+                }
+
+
+def contar_jobs_importacao_ativos():
+    """Ciclos da importação automática + execuções agendadas rodando agora."""
+    with background_jobs_lock:
+        return sum(
+            1 for job in background_jobs.values()
+            if job.get('tipo') in ('auto_ciclo', 'agendamento') and job.get('status') in JOB_STATUS_ATIVOS
+        )
 
 
 def contar_migracoes_manuais_em_execucao():
@@ -2936,36 +2982,25 @@ def excluir_usuario_route(user_id):
 @app.route('/dashboard')
 def dashboard():
     """Página do Dashboard (antigo index.html, agora dashboard.html)."""
-    # Tabelas ativas da importação automática e do Agendar Importação — o
-    # dashboard também agenda os ciclos/execuções delas (igual as telas
-    # próprias já faziam), pra não depender de outra aba aberta pra ver
-    # algo acontecendo em tempo real.
+    # Só o resumo (configuradas/ativas): quem dispara os ciclos/execuções é o
+    # agendador do servidor — abrir o dashboard não dispara nada.
     try:
         todas_auto_tabelas = get_auto_import_tabelas()
     except Exception:
         todas_auto_tabelas = []
-    tabelas_auto_ativas = [t for t in todas_auto_tabelas if t.get('status') == 'ativa']
-    resumo_auto = {'configuradas': len(todas_auto_tabelas), 'ativas': len(tabelas_auto_ativas)}
+    resumo_auto = {
+        'configuradas': len(todas_auto_tabelas),
+        'ativas': sum(1 for t in todas_auto_tabelas if t.get('status') == 'ativa'),
+    }
 
     try:
         todas_agendamento_tabelas = get_agendamento_tabelas()
     except Exception:
         todas_agendamento_tabelas = []
-    tabelas_agendamento_ativas = []
-    for t in todas_agendamento_tabelas:
-        if t.get('status') != 'ativa':
-            continue
-        # datetime.time não é serializável em JSON por padrão — converte
-        # pra string 'HH:MM' antes de embutir no template (tojson quebrava
-        # a página inteira com TypeError sempre que havia tabela ativa).
-        t = dict(t)
-        for campo in ('horario_1', 'horario_2', 'horario_3', 'horario_4'):
-            valor = t.get(campo)
-            t[campo] = valor.strftime('%H:%M') if valor is not None else None
-        t.pop('created_at', None)
-        t.pop('updated_at', None)
-        tabelas_agendamento_ativas.append(t)
-    resumo_agendamento = {'configuradas': len(todas_agendamento_tabelas), 'ativas': len(tabelas_agendamento_ativas)}
+    resumo_agendamento = {
+        'configuradas': len(todas_agendamento_tabelas),
+        'ativas': sum(1 for t in todas_agendamento_tabelas if t.get('status') == 'ativa'),
+    }
 
     manual_em_execucao = contar_migracoes_manuais_em_execucao()
 
@@ -2973,8 +3008,6 @@ def dashboard():
         flash('Informe usuário e senha do banco na tela Banco para liberar as operações.', 'warning')
         return render_template(
             'dashboard.html', migracoes=[], totais={},
-            tabelas_auto_ativas=tabelas_auto_ativas,
-            tabelas_agendamento_ativas=tabelas_agendamento_ativas,
             resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
             manual_em_execucao=manual_em_execucao
         )
@@ -3019,7 +3052,6 @@ def dashboard():
         }
         return render_template(
             'dashboard.html', migracoes=migracoes, totais=totais,
-            tabelas_auto_ativas=tabelas_auto_ativas, tabelas_agendamento_ativas=tabelas_agendamento_ativas,
             resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
             manual_em_execucao=manual_em_execucao
         )
@@ -3029,7 +3061,6 @@ def dashboard():
         flash(f'Erro ao carregar migrações: {str(e)}', 'error')
         return render_template(
             'dashboard.html', migracoes=[], totais={},
-            tabelas_auto_ativas=tabelas_auto_ativas, tabelas_agendamento_ativas=tabelas_agendamento_ativas,
             resumo_auto=resumo_auto, resumo_agendamento=resumo_agendamento,
             manual_em_execucao=manual_em_execucao
         )
@@ -3224,11 +3255,13 @@ def importacao_automatica():
 
 @app.route('/importacao-automatica/<int:tabela_id>/iniciar', methods=['POST'])
 def auto_import_iniciar(tabela_id):
-    """Marca a tabela como 'ativa' — o próprio navegador passa a chamar o ciclo no intervalo configurado."""
+    """Marca a tabela como 'ativa' — o agendador do servidor passa a disparar
+    os ciclos no intervalo configurado (sem depender de tela aberta)."""
     try:
         if not get_auto_import_tabela(tabela_id):
             return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
         atualizar_status_auto_import_tabela(tabela_id, 'ativa')
+        acordar_agendador()
         return jsonify({'status': 'sucesso'})
     except (OperationalError, InterfaceError) as error:
         return handle_db_connection_error(error, api=True)
@@ -4473,30 +4506,17 @@ def _background_agendamento_worker(job_id, tabela_id):
     })
 
 
-@app.route('/api/importacao-automatica/<int:tabela_id>/ciclo', methods=['POST'])
-def api_importacao_automatica_executar_ciclo(tabela_id):
-    """Dispara um ciclo de importação automática em segundo plano e retorna
-    na hora — o progresso é acompanhado via GET .../ciclo/status."""
-    if not is_db_configured():
-        return jsonify({
-            'status': 'erro',
-            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
-            'configurar_banco': url_for('configurar_banco')
-        }), 503
-
+def disparar_ciclo_auto_import(tabela_id):
+    """Dispara um ciclo em segundo plano. Usado pelo agendador do servidor e
+    pelo disparo manual. Retorna (http_status, mensagem)."""
     tabela_cfg = get_auto_import_tabela(tabela_id)
     if not tabela_cfg:
-        return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
-
+        return 404, 'Tabela não encontrada.'
     if tabela_cfg['status'] != 'ativa':
-        return jsonify({'status': 'erro', 'mensagem': 'Esta tabela está parada.'}), 409
+        return 409, 'Esta tabela está parada.'
 
     job_id = _generate_job_id('auto_ciclo', tabela_id)
-    job_existente = get_background_job(job_id)
-    if job_existente and job_existente.get('status') in ('iniciando', 'processando'):
-        return jsonify({'status': 'erro', 'mensagem': 'Já existe um ciclo em andamento para esta tabela.'}), 409
-
-    set_background_job(job_id, {
+    disparou = iniciar_background_job(job_id, {
         'job_id': job_id,
         'tipo': 'auto_ciclo',
         'tabela_id': tabela_id,
@@ -4510,16 +4530,27 @@ def api_importacao_automatica_executar_ciclo(tabela_id):
         'registros_com_erro': 0,
         'log': [],
         'lotes': [],
-    })
+    }, _background_auto_import_ciclo_worker, (job_id, tabela_id))
+    if not disparou:
+        return 409, 'Já existe um ciclo em andamento para esta tabela.'
+    return 200, job_id
 
-    thread = threading.Thread(
-        target=_background_auto_import_ciclo_worker,
-        args=(job_id, tabela_id),
-        daemon=True
-    )
-    thread.start()
 
-    return jsonify({'status': 'sucesso', 'job_id': job_id})
+@app.route('/api/importacao-automatica/<int:tabela_id>/ciclo', methods=['POST'])
+def api_importacao_automatica_executar_ciclo(tabela_id):
+    """Dispara um ciclo manualmente e retorna na hora — o progresso é
+    acompanhado via GET .../ciclo/status."""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    http_status, resultado = disparar_ciclo_auto_import(tabela_id)
+    if http_status != 200:
+        return jsonify({'status': 'erro', 'mensagem': resultado}), http_status
+    return jsonify({'status': 'sucesso', 'job_id': resultado})
 
 
 @app.route('/api/importacao-automatica/<int:tabela_id>/ciclo/status')
@@ -4623,11 +4654,13 @@ def agendar_importacao():
 
 @app.route('/agendar-importacao/<int:tabela_id>/iniciar', methods=['POST'])
 def agendamento_iniciar(tabela_id):
-    """Liga os horários desta tabela (o navegador passa a disparar nos horários configurados)."""
+    """Liga os horários desta tabela (o agendador do servidor dispara nos
+    horários configurados, sem depender de tela aberta)."""
     try:
         if not get_agendamento_tabela(tabela_id):
             return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
         atualizar_status_agendamento_tabela(tabela_id, 'ativa')
+        acordar_agendador()
         return jsonify({'status': 'sucesso'})
     except (OperationalError, InterfaceError) as error:
         return handle_db_connection_error(error, api=True)
@@ -4718,27 +4751,14 @@ def agendamento_execucao_registros(execucao_id):
     )
 
 
-@app.route('/api/agendar-importacao/<int:tabela_id>/executar', methods=['POST'])
-def api_agendamento_executar(tabela_id):
-    """Dispara uma execução completa em segundo plano e retorna na hora —
-    o progresso é acompanhado via GET .../executar/status."""
-    if not is_db_configured():
-        return jsonify({
-            'status': 'erro',
-            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
-            'configurar_banco': url_for('configurar_banco')
-        }), 503
-
-    tabela_cfg = get_agendamento_tabela(tabela_id)
-    if not tabela_cfg:
-        return jsonify({'status': 'erro', 'mensagem': 'Tabela não encontrada.'}), 404
+def disparar_execucao_agendamento(tabela_id):
+    """Dispara uma execução completa em segundo plano. Usado pelo agendador do
+    servidor e pelo botão "Executar agora". Retorna (http_status, mensagem)."""
+    if not get_agendamento_tabela(tabela_id):
+        return 404, 'Tabela não encontrada.'
 
     job_id = _generate_job_id('agendamento', tabela_id)
-    job_existente = get_background_job(job_id)
-    if job_existente and job_existente.get('status') in ('iniciando', 'processando'):
-        return jsonify({'status': 'erro', 'mensagem': 'Já existe uma execução em andamento para esta tabela.'}), 409
-
-    set_background_job(job_id, {
+    disparou = iniciar_background_job(job_id, {
         'job_id': job_id,
         'tipo': 'agendamento',
         'tabela_id': tabela_id,
@@ -4753,16 +4773,27 @@ def api_agendamento_executar(tabela_id):
         'registros_com_erro': 0,
         'log': [],
         'lotes': [],
-    })
+    }, _background_agendamento_worker, (job_id, tabela_id))
+    if not disparou:
+        return 409, 'Já existe uma execução em andamento para esta tabela.'
+    return 200, job_id
 
-    thread = threading.Thread(
-        target=_background_agendamento_worker,
-        args=(job_id, tabela_id),
-        daemon=True
-    )
-    thread.start()
 
-    return jsonify({'status': 'sucesso', 'job_id': job_id})
+@app.route('/api/agendar-importacao/<int:tabela_id>/executar', methods=['POST'])
+def api_agendamento_executar(tabela_id):
+    """Dispara uma execução manual e retorna na hora — o progresso é
+    acompanhado via GET .../executar/status."""
+    if not is_db_configured():
+        return jsonify({
+            'status': 'erro',
+            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
+            'configurar_banco': url_for('configurar_banco')
+        }), 503
+
+    http_status, resultado = disparar_execucao_agendamento(tabela_id)
+    if http_status != 200:
+        return jsonify({'status': 'erro', 'mensagem': resultado}), http_status
+    return jsonify({'status': 'sucesso', 'job_id': resultado})
 
 
 @app.route('/api/agendar-importacao/<int:tabela_id>/executar/status')
@@ -5146,51 +5177,44 @@ def api_background_todos():
     """Retorna os jobs de segundo plano, separados em migrações, importação
     automática e agendar importação — cada um já com o nome da tabela sendo processada."""
     with background_jobs_lock:
-        jobs = list(background_jobs.values())
+        jobs = [dict(job) for job in background_jobs.values()]
 
-    jobs_migracao = []
-    jobs_auto = []
-    jobs_agendamento = []
+    jobs_migracao = [j for j in jobs if j.get('tipo') in ('migracao', 'refresh')]
+    jobs_auto = [j for j in jobs if j.get('tipo') == 'auto_ciclo']
+    jobs_agendamento = [j for j in jobs if j.get('tipo') == 'agendamento']
 
-    for job in jobs:
-        tipo = job.get('tipo')
-        job_enriquecido = dict(job)
+    # Nomes das tabelas: uma consulta por tipo, numa conexão só — este
+    # endpoint é chamado a cada 2s por dashboard aberto, então não pode abrir
+    # uma conexão por job.
+    grupos = (
+        (jobs_migracao, 'migracao_id', 'controle_migracao'),
+        (jobs_auto, 'tabela_id', 'auto_importacao_tabelas'),
+        (jobs_agendamento, 'tabela_id', 'agendamento_importacao_tabelas'),
+    )
 
-        if tipo in ('migracao', 'refresh'):
-            try:
-                migracao_id = job.get('migracao_id')
-                rows = execute_query(
-                    "SELECT tabela_origem, tabela_destino FROM controle_migracao WHERE id = %s",
-                    (migracao_id,)
-                ) if migracao_id else []
-                if rows:
-                    job_enriquecido['tabela_origem'] = rows[0]['tabela_origem']
-                    job_enriquecido['tabela_destino'] = rows[0]['tabela_destino']
-            except Exception:
-                pass
-            jobs_migracao.append(job_enriquecido)
+    def _nomes(conn):
+        nomes = {}
+        for lista, campo_id, tabela in grupos:
+            ids = sorted({j.get(campo_id) for j in lista if j.get(campo_id)})
+            if not ids:
+                continue
+            rows = run_query_with_connection(
+                conn, f"SELECT id, tabela_origem, tabela_destino FROM {tabela} WHERE id = ANY(%s)", (ids,)
+            )
+            nomes[tabela] = {r['id']: r for r in rows}
+        return nomes
 
-        elif tipo == 'auto_ciclo':
-            try:
-                tabela_id = job.get('tabela_id')
-                tabela = get_auto_import_tabela(tabela_id) if tabela_id else None
-                if tabela:
-                    job_enriquecido['tabela_origem'] = tabela['tabela_origem']
-                    job_enriquecido['tabela_destino'] = tabela['tabela_destino']
-            except Exception:
-                pass
-            jobs_auto.append(job_enriquecido)
+    try:
+        nomes = execute_db_operation(_nomes, statement_timeout_ms=10000) if jobs and is_db_configured() else {}
+    except Exception:
+        nomes = {}
 
-        elif tipo == 'agendamento':
-            try:
-                tabela_id = job.get('tabela_id')
-                tabela = get_agendamento_tabela(tabela_id) if tabela_id else None
-                if tabela:
-                    job_enriquecido['tabela_origem'] = tabela['tabela_origem']
-                    job_enriquecido['tabela_destino'] = tabela['tabela_destino']
-            except Exception:
-                pass
-            jobs_agendamento.append(job_enriquecido)
+    for lista, campo_id, tabela in grupos:
+        for job in lista:
+            row = nomes.get(tabela, {}).get(job.get(campo_id))
+            if row:
+                job['tabela_origem'] = row['tabela_origem']
+                job['tabela_destino'] = row['tabela_destino']
 
     return jsonify({
         'jobs_migracao': jobs_migracao,
@@ -5242,10 +5266,151 @@ def api_cancelar_migracao(id):
         return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
 
 # ============================================================
+# AGENDADOR NO SERVIDOR (importação automática + agendar importação)
+# ============================================================
+# Antes quem disparava os ciclos/execuções era o JavaScript das telas
+# (setInterval no navegador): sem aba aberta e usuário logado nada rodava, e
+# cada aba/dashboard aberto disparava de novo. Agora uma única thread no
+# servidor confere a cada AGENDADOR_INTERVALO_SEG o que está vencido e
+# dispara em segundo plano; as telas só acompanham o progresso.
+
+AGENDADOR_INTERVALO_SEG = 15
+# Máximo de ciclos/execuções agendados rodando ao mesmo tempo — o resto
+# espera o próximo tick (disparos manuais não entram nessa conta)
+IMPORTACAO_MAX_SIMULTANEAS = int(os.getenv('IMPORTACAO_MAX_SIMULTANEAS', '5'))
+# Até quanto tempo depois do horário configurado uma execução agendada ainda
+# é disparada (ex.: app reiniciado às 03:20 ainda roda a das 03:00)
+AGENDAMENTO_TOLERANCIA_MIN = int(os.getenv('AGENDAMENTO_TOLERANCIA_MIN', '60'))
+
+_agendador_acordar = threading.Event()
+_agendador_iniciado = False
+_agendador_lock = threading.Lock()
+# Memória do agendador (só deste processo): evita redisparar enquanto o log
+# do ciclo/execução ainda não foi gravado no banco
+_ultimo_disparo_auto = {}           # tabela_id -> time.monotonic()
+_disparos_agendamento_feitos = set()  # (tabela_id, datetime do horário-alvo)
+
+
+def acordar_agendador():
+    """Faz o agendador conferir agora em vez de esperar o próximo tick."""
+    _agendador_acordar.set()
+
+
+def _auto_import_vencidas():
+    """Ids das tabelas ativas cujo intervalo já passou desde o fim do último
+    ciclo, das mais atrasadas pras menos. Tempo medido no relógio do banco."""
+    rows = execute_query("""
+        SELECT t.id, t.intervalo_min,
+               EXTRACT(EPOCH FROM LOCALTIMESTAMP - MAX(c.executado_em)) AS seg_desde_ultimo
+        FROM auto_importacao_tabelas t
+        LEFT JOIN auto_importacao_ciclos c ON c.tabela_id = t.id
+        WHERE t.status = 'ativa'
+        GROUP BY t.id, t.intervalo_min
+    """, statement_timeout_ms=30000)
+    agora = time.monotonic()
+    vencidas = []
+    for r in rows:
+        intervalo_seg = max(int(r['intervalo_min'] or 5), 1) * 60
+        seg = r['seg_desde_ultimo']
+        if seg is not None and float(seg) < intervalo_seg:
+            continue
+        ultimo_disparo = _ultimo_disparo_auto.get(r['id'])
+        if ultimo_disparo is not None and agora - ultimo_disparo < intervalo_seg:
+            continue
+        vencidas.append((float('inf') if seg is None else float(seg), r['id']))
+    return [tabela_id for _, tabela_id in sorted(vencidas, reverse=True)]
+
+
+def _agendamentos_vencidos():
+    """[(tabela_id, horário-alvo)] das tabelas ativas com um horário que já
+    passou (dentro da tolerância) e ainda não rodou desde então."""
+    rows = execute_query("""
+        SELECT t.id, t.horario_1, t.horario_2, t.horario_3, t.horario_4,
+               MAX(e.executado_em) AS ultima_execucao_em, LOCALTIMESTAMP AS agora
+        FROM agendamento_importacao_tabelas t
+        LEFT JOIN agendamento_importacao_execucoes e ON e.tabela_id = t.id
+        WHERE t.status = 'ativa'
+        GROUP BY t.id
+    """, statement_timeout_ms=30000)
+    tolerancia = timedelta(minutes=AGENDAMENTO_TOLERANCIA_MIN)
+    vencidos = []
+    for r in rows:
+        agora = r['agora']
+        ultima = r['ultima_execucao_em']
+        horarios = [r[f'horario_{i}'] for i in range(1, 5) if r[f'horario_{i}'] is not None]
+        # Ontem também conta: horário 23:50 ainda vale às 00:10
+        alvos = [
+            datetime.combine(agora.date() - timedelta(days=dias), h)
+            for h in horarios for dias in (0, 1)
+        ]
+        alvos = [a for a in alvos if a <= agora < a + tolerancia and (ultima is None or ultima < a)]
+        alvos = [a for a in alvos if (r['id'], a) not in _disparos_agendamento_feitos]
+        if alvos:
+            vencidos.append((r['id'], max(alvos)))
+    return vencidos
+
+
+def _agendador_tick():
+    liberar_jobs_orfaos()
+
+    for tabela_id in _auto_import_vencidas():
+        if contar_jobs_importacao_ativos() >= IMPORTACAO_MAX_SIMULTANEAS:
+            return
+        http_status, resultado = disparar_ciclo_auto_import(tabela_id)
+        if http_status == 200:
+            _ultimo_disparo_auto[tabela_id] = time.monotonic()
+
+    for tabela_id, alvo in _agendamentos_vencidos():
+        if contar_jobs_importacao_ativos() >= IMPORTACAO_MAX_SIMULTANEAS:
+            return
+        http_status, resultado = disparar_execucao_agendamento(tabela_id)
+        if http_status == 200:
+            _disparos_agendamento_feitos.add((tabela_id, alvo))
+        elif http_status == 409:
+            # Já tem uma execução dessa tabela rodando — ela cobre este horário
+            _disparos_agendamento_feitos.add((tabela_id, alvo))
+        else:
+            app.logger.warning('Agendamento %s não disparado: %s', tabela_id, resultado)
+
+    # Esquece disparos antigos (já fora de qualquer janela)
+    limite = datetime.now() - timedelta(days=2)
+    _disparos_agendamento_feitos.difference_update(
+        {d for d in _disparos_agendamento_feitos if d[1] < limite}
+    )
+
+
+def _agendador_loop():
+    while True:
+        try:
+            if is_db_configured():
+                _agendador_tick()
+        except Exception:
+            app.logger.exception('Erro no agendador de importações')
+        _agendador_acordar.wait(AGENDADOR_INTERVALO_SEG)
+        _agendador_acordar.clear()
+
+
+def iniciar_agendador_importacoes():
+    """Sobe a thread do agendador (uma vez por processo)."""
+    global _agendador_iniciado
+    with _agendador_lock:
+        if _agendador_iniciado:
+            return
+        _agendador_iniciado = True
+    threading.Thread(target=_agendador_loop, name='agendador-importacoes', daemon=True).start()
+
+
+# ============================================================
 # EXECUÇÃO
 # ============================================================
 
 iniciar_migracao_tabelas_detalhe()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5310)
+    # Com debug=True o reloader do Werkzeug roda este script em dois
+    # processos (vigia + servidor). Só o servidor (WERKZEUG_RUN_MAIN) sobe o
+    # agendador — senão cada ciclo seria disparado duas vezes.
+    debug = True
+    if not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        iniciar_agendador_importacoes()
+    app.run(debug=debug, host='0.0.0.0', port=5310)

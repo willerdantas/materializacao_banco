@@ -197,8 +197,9 @@
             </div>
         </div>
         <div class="form-text" style="padding: 0 16px 16px;">
-            ⚠️ A rotina roda no navegador — mantenha esta aba aberta. Se fechar ou recarregar, os
-            temporizadores reiniciam automaticamente para as tabelas marcadas como "ativa".
+            ℹ️ Os ciclos rodam no servidor, em segundo plano, no intervalo configurado de cada tabela
+            "ativa" — não precisa manter esta aba aberta nem ter alguém logado. Esta tela só acompanha
+            o progresso.
         </div>
     </div>
 </div>
@@ -207,8 +208,9 @@
 {% block extra_js %}
 <script>
 const autoImportLog = document.getElementById('auto-import-log');
-let autoTimers = {};   // { tabelaId: intervalId }
-let autoEmExecucao = {}; // { tabelaId: bool } evita sobrepor ciclos da mesma tabela
+// Último job visto por tabela — pra logar só as transições (início/fim de ciclo)
+const ultimoJobVisto = {}; // { tabelaId: { inicio, status } }
+const ACOMPANHAMENTO_MS = 3000;
 
 document.addEventListener('DOMContentLoaded', () => {
     const initialTime = document.getElementById('auto-log-initial-time');
@@ -243,12 +245,11 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('.auto-tabela-row').forEach(row => {
         row.querySelector('.auto-btn-iniciar')?.addEventListener('click', () => iniciarTabela(row));
         row.querySelector('.auto-btn-parar')?.addEventListener('click', () => pararTabela(row));
-
-        // Retoma o loop automaticamente para tabelas que já estavam "ativa"
-        if (row.dataset.status === 'ativa') {
-            agendarTabela(row);
-        }
     });
+
+    // Só acompanha: quem dispara os ciclos é o agendador do servidor
+    acompanharTodas();
+    setInterval(acompanharTodas, ACOMPANHAMENTO_MS);
 });
 
 function getTime() {
@@ -292,8 +293,7 @@ async function iniciarTabela(row) {
             return;
         }
         setRowUiAtiva(row, true);
-        appendLog(`▶️ ${row.dataset.destino}: rotina iniciada (a cada ${row.dataset.intervaloMin} min).`, 'success');
-        agendarTabela(row);
+        appendLog(`▶️ ${row.dataset.destino}: rotina iniciada — o servidor dispara a cada ${row.dataset.intervaloMin} min.`, 'success');
     } catch (e) {
         appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
     }
@@ -309,7 +309,6 @@ async function pararTabela(row) {
             return;
         }
         setRowUiAtiva(row, false);
-        desagendarTabela(row);
         appendLog(`⏹️ ${row.dataset.destino}: rotina parada.`, 'warning');
     } catch (e) {
         appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
@@ -339,23 +338,6 @@ async function pararTodas() {
     appendLog(`⏹️ Parando ${ativas.length} tabela(s)...`, 'info');
     for (const row of ativas) {
         await pararTabela(row);
-    }
-}
-
-function agendarTabela(row) {
-    const id = row.dataset.id;
-    if (autoTimers[id]) return; // já agendada
-
-    const intervaloMs = (parseInt(row.dataset.intervaloMin, 10) || 5) * 60 * 1000;
-    executarCiclo(row); // roda imediatamente ao iniciar
-    autoTimers[id] = setInterval(() => executarCiclo(row), intervaloMs);
-}
-
-function desagendarTabela(row) {
-    const id = row.dataset.id;
-    if (autoTimers[id]) {
-        clearInterval(autoTimers[id]);
-        delete autoTimers[id];
     }
 }
 
@@ -395,75 +377,71 @@ function incrementarContadorCiclos(row) {
     el.textContent = (parseInt(el.textContent, 10) || 0) + 1;
 }
 
-function aguardar(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+function jobAtivo(job) {
+    return !!job && (job.status === 'iniciando' || job.status === 'processando');
 }
 
-async function executarCiclo(row) {
+function acompanharTodas() {
+    document.querySelectorAll('.auto-tabela-row').forEach(acompanharTabela);
+}
+
+async function acompanharTabela(row) {
     const id = row.dataset.id;
-    if (autoEmExecucao[id]) return; // ciclo anterior ainda rodando
-    if (row.dataset.status !== 'ativa') { desagendarTabela(row); return; }
-
-    autoEmExecucao[id] = true;
-    appendLog(`⏳ ${row.dataset.destino}: iniciando ciclo...`, 'info');
-    marcarExecutando(row, true);
-
+    let job;
     try {
-        // 1) dispara o ciclo em segundo plano
-        const respStart = await fetch(`/api/importacao-automatica/${id}/ciclo`, { method: 'POST' });
-        const dataStart = await parseJsonResponse(respStart);
+        const resp = await fetch(`/api/importacao-automatica/${id}/ciclo/status`);
+        job = await parseJsonResponse(resp);
+    } catch (_) {
+        return; // falha isolada de rede — tenta de novo no próximo acompanhamento
+    }
+    if (!job || job.status === 'inativo') job = null;
 
-        if (!respStart.ok || dataStart.status === 'erro') {
-            appendLog(`✗ ${row.dataset.destino}: ${dataStart.mensagem || 'erro ao iniciar ciclo'}`, 'error');
-            return;
-        }
+    const anterior = ultimoJobVisto[id];
+    ultimoJobVisto[id] = job ? { inicio: job.inicio, status: job.status } : null;
 
-        // 2) acompanha o progresso por lote até terminar
-        let job = null;
-        while (true) {
-            const respStatus = await fetch(`/api/importacao-automatica/${id}/ciclo/status`);
-            job = await parseJsonResponse(respStatus);
+    if (jobAtivo(job)) {
+        if (!jobAtivo(anterior)) appendLog(`⏳ ${row.dataset.destino}: ciclo em andamento no servidor...`, 'info');
+        marcarExecutando(row, true);
+        atualizarProgressoLote(row, job);
+        return;
+    }
 
-            if (!job || job.status === 'inativo') break;
-            atualizarProgressoLote(row, job);
+    marcarExecutando(row, false);
+    // Na primeira leitura (anterior === undefined) só mostra o estado, sem logar
+    // um ciclo antigo; depois disso, loga cada ciclo que terminar
+    if (!job || anterior === undefined) return;
+    if (jobAtivo(anterior) || (anterior && anterior.inicio !== job.inicio)) {
+        logarResultadoCiclo(row, job);
+    }
+}
 
-            if (job.status === 'concluido' || job.status === 'erro' || job.status === 'cancelado') break;
-            await aguardar(1000);
-        }
+function logarResultadoCiclo(row, job) {
+    if (job.status === 'cancelado') {
+        appendLog(`⏹️ ${row.dataset.destino}: ciclo interrompido.`, 'warning');
+        return;
+    }
+    if (job.status === 'erro') {
+        appendLog(`✗ ${row.dataset.destino}: ${job.mensagem || 'erro no ciclo'}`, 'error');
+        return;
+    }
 
-        if (job && job.status === 'cancelado') {
-            appendLog(`⏹️ ${row.dataset.destino}: ciclo interrompido.`, 'warning');
-            return;
-        }
+    incrementarContadorCiclos(row);
 
-        if (!job || job.status === 'erro') {
-            appendLog(`✗ ${row.dataset.destino}: ${(job && job.mensagem) || 'erro no ciclo'}`, 'error');
-            return;
-        }
+    const ultimoIdEl = row.querySelector('.auto-ultimo-id');
+    if (ultimoIdEl && job.ultimo_id_destino != null) {
+        ultimoIdEl.textContent = Number(job.ultimo_id_destino).toLocaleString('pt-BR');
+    }
 
-        incrementarContadorCiclos(row);
+    const partes = [];
+    if (job.registros_inseridos) partes.push(`${job.registros_inseridos} inserido(s)`);
+    if (job.registros_atualizados) partes.push(`${job.registros_atualizados} atualizado(s)`);
+    if (job.registros_com_erro) partes.push(`${job.registros_com_erro} com erro`);
+    const loteInfo = job.total_lotes ? ` [${job.total_lotes} lote(s) de ${job.tamanho_lote}]` : '';
 
-        const ultimoIdEl = row.querySelector('.auto-ultimo-id');
-        if (ultimoIdEl && job.ultimo_id_destino != null) {
-            ultimoIdEl.textContent = Number(job.ultimo_id_destino).toLocaleString('pt-BR');
-        }
-
-        const partes = [];
-        if (job.registros_inseridos) partes.push(`${job.registros_inseridos} inserido(s)`);
-        if (job.registros_atualizados) partes.push(`${job.registros_atualizados} atualizado(s)`);
-        if (job.registros_com_erro) partes.push(`${job.registros_com_erro} com erro`);
-        const loteInfo = job.total_lotes ? ` [${job.total_lotes} lote(s) de ${job.tamanho_lote}]` : '';
-
-        if (partes.length > 0) {
-            appendLog(`✓ ${row.dataset.destino}: ${partes.join(', ')}${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'success');
-        } else {
-            appendLog(`○ ${row.dataset.destino}: nenhum registro novo${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'info');
-        }
-    } catch (e) {
-        appendLog(`✗ ${row.dataset.destino}: ${e.message}`, 'error');
-    } finally {
-        autoEmExecucao[id] = false;
-        marcarExecutando(row, false);
+    if (partes.length > 0) {
+        appendLog(`✓ ${row.dataset.destino}: ${partes.join(', ')}${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'success');
+    } else {
+        appendLog(`○ ${row.dataset.destino}: nenhum registro novo${loteInfo}. Último ID: ${job.ultimo_id_destino}`, 'info');
     }
 }
 </script>

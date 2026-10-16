@@ -222,9 +222,9 @@
             </div>
         </div>
         <div class="form-text" style="padding: 0 16px 16px;">
-            ⚠️ O agendamento roda no navegador — mantenha esta aba aberta (ou o dashboard, se ele também
-            tiver sido configurado pra isso). Se fechar ou recarregar, os horários voltam a ser checados
-            automaticamente para as tabelas marcadas como "ativa".
+            ℹ️ As execuções rodam no servidor, em segundo plano, nos horários configurados de cada tabela
+            "ativa" — não precisa manter esta aba aberta nem ter alguém logado. Se o servidor estiver fora
+            do ar no horário, a execução ainda é feita se ele voltar em até 60 minutos.
         </div>
     </div>
 </div>
@@ -234,7 +234,6 @@
 <script>
 const agendamentoLog = document.getElementById('agendamento-log');
 let agendamentoEmExecucao = {}; // { tabelaId: bool } evita sobrepor execuções da mesma tabela
-let agendamentoJaDisparadoHoje = {}; // { 'tabelaId_HH:MM': true }
 
 document.addEventListener('DOMContentLoaded', () => {
     const initialTime = document.getElementById('agendamento-log-initial-time');
@@ -276,11 +275,11 @@ document.addEventListener('DOMContentLoaded', () => {
         retomarSeJaExecutando(row);
     });
 
-    // Checa os horários a cada 10s, com janela de tolerância de 5 min (veja
-    // horarioDentroDaJanela) — evita perder o disparo por causa de throttle
-    // do navegador em aba em segundo plano.
-    verificarHorarios();
-    setInterval(verificarHorarios, 10000);
+    // Quem dispara nos horários é o agendador do servidor — aqui só detecta
+    // execuções iniciadas por ele pra mostrar o progresso
+    setInterval(() => {
+        document.querySelectorAll('.agendamento-tabela-row').forEach(retomarSeJaExecutando);
+    }, 10000);
 });
 
 async function retomarSeJaExecutando(row) {
@@ -289,7 +288,8 @@ async function retomarSeJaExecutando(row) {
         const resp = await fetch(`/api/agendar-importacao/${id}/executar/status`);
         const job = await parseJsonResponse(resp);
         if (job && (job.status === 'iniciando' || job.status === 'processando')) {
-            appendLog(`🔄 ${row.dataset.destino}: execução em andamento detectada, retomando acompanhamento...`, 'info');
+            if (agendamentoEmExecucao[id]) return; // já acompanhando
+            appendLog(`🔄 ${row.dataset.destino}: execução em andamento no servidor, acompanhando...`, 'info');
             acompanharExecucao(row);
         }
     } catch (_) { /* sem job ativo — segue normal */ }
@@ -387,43 +387,6 @@ async function pararTodas() {
     for (const row of ativas) {
         await pararTabela(row);
     }
-}
-
-function dataDeHojeStr() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-// Em vez de exigir que o check bata no minuto EXATO (o que falha se a aba
-// estiver em segundo plano e o navegador atrasar o setInterval — comum em
-// abas inativas por horas, esperando um horário como 03:00), aceita disparar
-// em até 5 minutos depois do horário configurado. A trava por dia
-// (agendamentoJaDisparadoHoje) garante que não dispara mais de uma vez.
-function horarioDentroDaJanela(horario) {
-    const agora = new Date();
-    const [h, m] = horario.split(':').map(Number);
-    if (Number.isNaN(h) || Number.isNaN(m)) return false;
-    const alvo = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate(), h, m, 0);
-    const diffMs = agora - alvo;
-    return diffMs >= 0 && diffMs < 5 * 60 * 1000;
-}
-
-function verificarHorarios() {
-    const hoje = dataDeHojeStr();
-    document.querySelectorAll('.agendamento-tabela-row').forEach(row => {
-        if (row.dataset.status !== 'ativa') return;
-
-        let horarios = [];
-        try { horarios = JSON.parse(row.dataset.horarios || '[]'); } catch (_) { horarios = []; }
-
-        horarios.forEach(h => {
-            const chave = `${row.dataset.id}_${h}_${hoje}`;
-            if (horarioDentroDaJanela(h) && !agendamentoJaDisparadoHoje[chave]) {
-                agendamentoJaDisparadoHoje[chave] = true;
-                executarExecucao(row, false);
-            }
-        });
-    });
 }
 
 function marcarExecutando(row, executando) {
