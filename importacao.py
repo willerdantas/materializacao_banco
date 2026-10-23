@@ -1836,7 +1836,7 @@ def garantir_tabelas_e_executar(operacao):
     manualmente em "Criar Tabelas de Controle" antes de usar a tela."""
     try:
         return operacao()
-    except psycopg2.errors.UndefinedTable:
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
         criar_tabelas_controle()
         return operacao()
 
@@ -1968,36 +1968,37 @@ def get_agendamento_tabela(tabela_id):
     return garantir_tabelas_e_executar(_buscar)
 
 
-def criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios):
+def criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios, id_inicio=1):
     """Cadastra uma nova tabela. `horarios` é uma lista de até 4 strings 'HH:MM' (ou None)."""
     h = (list(horarios) + [None, None, None, None])[:4]
     def _inserir():
         result = execute_query(
             """
             INSERT INTO agendamento_importacao_tabelas
-                (tabela_origem, tabela_destino, campo_id, tamanho_lote,
+                (tabela_origem, tabela_destino, campo_id, tamanho_lote, id_inicio,
                  horario_1, horario_2, horario_3, horario_4, status, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'parada', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'parada', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             RETURNING *
             """,
-            (tabela_origem, tabela_destino, campo_id, tamanho_lote, h[0], h[1], h[2], h[3])
+            (tabela_origem, tabela_destino, campo_id, tamanho_lote, id_inicio, h[0], h[1], h[2], h[3])
         )
         return result[0]
     return garantir_tabelas_e_executar(_inserir)
 
 
-def atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios):
+def atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios,
+                                 id_inicio=1):
     """Atualiza a configuração (status e histórico não mudam)."""
     h = (list(horarios) + [None, None, None, None])[:4]
     garantir_tabelas_e_executar(lambda: execute_query(
         """
         UPDATE agendamento_importacao_tabelas
-        SET tabela_origem = %s, tabela_destino = %s, campo_id = %s, tamanho_lote = %s,
+        SET tabela_origem = %s, tabela_destino = %s, campo_id = %s, tamanho_lote = %s, id_inicio = %s,
             horario_1 = %s, horario_2 = %s, horario_3 = %s, horario_4 = %s,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
         """,
-        (tabela_origem, tabela_destino, campo_id, tamanho_lote, h[0], h[1], h[2], h[3], tabela_id),
+        (tabela_origem, tabela_destino, campo_id, tamanho_lote, id_inicio, h[0], h[1], h[2], h[3], tabela_id),
         fetch=False
     ))
 
@@ -2594,6 +2595,10 @@ def criar_tabelas_controle():
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             """)  # status: 'parada' | 'ativa' — controla se os horários estão ligados
+            cur.execute("""
+                ALTER TABLE agendamento_importacao_tabelas
+                ADD COLUMN IF NOT EXISTS id_inicio BIGINT NOT NULL DEFAULT 1
+            """)  # primeiro ID da faixa verificada em cada execução
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS agendamento_importacao_execucoes (
                     id SERIAL PRIMARY KEY,
@@ -4435,21 +4440,24 @@ def _background_agendamento_worker(job_id, tabela_id):
         # banco em tabelas grandes (psycopg2 não usa autocommit por padrão).
         conn.commit()
 
-        # 3. Faixa COMPLETA: 1 até o maior ID entre origem e destino — sem
-        #    isso, um ID que só existe no destino (e deveria ser deletado)
-        #    nunca entraria na lista de verificação.
+        # 3. Faixa: do "A partir do ID" configurado (padrão 1) até o maior ID
+        #    entre origem e destino — sem o maior dos dois, um ID que só existe
+        #    no destino (e deveria ser deletado) nunca entraria na verificação.
+        #    IDs abaixo do início ficam fora: nem atualizados nem deletados.
         #
         # IMPORTANTE: NÃO materializa a lista inteira de IDs em memória (um
         # `range(1, id_fim + 1)` convertido em lista de strings, pra uma
         # tabela com milhões de linhas, consome memória e CPU excessivos —
         # foi isso que travou o banco). Cada lote calcula só os IDs que
         # precisa, na hora, via slice do range.
+        id_inicio = max(int(tabela_cfg.get('id_inicio') or 1), 1)
         id_fim = max(ultimo_id_destino, ultimo_id_origem)
-        total_lotes = math.ceil(id_fim / tamanho_lote) if id_fim > 0 else 0
+        total_ids = max(id_fim - id_inicio + 1, 0)
+        total_lotes = math.ceil(total_ids / tamanho_lote)
 
         def ids_do_lote(lote_idx):
-            inicio = lote_idx * tamanho_lote + 1
-            fim = min((lote_idx + 1) * tamanho_lote, id_fim)
+            inicio = id_inicio + lote_idx * tamanho_lote
+            fim = min(inicio + tamanho_lote - 1, id_fim)
             return [str(v) for v in range(inicio, fim + 1)]
 
         # 4. Staging em `temp` com prefixo a_ — mesma estrutura da migração
@@ -4473,11 +4481,11 @@ def _background_agendamento_worker(job_id, tabela_id):
             'total_lotes': total_lotes,
             'lote_atual': 0,
             'tamanho_lote': tamanho_lote,
-            'mensagem': f'{id_fim} id(s) a verificar em {total_lotes} lote(s)...',
+            'mensagem': f'{total_ids} id(s) a verificar em {total_lotes} lote(s)...',
         })
         _log_execucao(
             job_id, 'info',
-            f'{id_fim} id(s) a verificar (faixa completa 1-{id_fim}) em {total_lotes} lote(s).'
+            f'{total_ids} id(s) a verificar (faixa {id_inicio}-{id_fim}) em {total_lotes} lote(s).'
         )
 
         # Cria o registro da execução JÁ AGORA (contadores em zero, status
@@ -4786,6 +4794,15 @@ def agendar_importacao():
             return redirect(url_for('agendar_importacao'))
         tamanho_lote = min(tamanho_lote, MAX_TAMANHO_LOTE)
 
+        try:
+            id_inicio = int((request.form.get('id_inicio') or '').strip() or 1)
+        except ValueError:
+            flash('"A partir do ID" deve ser um número inteiro.', 'error')
+            return redirect(url_for('agendar_importacao'))
+        if id_inicio < 1:
+            flash('"A partir do ID" deve ser 1 ou maior.', 'error')
+            return redirect(url_for('agendar_importacao'))
+
         if not any(horarios):
             flash('Informe pelo menos um horário de execução.', 'error')
             return redirect(url_for('agendar_importacao'))
@@ -4802,10 +4819,11 @@ def agendar_importacao():
                 tabela_id = int(tabela_id_raw)
                 if not get_agendamento_tabela(tabela_id):
                     raise ValueError('Tabela não encontrada para edição.')
-                atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios)
+                atualizar_agendamento_tabela(tabela_id, tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios,
+                                             id_inicio)
                 flash(f'Tabela "{tabela_destino}" atualizada.', 'success')
             else:
-                criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios)
+                criar_agendamento_tabela(tabela_origem, tabela_destino, campo_id, tamanho_lote, horarios, id_inicio)
                 flash(f'Tabela "{tabela_destino}" adicionada ao Agendar Importação.', 'success')
 
             if tabela_criada_agora:

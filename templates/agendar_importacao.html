@@ -98,6 +98,10 @@
                     <input type="number" name="tamanho_lote" class="form-control" value="{{ tabela_edicao.tamanho_lote if tabela_edicao else 500 }}" min="1" max="5000">
                 </div>
                 <div class="form-group">
+                    <label class="form-label" title="Cada execução verifica do ID informado até o maior ID entre origem e destino. IDs abaixo dele não são atualizados nem deletados.">A partir do ID</label>
+                    <input type="number" name="id_inicio" class="form-control" value="{{ tabela_edicao.id_inicio if tabela_edicao and tabela_edicao.id_inicio else 1 }}" min="1" step="1" required>
+                </div>
+                <div class="form-group">
                     <label class="form-label" style="font-size: 0.75rem;">Horário 1</label>
                     <input type="time" name="horario_1" class="form-control" value="{{ (tabela_edicao.horario_1|string)[:5] if tabela_edicao and tabela_edicao.horario_1 else '' }}">
                 </div>
@@ -152,6 +156,7 @@
                         <th>Destino</th>
                         <th>Horários</th>
                         <th style="text-align: center;">Lote</th>
+                        <th style="text-align: right;">A partir do ID</th>
                         <th style="text-align: center;">Execuções</th>
                         <th style="text-align: right;">Último ID</th>
                         <th style="text-align: center;">Status</th>
@@ -169,6 +174,7 @@
                         <td>{{ t.tabela_destino }}</td>
                         <td>{{ horarios_lista|join(', ') if horarios_lista else '-' }}</td>
                         <td style="text-align: center;">{{ t.tamanho_lote }}</td>
+                        <td style="text-align: right;">{{ "{:,}".format(t.id_inicio or 1).replace(",", ".") }}</td>
                         <td style="text-align: center;" class="agendamento-execucoes-count">{{ t.total_execucoes }}</td>
                         <td style="text-align: right;" class="agendamento-ultimo-id">
                             {{ "{:,}".format(t.ultimo_id_destino).replace(",", ".") if t.ultimo_id_destino is not none else '-' }}
