@@ -1,7 +1,7 @@
 # app.py - Aplicação Flask para Controle de Migração
 # ============================================================
 
-from flask import Flask, render_template, request, jsonify, flash, redirect, url_for, session
+from flask import Flask, render_template, request, jsonify, flash, redirect, url_for, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet, InvalidToken
 import json
@@ -793,6 +793,84 @@ def persist_fdw_config(fdw_config):
 
 
 # ============================================================
+# LOGO DO SISTEMA
+# ============================================================
+# A logo é uma variável do sistema (`logo_url` nos templates): a enviada pela
+# tela Configurar Banco fica em data/ (volume persistido do Docker); sem
+# nenhuma enviada, vale a logo padrão em static/.
+
+LOGO_PADRAO = os.path.join(app.root_path, 'static', 'logo_hcasg.png')
+LOGO_NOME_ARQUIVO = 'logo_sistema'
+LOGO_MAX_BYTES = 2 * 1024 * 1024
+# Só formatos de imagem raster, conferidos pelo conteúdo (não pela extensão).
+# SVG fica de fora: pode carregar script e seria servido pelo mesmo domínio.
+LOGO_ASSINATURAS = (
+    ('png', lambda b: b.startswith(b'\x89PNG\r\n\x1a\n')),
+    ('jpg', lambda b: b.startswith(b'\xff\xd8\xff')),
+    ('gif', lambda b: b[:6] in (b'GIF87a', b'GIF89a')),
+    ('webp', lambda b: b[:4] == b'RIFF' and b[8:12] == b'WEBP'),
+)
+
+
+def caminho_logo_personalizada():
+    """Caminho da logo enviada pelo administrador, ou None se não houver."""
+    for extensao, _ in LOGO_ASSINATURAS:
+        caminho = os.path.join(APP_DATA_DIR, f'{LOGO_NOME_ARQUIVO}.{extensao}')
+        if os.path.isfile(caminho):
+            return caminho
+    return None
+
+
+def caminho_logo_atual():
+    return caminho_logo_personalizada() or LOGO_PADRAO
+
+
+def salvar_logo(conteudo):
+    """Valida e grava a nova logo. Levanta ValueError com mensagem pro usuário."""
+    if not conteudo:
+        raise ValueError('Selecione um arquivo de imagem.')
+    if len(conteudo) > LOGO_MAX_BYTES:
+        raise ValueError(f'A imagem passa do limite de {LOGO_MAX_BYTES // (1024 * 1024)} MB.')
+    extensao = next((ext for ext, confere in LOGO_ASSINATURAS if confere(conteudo)), None)
+    if extensao is None:
+        raise ValueError('Formato não suportado. Envie PNG, JPG, GIF ou WEBP.')
+
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    destino = os.path.join(APP_DATA_DIR, f'{LOGO_NOME_ARQUIVO}.{extensao}')
+    temporario = destino + '.tmp'
+    with open(temporario, 'wb') as arquivo:
+        arquivo.write(conteudo)
+    os.replace(temporario, destino)  # troca atômica: nunca serve meio arquivo
+
+    # Remove a logo anterior se ela era de outro formato
+    for ext, _ in LOGO_ASSINATURAS:
+        antigo = os.path.join(APP_DATA_DIR, f'{LOGO_NOME_ARQUIVO}.{ext}')
+        if ext != extensao and os.path.isfile(antigo):
+            os.remove(antigo)
+
+
+def restaurar_logo_padrao():
+    caminho = caminho_logo_personalizada()
+    while caminho:
+        os.remove(caminho)
+        caminho = caminho_logo_personalizada()
+
+
+@app.context_processor
+def inject_logo():
+    """`logo_url` para todos os templates — com a data do arquivo na URL pra
+    o navegador não continuar mostrando a logo antiga do cache."""
+    try:
+        versao = int(os.path.getmtime(caminho_logo_atual()))
+    except OSError:
+        versao = 0
+    return {
+        'logo_url': url_for('logo_sistema', v=versao),
+        'logo_personalizada': caminho_logo_personalizada() is not None,
+    }
+
+
+# ============================================================
 # USUÁRIOS E PERFIS DE ACESSO
 # ============================================================
 # Perfis suportados:
@@ -868,11 +946,12 @@ def excluir_usuario(user_id):
 
 
 # Endpoints acessíveis sem login (nome da view Flask, não a URL)
-PUBLIC_ENDPOINTS = {'login', 'logout', 'static'}
+PUBLIC_ENDPOINTS = {'login', 'logout', 'static', 'logo_sistema'}
 
 # Endpoints restritos ao perfil administrador
 ADMIN_ONLY_ENDPOINTS = {
     'configurar_banco', 'usar_conexao_salva', 'excluir_conexao_salva',
+    'testar_conexao_banco', 'testar_fdw_route', 'alterar_logo_route', 'restaurar_logo_route',
     'criar_banco_local_route', 'criar_fdw_route', 'criar_schema_temp_route', 'revisar_tabelas_route',
     'usuarios', 'excluir_usuario_route',
 }
@@ -2872,6 +2951,119 @@ def criar_fdw_route():
         flash(f'Erro ao criar o FDW: {str(e)}', 'error')
 
     return redirect(url_for('configurar_banco'))
+
+
+def _testar_origem_direta(origem, porta):
+    """Etapa 1: o app conecta direto na origem com os dados informados."""
+    try:
+        conexao = psycopg2.connect(
+            host=origem['host'], port=porta, dbname=origem['database'],
+            user=origem['user'], password=origem['password'],
+            connect_timeout=int(os.getenv('DB_TEST_CONNECT_TIMEOUT', '8')),
+        )
+    except Exception as error:  # noqa: BLE001 - qualquer erro do driver vira mensagem
+        return False, f'Origem: falha ao conectar em {origem["host"]}:{porta}/{origem["database"]} — {error}'
+    try:
+        with conexao.cursor() as cur:
+            cur.execute(
+                'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s',
+                (origem['schema_remoto'],)
+            )
+            total = cur.fetchone()[0]
+    finally:
+        conexao.close()
+    if total == 0:
+        return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas o schema '
+                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views (ou o usuário não tem acesso).')
+    return True, (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
+                  f'{total} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".')
+
+
+def _testar_via_fdw(schema_local):
+    """Etapa 2: consulta real pelo FDW já criado no banco local — confirma que
+    o servidor PostgreSQL local alcança a origem (é o caminho das importações)."""
+    if not is_db_configured():
+        return None, 'FDW: banco local não configurado — teste pelo FDW não executado.'
+    server_name = f'fdw_srv_{schema_local}'
+
+    def _operacao(conn):
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
+            if not cur.fetchone():
+                return None, f'FDW: servidor "{server_name}" ainda não foi criado — clique em "Criar / Atualizar FDW".'
+            cur.execute("""
+                SELECT c.relname FROM pg_foreign_table ft
+                JOIN pg_class c ON c.oid = ft.ftrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s ORDER BY c.relname LIMIT 1
+            """, (schema_local,))
+            row = cur.fetchone()
+            if not row:
+                return False, f'FDW: nenhuma tabela importada no schema local "{schema_local}".'
+            tabela = f'{quote_identifier(schema_local)}.{quote_identifier(row[0])}'
+            cur.execute(f'SELECT 1 FROM {tabela} LIMIT 1')
+            cur.fetchall()
+            return True, f'FDW: consulta pelo servidor local OK ({schema_local}.{row[0]}).'
+
+    try:
+        return execute_db_operation(_operacao, statement_timeout_ms=15000)
+    except Exception as error:  # noqa: BLE001
+        return False, f'FDW: falha ao consultar pelo servidor local — {error}'
+
+
+@app.route('/configurar-banco/testar-fdw', methods=['POST'])
+def testar_fdw_route():
+    """Testa, via AJAX, a origem do FDW (direto e pelo FDW criado) sem salvar nada."""
+    fdw_atual = get_fdw_config()
+    origem = {
+        'host': (request.form.get('fdw_host') or '').strip(),
+        'database': (request.form.get('fdw_database') or '').strip(),
+        'user': (request.form.get('fdw_user') or '').strip(),
+        # Senha em branco = usa a salva (mesmo padrão do botão "Criar / Atualizar FDW")
+        'password': request.form.get('fdw_password') or fdw_atual.get('password') or '',
+        'schema_remoto': (request.form.get('fdw_schema_remoto') or 'public').strip(),
+        'schema_local': (request.form.get('fdw_schema_local') or 'fdw_externo').strip(),
+    }
+    if not origem['host'] or not origem['database'] or not origem['user'] or not origem['password']:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe host, banco, usuário e senha da origem.'})
+    try:
+        porta = int((request.form.get('fdw_port') or '5432').strip())
+    except ValueError:
+        return jsonify({'sucesso': False, 'mensagem': 'Informe uma porta válida.'})
+
+    direto_ok, direto_msg = _testar_origem_direta(origem, porta)
+    fdw_ok, fdw_msg = _testar_via_fdw(origem['schema_local'])
+    # FDW ainda não criado (None) não reprova o teste — só a etapa que rodou e falhou
+    return jsonify({'sucesso': direto_ok and fdw_ok is not False, 'mensagem': f'{direto_msg}\n{fdw_msg}'})
+
+
+@app.route('/logo')
+def logo_sistema():
+    """Serve a logo atual (personalizada ou a padrão)."""
+    return send_file(caminho_logo_atual(), max_age=0)
+
+
+@app.route('/configurar-banco/logo', methods=['POST'])
+def alterar_logo_route():
+    arquivo = request.files.get('logo')
+    try:
+        salvar_logo(arquivo.read(LOGO_MAX_BYTES + 1) if arquivo else b'')
+        flash('Logo do sistema atualizada.', 'success')
+    except ValueError as error:
+        flash(str(error), 'error')
+    except OSError as error:
+        flash(f'Não foi possível gravar a logo: {error}', 'error')
+    return redirect(url_for('configurar_banco') + '#logo-sistema')
+
+
+@app.route('/configurar-banco/logo/restaurar', methods=['POST'])
+def restaurar_logo_route():
+    try:
+        restaurar_logo_padrao()
+        flash('Logo padrão restaurada.', 'success')
+    except OSError as error:
+        flash(f'Não foi possível remover a logo personalizada: {error}', 'error')
+    return redirect(url_for('configurar_banco') + '#logo-sistema')
 
 
 @app.route('/configurar-banco/criar-schema-temp', methods=['POST'])

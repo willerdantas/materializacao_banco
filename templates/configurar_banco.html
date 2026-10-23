@@ -138,7 +138,7 @@
             <button type="submit" class="btn btn-primary btn-lg">
                 <span>{{ 'Atualizar conexão' if db_config.profile_id else 'Salvar conexão' }}</span>
             </button>
-            <button type="button" id="btn-testar-conexao" class="btn btn-outline" onclick="testarConexaoBanco()">
+            <button type="button" id="btn-testar-conexao" class="btn btn-outline" onclick="testarConexao('btn-testar-conexao', 'resultado-teste-conexao', '{{ url_for("testar_conexao_banco") }}')">
                 <span>Testar conexão</span>
             </button>
             <a href="{{ url_for('dashboard') }}" class="btn btn-outline">
@@ -249,7 +249,21 @@
                     Prefixo usado nas migrações, ex: <code>{{ fdw_config.schema_local or 'fdw_externo' }}.v_paciente</code>.
                 </div>
             </div>
-            <button type="submit" class="btn btn-primary mt-2">Criar / Atualizar FDW</button>
+            <div id="resultado-teste-fdw" class="alert" style="display: none; margin: 12px 0 0;">
+                <span class="alert-icon"></span>
+                <div class="alert-mensagem" style="white-space: pre-line;"></div>
+            </div>
+            <div class="btn-group mt-2">
+                <button type="submit" class="btn btn-primary">Criar / Atualizar FDW</button>
+                <button type="button" id="btn-testar-fdw" class="btn btn-outline"
+                        onclick="testarConexao('btn-testar-fdw', 'resultado-teste-fdw', '{{ url_for("testar_fdw_route") }}')">
+                    <span>Testar conexão FDW</span>
+                </button>
+            </div>
+            <div class="form-text">
+                O teste confere a origem direto com os dados acima (senha em branco usa a salva) e
+                faz uma consulta pelo FDW já criado no banco local — que é o caminho usado nas importações.
+            </div>
         </form>
     </div>
 
@@ -376,6 +390,43 @@
     </div>
     {% endif %}
 </div>
+
+<div class="card animate-fade-in" id="logo-sistema">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Logo do sistema</h2>
+            <p class="card-subtitle">Imagem exibida no cabeçalho de todas as telas.</p>
+        </div>
+        <span class="status status-{{ 'concluido' if logo_personalizada else 'pendente' }}">
+            {{ 'Personalizada' if logo_personalizada else 'Padrão' }}
+        </span>
+    </div>
+
+    <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap; padding: 0 16px 16px;">
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; background: #fff;">
+            <img src="{{ logo_url }}" alt="Logo atual" style="max-height: 80px; max-width: 240px; display: block;">
+        </div>
+        <div style="flex: 1; min-width: 260px;">
+            <form method="POST" action="{{ url_for('alterar_logo_route') }}" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label class="form-label">Nova logo</label>
+                    <input type="file" name="logo" class="form-control"
+                           accept="image/png,image/jpeg,image/gif,image/webp" required>
+                    <div class="form-text">PNG, JPG, GIF ou WEBP, até 2 MB. Fica salva em <code>data/</code> e não se perde ao atualizar o sistema.</div>
+                </div>
+                <div class="btn-group mt-2">
+                    <button type="submit" class="btn btn-primary">Alterar logo</button>
+                </div>
+            </form>
+            {% if logo_personalizada %}
+            <form method="POST" action="{{ url_for('restaurar_logo_route') }}" style="margin-top: 8px;"
+                  onsubmit="return confirm('Voltar para a logo padrão?');">
+                <button type="submit" class="btn btn-outline">Restaurar logo padrão</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -397,9 +448,11 @@ function alternarModoConexao() {
 
 document.addEventListener('DOMContentLoaded', alternarModoConexao);
 
-async function testarConexaoBanco() {
-    const botao = document.getElementById('btn-testar-conexao');
-    const resultado = document.getElementById('resultado-teste-conexao');
+// Teste via AJAX dos dados do formulário do botão, sem salvar nada
+// (usado pela conexão do banco e pelo FDW)
+async function testarConexao(botaoId, resultadoId, url) {
+    const botao = document.getElementById(botaoId);
+    const resultado = document.getElementById(resultadoId);
     const icone = resultado.querySelector('.alert-icon');
     const mensagem = resultado.querySelector('.alert-mensagem');
 
@@ -411,7 +464,7 @@ async function testarConexaoBanco() {
     resultado.style.display = 'none';
 
     try {
-        const resposta = await fetch('{{ url_for("testar_conexao_banco") }}', {
+        const resposta = await fetch(url, {
             method: 'POST',
             body: dadosForm
         });
