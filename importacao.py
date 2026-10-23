@@ -1197,7 +1197,7 @@ def update_migration_record(migracao_id, source_table, target_table, key_column)
 def refresh_migration_batches(migration_id):
     """Atualiza a consulta de diferenças e retorna os totais recalculados da migração."""
     result = execute_query(
-        "SELECT * FROM public.atualizar_lotes_migracao(%s)",
+        "SELECT * FROM atualizar_lotes_migracao(%s)",
         (migration_id,),
         statement_timeout_ms=1800000  # 30 minutos para tabelas grandes
     )
@@ -1232,7 +1232,7 @@ def _background_refresh_batches_worker(job_id, migration_id):
 
             # Preparar colunas e obter COUNT + MAX(id) — sem carregar todos os IDs
             info = execute_query(
-                "SELECT * FROM public.preparar_colunas_migracao(%s)",
+                "SELECT * FROM preparar_colunas_migracao(%s)",
                 (migration_id,),
                 statement_timeout_ms=600000
             )[0]
@@ -2416,7 +2416,7 @@ def revisar_tabelas_controle_importacao():
     recria tabelas de detalhe erradas e aplica a retenção de logs.
     Retorna a lista de mensagens do que foi feito."""
     criar_tabelas_controle()
-    acoes = ['Tabelas, colunas e índices de controle verificados/criados.']
+    acoes = ['Tabelas, colunas, índices e funções SQL de controle verificados/criados no schema de destino.']
     acoes += migrar_tabelas_detalhe_para_bigint()
 
     removidos = execute_db_operation(
@@ -2432,6 +2432,11 @@ def revisar_tabelas_controle_importacao():
 
 
 def _migrar_tabelas_detalhe_worker():
+    try:
+        # Tabelas de controle + funções SQL no schema de destino (idempotente)
+        criar_tabelas_controle()
+    except Exception:
+        app.logger.exception('Falha ao criar tabelas/funções de controle na subida')
     try:
         acoes = migrar_tabelas_detalhe_para_bigint()
         if acoes:
@@ -2474,6 +2479,39 @@ def criar_banco_local():
         return not ja_existia
     finally:
         conn.close()
+
+
+# Funções SQL da migração em lotes — instaladas no schema de destino
+# configurado (não em public), junto com as tabelas de controle.
+ARQUIVO_FUNCOES_MIGRACAO = os.path.join(app.root_path, 'sql', 'funcoes_migracao.sql')
+FUNCOES_MIGRACAO = (
+    'atualizar_lotes_migracao', 'preparar_colunas_migracao', 'inicializar_migracao',
+    'processar_lote', 'processar_registro', 'verificar_progresso', 'finalizar_migracao',
+)
+
+
+def instalar_funcoes_migracao(conn):
+    """Cria/atualiza (CREATE OR REPLACE) as funções de sql/funcoes_migracao.sql
+    no schema de destino e fixa o search_path de cada uma nesse schema — assim
+    elas sempre acham controle_migracao dali, venha a chamada de onde vier."""
+    schema = (get_db_config().get('schema_destino') or 'public').strip()
+    schema_sql = quote_identifier(schema)
+    with open(ARQUIVO_FUNCOES_MIGRACAO, encoding='utf-8') as arquivo:
+        script = arquivo.read()
+
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS {schema_sql}')
+        # Só o schema de destino: os CREATE sem schema caem nele, nunca em public
+        cur.execute(f'SET LOCAL search_path = {schema_sql}')
+        cur.execute(script)
+        cur.execute("""
+            SELECT p.oid::regprocedure::text
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = %s AND p.proname = ANY(%s)
+        """, (schema, list(FUNCOES_MIGRACAO)))
+        for (assinatura,) in cur.fetchall():
+            cur.execute(f'ALTER FUNCTION {schema_sql}.{assinatura} SET search_path = {schema_sql}, public')
+    conn.commit()
 
 
 def criar_tabelas_controle():
@@ -2519,6 +2557,19 @@ def criar_tabelas_controle():
                 CREATE INDEX IF NOT EXISTS idx_controle_migracao_lotes_migracao_status
                 ON controle_migracao_lotes (migracao_id, status)
             """)  # acelera os filtros por status usados em /api/registros
+            # Colunas usadas pelas funções de sql/funcoes_migracao.sql que o
+            # CREATE acima não tinha (instalações novas e antigas)
+            cur.execute("""
+                ALTER TABLE controle_migracao
+                ADD COLUMN IF NOT EXISTS sql_colunas_update TEXT,
+                ADD COLUMN IF NOT EXISTS sql_colunas_update_where TEXT
+            """)
+            cur.execute("""
+                ALTER TABLE controle_migracao_lotes
+                ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ALTER COLUMN status SET DEFAULT 'pendente'
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_controle_status ON controle_migracao (status)")
 
             # ---- Importação Automática: tabelas configuradas + histórico de ciclos ----
             cur.execute("""
@@ -2636,6 +2687,7 @@ def criar_tabelas_controle():
         conn.commit()
 
     execute_db_operation(_operacao, statement_timeout_ms=60000)
+    execute_db_operation(instalar_funcoes_migracao, statement_timeout_ms=60000)
 
 
 def garantir_tabelas_controle_no_schema_ativo():
@@ -3632,27 +3684,27 @@ def api_processar_lote():
         def processar_lote_na_mesma_conexao(conn):
             result = run_query_with_connection(
                 conn,
-                "SELECT * FROM public.processar_lote(%s, %s)",
+                "SELECT * FROM processar_lote(%s, %s)",
                 (migracao_id, numero_lote)
             )[0]
 
             progresso = run_query_with_connection(
                 conn,
-                "SELECT * FROM public.verificar_progresso(%s)",
+                "SELECT * FROM verificar_progresso(%s)",
                 (migracao_id,)
             )[0]
 
             if progresso['registros_processados'] >= progresso['total_registros']:
                 run_query_with_connection(
                     conn,
-                    "SELECT public.finalizar_migracao(%s)",
+                    "SELECT finalizar_migracao(%s)",
                     (migracao_id,),
                     fetch=False
                 )
                 result['concluido'] = True
                 progresso = run_query_with_connection(
                     conn,
-                    "SELECT * FROM public.verificar_progresso(%s)",
+                    "SELECT * FROM verificar_progresso(%s)",
                     (migracao_id,)
                 )[0]
 
@@ -3755,7 +3807,7 @@ def api_processar_registro():
                     """, (migracao_id,))
 
                 # 5) Buscar progresso
-                cur.execute("SELECT * FROM public.verificar_progresso(%s)", (migracao_id,))
+                cur.execute("SELECT * FROM verificar_progresso(%s)", (migracao_id,))
                 progresso = cur.fetchone()
 
             result = {
@@ -5028,7 +5080,7 @@ def api_progresso(id):
 
     try:
         result = execute_query(
-            "SELECT * FROM public.verificar_progresso(%s)",
+            "SELECT * FROM verificar_progresso(%s)",
             (id,)
         )[0]
         return jsonify(result)
@@ -5083,7 +5135,7 @@ def api_processar_automatico():
             numero_lote = lote_inicial + i
             result = run_query_with_connection(
                 conn,
-                "SELECT * FROM public.processar_lote(%s, %s)",
+                "SELECT * FROM processar_lote(%s, %s)",
                 (migracao_id, numero_lote)
             )[0]
 
@@ -5092,7 +5144,7 @@ def api_processar_automatico():
             try:
                 progresso = run_query_with_connection(
                     conn,
-                    "SELECT * FROM public.verificar_progresso(%s)",
+                    "SELECT * FROM verificar_progresso(%s)",
                     (migracao_id,)
                 )[0]
                 result['progresso'] = dict(progresso)
@@ -5614,13 +5666,14 @@ def iniciar_agendador_importacoes():
 # EXECUÇÃO
 # ============================================================
 
-iniciar_migracao_tabelas_detalhe()
-
 if __name__ == '__main__':
     # Com debug=True o reloader do Werkzeug roda este script em dois
-    # processos (vigia + servidor). Só o servidor (WERKZEUG_RUN_MAIN) sobe o
-    # agendador — senão cada ciclo seria disparado duas vezes.
+    # processos (vigia + servidor). Só o servidor (WERKZEUG_RUN_MAIN) sobe as
+    # rotinas de fundo — senão cada ciclo seria disparado duas vezes. Ficam
+    # aqui (e não no import do módulo) pra que importar o app — em testes ou
+    # scripts — nunca dispare DDL nem importações no banco configurado.
     debug = True
     if not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        iniciar_migracao_tabelas_detalhe()
         iniciar_agendador_importacoes()
     app.run(debug=debug, host='0.0.0.0', port=5310)

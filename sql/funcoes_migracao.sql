@@ -1,149 +1,20 @@
 -- ============================================================
--- SISTEMA DE MIGRACAO EM LOTES PARA POSTGRESQL - REVISAO
+-- FUNÇÕES DA MIGRAÇÃO EM LOTES (PostgreSQL)
+-- ============================================================
+-- Instaladas AUTOMATICAMENTE pelo app (instalar_funcoes_migracao) no schema
+-- de destino configurado em "Configurar Banco" (ex.: integra_local) — na
+-- subida do app, ao salvar a conexão e no botão "Revisar e Corrigir".
+-- Por isso nenhum nome aqui leva schema: o instalador roda com
+-- search_path = <schema de destino> e depois fixa o search_path de cada
+-- função nesse schema. As tabelas de controle (controle_migracao,
+-- controle_migracao_lotes) são criadas pelo app (criar_tabelas_controle).
+--
+-- Para instalar à mão (substitua integra_local pelo schema configurado):
+--   psql ... -c "SET search_path = integra_local" -f sql/funcoes_migracao.sql
 -- ============================================================
 
--- Principais ajustes desta revisao:
--- 1. Usa regclass/to_regclass para tabelas com schema, evitando erros com %I em nomes como integrash.v_paciente.
--- 2. Valida lote e existencia das relacoes antes de executar.
--- 3. Monta a lista de colunas pela intersecao entre origem e destino.
--- 4. Exclui a coluna ID apenas quando ela for identity/serial no destino.
--- 5. Faz lock da linha de controle durante o processamento do lote.
 
-DROP FUNCTION IF EXISTS public.finalizar_migracao(INTEGER);
-DROP FUNCTION IF EXISTS public.verificar_progresso(INTEGER);
-DROP FUNCTION IF EXISTS public.processar_lote(INTEGER, INTEGER);
-DROP FUNCTION IF EXISTS public.processar_registro(INTEGER, TEXT);
-DROP FUNCTION IF EXISTS public.inicializar_migracao(TEXT, TEXT, TEXT, INTEGER);
-DROP FUNCTION IF EXISTS public.atualizar_lotes_migracao(INTEGER);
-
-DROP TABLE IF EXISTS controle_migracao_lotes;
-DROP TABLE IF EXISTS controle_migracao;
-
-CREATE TABLE IF NOT EXISTS controle_migracao (
-    id SERIAL PRIMARY KEY,
-    tabela_origem VARCHAR(255) NOT NULL,
-    tabela_destino VARCHAR(255) NOT NULL,
-    campo_id VARCHAR(100) NOT NULL,
-    sql_colunas_insert TEXT,
-    sql_colunas_select TEXT,
-    sql_colunas_update TEXT,
-    sql_colunas_update_where TEXT,
-    lote_atual INTEGER DEFAULT 0,
-    total_registros INTEGER DEFAULT 0,
-    registros_processados INTEGER DEFAULT 0,
-    tamanho_lote INTEGER DEFAULT 1,
-    id_maximo BIGINT DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'pendente',
-    data_inicio TIMESTAMP,
-    data_fim TIMESTAMP,
-    erro_msg TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Ajusta a estrutura da tabela de controle quando o script for reaplicado
--- em ambientes que ja possuem uma versao anterior.
-ALTER TABLE controle_migracao
-    ADD COLUMN IF NOT EXISTS tabela_origem VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS tabela_destino VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS campo_id VARCHAR(100),
-    ADD COLUMN IF NOT EXISTS sql_colunas_insert TEXT,
-    ADD COLUMN IF NOT EXISTS sql_colunas_select TEXT,
-    ADD COLUMN IF NOT EXISTS sql_colunas_update TEXT,
-    ADD COLUMN IF NOT EXISTS sql_colunas_update_where TEXT,
-    ADD COLUMN IF NOT EXISTS lote_atual INTEGER DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_registros INTEGER DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS registros_processados INTEGER DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS tamanho_lote INTEGER DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS id_maximo BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pendente',
-    ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS data_fim TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS erro_msg TEXT,
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-
-UPDATE controle_migracao
-SET lote_atual = COALESCE(lote_atual, 0),
-    total_registros = COALESCE(total_registros, 0),
-    registros_processados = COALESCE(registros_processados, 0),
-    tamanho_lote = COALESCE(tamanho_lote, 1),
-    status = COALESCE(status, 'pendente'),
-    created_at = COALESCE(created_at, CURRENT_TIMESTAMP),
-    updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
-WHERE lote_atual IS NULL
-   OR total_registros IS NULL
-   OR registros_processados IS NULL
-   OR tamanho_lote IS NULL
-   OR status IS NULL
-   OR created_at IS NULL
-   OR updated_at IS NULL;
-
-ALTER TABLE controle_migracao
-    ALTER COLUMN tabela_origem TYPE VARCHAR(255),
-    ALTER COLUMN tabela_destino TYPE VARCHAR(255),
-    ALTER COLUMN campo_id TYPE VARCHAR(100),
-    ALTER COLUMN lote_atual SET DEFAULT 0,
-    ALTER COLUMN total_registros SET DEFAULT 0,
-    ALTER COLUMN registros_processados SET DEFAULT 0,
-    ALTER COLUMN tamanho_lote SET DEFAULT 1,
-    ALTER COLUMN id_maximo SET DEFAULT 0,
-    ALTER COLUMN status SET DEFAULT 'pendente',
-    ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP,
-    ALTER COLUMN updated_at SET DEFAULT CURRENT_TIMESTAMP;
-
-ALTER TABLE controle_migracao
-    ALTER COLUMN tabela_origem SET NOT NULL,
-    ALTER COLUMN tabela_destino SET NOT NULL,
-    ALTER COLUMN campo_id SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_controle_status ON controle_migracao(status);
-
-
-CREATE TABLE IF NOT EXISTS controle_migracao_lotes (
-    id BIGSERIAL PRIMARY KEY,
-    migracao_id INTEGER NOT NULL REFERENCES controle_migracao(id) ON DELETE CASCADE,
-    numero_lote INTEGER NOT NULL DEFAULT 1,
-    chave_valor TEXT NOT NULL,
-    status VARCHAR(20) DEFAULT 'pendente',
-    erro_msg TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-ALTER TABLE controle_migracao_lotes
-    ADD COLUMN IF NOT EXISTS migracao_id INTEGER,
-    ADD COLUMN IF NOT EXISTS numero_lote INTEGER,
-    ADD COLUMN IF NOT EXISTS chave_valor TEXT,
-    ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pendente',
-    ADD COLUMN IF NOT EXISTS erro_msg TEXT,
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-
-UPDATE controle_migracao_lotes
-SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP),
-    updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP),
-    status = COALESCE(status, 'pendente')
-WHERE created_at IS NULL OR updated_at IS NULL OR status IS NULL;
-
-ALTER TABLE controle_migracao_lotes
-    ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP,
-    ALTER COLUMN updated_at SET DEFAULT CURRENT_TIMESTAMP,
-    ALTER COLUMN migracao_id SET NOT NULL,
-    ALTER COLUMN numero_lote SET NOT NULL,
-    ALTER COLUMN chave_valor SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_controle_migracao_lotes_migracao
-    ON controle_migracao_lotes (migracao_id, numero_lote);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_controle_migracao_lotes_chave
-    ON controle_migracao_lotes (migracao_id, chave_valor);
-
-CREATE INDEX IF NOT EXISTS idx_controle_migracao_lotes_status
-    ON controle_migracao_lotes (migracao_id, status);
-
-
-CREATE OR REPLACE FUNCTION public.atualizar_lotes_migracao(p_migracao_id INTEGER)
+CREATE OR REPLACE FUNCTION atualizar_lotes_migracao(p_migracao_id INTEGER)
 RETURNS TABLE (
     total_registros INTEGER,
     total_lotes INTEGER,
@@ -364,9 +235,7 @@ $$ LANGUAGE plpgsql;
 -- PREPARAR COLUNAS DA MIGRAÇÃO (sem gerar lotes)
 -- Retorna os metadados e a query de diferenças pronta para execução.
 -- ============================================================
-DROP FUNCTION IF EXISTS public.preparar_colunas_migracao(INTEGER);
-
-CREATE OR REPLACE FUNCTION public.preparar_colunas_migracao(p_migracao_id INTEGER)
+CREATE OR REPLACE FUNCTION preparar_colunas_migracao(p_migracao_id INTEGER)
 RETURNS TABLE (
     tabela_origem_resolved TEXT,
     tabela_destino_resolved TEXT,
@@ -595,7 +464,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION public.inicializar_migracao(
+CREATE OR REPLACE FUNCTION inicializar_migracao(
     p_tabela_origem TEXT,
     p_tabela_destino TEXT,
     p_campo_id TEXT,
@@ -651,7 +520,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION public.processar_lote(
+CREATE OR REPLACE FUNCTION processar_lote(
     p_migracao_id INTEGER,
     p_numero_lote INTEGER
 )
@@ -741,7 +610,7 @@ BEGIN
     WHERE id = p_migracao_id;
 
     IF v_colunas_insert IS NULL OR v_colunas_insert = '' OR v_colunas_select IS NULL OR v_colunas_select = '' THEN
-        PERFORM public.atualizar_lotes_migracao(p_migracao_id);
+        PERFORM atualizar_lotes_migracao(p_migracao_id);
 
         SELECT
             cm.sql_colunas_insert,
@@ -825,7 +694,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION public.processar_registro(
+CREATE OR REPLACE FUNCTION processar_registro(
     p_migracao_id INTEGER,
     p_chave_valor TEXT
 )
@@ -889,7 +758,7 @@ BEGIN
 
     -- Preparar colunas se ainda nao foram geradas
     IF v_colunas_insert IS NULL OR v_colunas_insert = '' OR v_colunas_select IS NULL OR v_colunas_select = '' THEN
-        PERFORM * FROM public.preparar_colunas_migracao(p_migracao_id);
+        PERFORM * FROM preparar_colunas_migracao(p_migracao_id);
 
         SELECT
             cm.sql_colunas_insert,
@@ -1018,7 +887,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION public.verificar_progresso(p_migracao_id INTEGER)
+CREATE OR REPLACE FUNCTION verificar_progresso(p_migracao_id INTEGER)
 RETURNS TABLE (
     migracao_id INTEGER,
     tabela_origem VARCHAR,
@@ -1036,15 +905,16 @@ BEGIN
     RETURN QUERY
     SELECT
         cm.id,
-        cm.tabela_origem,
-        cm.tabela_destino,
-        cm.campo_id,
+        -- casts: o app cria essas colunas como TEXT; o script antigo, como VARCHAR
+        cm.tabela_origem::VARCHAR,
+        cm.tabela_destino::VARCHAR,
+        cm.campo_id::VARCHAR,
         cm.lote_atual,
         cm.total_registros,
         cm.registros_processados,
         cm.id_maximo,
         ROUND((cm.registros_processados::NUMERIC / NULLIF(cm.total_registros, 0)) * 100, 2),
-        cm.status,
+        cm.status::VARCHAR,
         CASE
             WHEN cm.registros_processados > 0 AND cm.data_inicio IS NOT NULL THEN
                 CEIL(
@@ -1060,7 +930,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION public.finalizar_migracao(p_migracao_id INTEGER)
+CREATE OR REPLACE FUNCTION finalizar_migracao(p_migracao_id INTEGER)
 RETURNS VOID AS $$
 BEGIN
     UPDATE controle_migracao

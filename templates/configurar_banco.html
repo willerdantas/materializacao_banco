@@ -289,11 +289,12 @@
             automaticamente no schema de destino sempre que você salva a conexão acima
             (seção 1) ou troca a conexão ativa na lista de conexões salvas.
         </p>
-        <div class="form-text" style="color: var(--color-orange);">
-            ⚠️ As funções SQL usadas em outras telas (<code>processar_lote</code>,
-            <code>verificar_progresso</code>, <code>preparar_colunas_migracao</code>,
-            <code>atualizar_lotes_migracao</code>, <code>finalizar_migracao</code>) não são
-            criadas por aqui — precisam existir separadamente no banco.
+        <div class="form-text">
+            As funções SQL da migração (<code>processar_lote</code>, <code>verificar_progresso</code>,
+            <code>preparar_colunas_migracao</code>, <code>atualizar_lotes_migracao</code>,
+            <code>finalizar_migracao</code>...) também são criadas/atualizadas automaticamente no
+            schema de destino <code>{{ db_config.schema_destino or 'public' }}</code> — junto com as tabelas,
+            na subida do sistema e pelo botão abaixo.
         </div>
         <div class="form-text" style="margin-top: 8px;">
             <strong>Revisar e Corrigir</strong> confere as tabelas de controle de importação:
