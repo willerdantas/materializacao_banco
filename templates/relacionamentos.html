@@ -1,0 +1,471 @@
+{% extends "base.html" %}
+
+{% block title %}Relacionamentos - Sistema de Migração{% endblock %}
+
+{% block extra_css %}
+<style>
+    .rel-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px 12px; }
+    .rel-toolbar .form-control { max-width: 260px; }
+    .rel-legenda { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.75rem; color: var(--color-gray); padding: 0 16px 12px; align-items: center; }
+    .rel-legenda svg { vertical-align: middle; }
+    .rel-canvas { position: relative; height: 72vh; min-height: 420px; margin: 0 16px 16px; border: 1px solid #E5E7EB;
+                  border-radius: var(--radius-md); background-color: #FAFBFC; overflow: hidden;
+                  background-image: radial-gradient(#E5E7EB 1px, transparent 1px); background-size: 20px 20px; }
+    .rel-canvas svg { width: 100%; height: 100%; cursor: grab; user-select: none; touch-action: none; }
+    .rel-canvas svg.arrastando { cursor: grabbing; }
+    .rel-no { cursor: move; }
+    .rel-no .caixa { fill: var(--color-white); stroke: #D1D5DB; stroke-width: 1; }
+    .rel-no .cabecalho { fill: var(--color-primary-dark); }
+    .rel-no .titulo { fill: var(--color-white); font-weight: 600; font-size: 13px; }
+    .rel-no .linha-pk { fill: #E6F6F4; }
+    .rel-no .linha-fk { fill: #FFF4EC; }
+    .rel-no .texto { fill: var(--color-dark); font-size: 12px; }
+    .rel-no .texto-pk { font-weight: 600; }
+    .rel-no .tipo { fill: var(--color-gray); font-size: 11px; }
+    .rel-no .mais { fill: var(--color-gray); font-size: 11px; font-style: italic; }
+    .rel-no.sem-estrutura .caixa { stroke-dasharray: 4 3; }
+    .rel-no.selecionado .caixa { stroke: var(--color-primary); stroke-width: 2.5; }
+    .rel-ligacao { fill: none; stroke: var(--color-primary); stroke-width: 1.6; }
+    .rel-ligacao.mesma-chave { stroke: var(--color-yellow); stroke-dasharray: 6 4; }
+    .rel-ligacao-rotulo { fill: var(--color-gray); font-size: 10px; }
+    .esmaecido { opacity: 0.12; }
+    .destacado.rel-ligacao { stroke-width: 2.6; }
+    .rel-vazio { padding: 32px 16px; text-align: center; color: var(--color-gray); }
+    .rel-dica { font-size: 0.75rem; color: var(--color-gray); padding: 0 16px 16px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="card animate-fade-in">
+    <div class="card-header">
+        <div>
+            <h2 class="card-title">Relacionamentos entre tabelas</h2>
+            <p class="card-subtitle">
+                Tabelas configuradas nas migrações. A chave de cada migração é a chave primária (🔑);
+                quando essa coluna aparece em outra tabela, as duas são ligadas (🔗).
+            </p>
+        </div>
+        <span class="status status-concluido" id="rel-resumo"></span>
+    </div>
+
+    {% if esquema.tabelas %}
+    <div class="rel-toolbar">
+        <input type="search" id="rel-busca" class="form-control" placeholder="Buscar tabela ou coluna...">
+        <label style="display: flex; gap: 6px; align-items: center; font-size: 0.85rem;">
+            <input type="checkbox" id="rel-todas-colunas"> Mostrar todas as colunas
+        </label>
+        <label style="display: flex; gap: 6px; align-items: center; font-size: 0.85rem;">
+            <input type="checkbox" id="rel-so-ligadas"> Só tabelas com ligação
+        </label>
+        <button type="button" class="btn btn-outline btn-sm" id="rel-ajustar">Ajustar à tela</button>
+        <button type="button" class="btn btn-outline btn-sm" id="rel-reorganizar">Reorganizar</button>
+    </div>
+    <div class="rel-legenda">
+        <span><svg width="34" height="10"><line x1="2" y1="5" x2="26" y2="5" stroke="#00A1A2" stroke-width="2"/><polygon points="26,1 33,5 26,9" fill="#00A1A2"/></svg>
+            coluna 🔗 → chave primária 🔑 de outra tabela</span>
+        <span><svg width="34" height="10"><line x1="2" y1="5" x2="32" y2="5" stroke="#F3A133" stroke-width="2" stroke-dasharray="6 4"/></svg>
+            mesma chave primária (ex.: tabela atual e _old)</span>
+        <span><svg width="22" height="12"><rect x="1" y="1" width="20" height="10" fill="#fff" stroke="#9CA3AF" stroke-dasharray="4 3"/></svg>
+            sem estrutura encontrada</span>
+    </div>
+    <div class="rel-canvas">
+        <svg id="rel-svg" xmlns="http://www.w3.org/2000/svg" aria-label="Diagrama de relacionamentos">
+            <defs>
+                <marker id="seta-pk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#00A1A2"/>
+                </marker>
+                <marker id="ponto-fk" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6">
+                    <circle cx="5" cy="5" r="4" fill="#fff" stroke="#00A1A2" stroke-width="2"/>
+                </marker>
+            </defs>
+            <g id="rel-viewport">
+                <g id="rel-ligacoes"></g>
+                <g id="rel-nos"></g>
+            </g>
+        </svg>
+    </div>
+    <div class="rel-dica">
+        Arraste as tabelas para organizar (a posição fica salva neste navegador) · arraste o fundo para mover ·
+        roda do mouse para zoom · passe o mouse ou clique numa tabela para destacar as ligações dela.
+    </div>
+    {% else %}
+    <div class="rel-vazio">
+        Nenhuma migração cadastrada ainda. Cadastre em <a href="{{ url_for('nova_migracao') }}">Nova Migração</a>
+        para ver o esquema das tabelas.
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script type="application/json" id="rel-esquema-json">{{ esquema|tojson }}</script>
+<script>
+(function () {
+    const esquema = JSON.parse(document.getElementById('rel-esquema-json').textContent);
+    const svg = document.getElementById('rel-svg');
+    if (!svg || !esquema.tabelas.length) return;
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const ALTURA_CABECALHO = 30, ALTURA_LINHA = 20, LARGURA_MIN = 190, LARGURA_MAX = 340;
+    const CHAVE_POSICOES = 'relacionamentos-posicoes-v2';
+    const viewport = document.getElementById('rel-viewport');
+    const camadaNos = document.getElementById('rel-nos');
+    const camadaLigacoes = document.getElementById('rel-ligacoes');
+
+    const tabelas = esquema.tabelas;
+    const relacoes = esquema.relacoes;
+    const porChave = Object.fromEntries(tabelas.map(t => [t.chave, t]));
+    let mostrarTodas = false, soLigadas = false, selecionada = null;
+    let vista = { x: 0, y: 0, k: 1 };
+
+    // ---------- Dados derivados ----------
+    const ligadasA = {};       // chave -> Set(chaves ligadas)
+    const colunasLigadas = {}; // chave -> Set(colunas usadas em ligações, minúsculo)
+    tabelas.forEach(t => { ligadasA[t.chave] = new Set(); colunasLigadas[t.chave] = new Set(); });
+    relacoes.forEach(r => {
+        ligadasA[r.de].add(r.para); ligadasA[r.para].add(r.de);
+        colunasLigadas[r.de].add(r.coluna.toLowerCase());
+        colunasLigadas[r.para].add(r.coluna.toLowerCase());
+    });
+    document.getElementById('rel-resumo').textContent =
+        `${tabelas.length} tabela(s) · ${relacoes.length} ligação(ões)`;
+
+    function el(tag, attrs, texto) {
+        const e = document.createElementNS(SVG_NS, tag);
+        Object.entries(attrs || {}).forEach(([k, v]) => e.setAttribute(k, v));
+        if (texto !== undefined) e.textContent = texto;
+        return e;
+    }
+
+    // Linhas exibidas de uma tabela: PK, colunas ligadas e (opcional) o resto
+    function linhasDaTabela(t) {
+        const pk = (t.pk || '').toLowerCase();
+        const linhas = [];
+        const colunaPk = t.colunas.find(c => c.nome.toLowerCase() === pk);
+        linhas.push({ nome: colunaPk ? colunaPk.nome : (t.pk || '(sem chave)'), tipo: colunaPk ? colunaPk.tipo : null, papel: 'pk' });
+        const resto = t.colunas.filter(c => c.nome.toLowerCase() !== pk);
+        resto.filter(c => colunasLigadas[t.chave].has(c.nome.toLowerCase()))
+             .forEach(c => linhas.push({ nome: c.nome, tipo: c.tipo, papel: 'fk' }));
+        const outras = resto.filter(c => !colunasLigadas[t.chave].has(c.nome.toLowerCase()));
+        if (mostrarTodas) {
+            outras.forEach(c => linhas.push({ nome: c.nome, tipo: c.tipo, papel: '' }));
+        } else if (outras.length) {
+            linhas.push({ nome: `+ ${outras.length} coluna(s)`, papel: 'mais' });
+        }
+        if (!t.colunas.length) linhas.push({ nome: 'estrutura não encontrada', papel: 'mais' });
+        return linhas;
+    }
+
+    function medir(t) {
+        t.linhas = linhasDaTabela(t);
+        const maiorTexto = Math.max(t.nome.length * 7.4 + 24,
+            ...t.linhas.map(l => (l.nome.length + (l.tipo ? l.tipo.length * 0.85 + 3 : 0)) * 6.8 + 46));
+        t.w = Math.round(Math.min(LARGURA_MAX, Math.max(LARGURA_MIN, maiorTexto)));
+        t.h = ALTURA_CABECALHO + t.linhas.length * ALTURA_LINHA + 6;
+    }
+
+    // ---------- Organização automática em camadas ----------
+    // Quem só é referenciado (só tem PK usada pelos outros) fica à direita;
+    // quem aponta (FK) fica à esquerda dele — as setas correm da esquerda
+    // pra direita. Dentro de cada coluna, a ordem segue a média da posição
+    // dos vizinhos (algumas passadas) pra cruzar menos linhas.
+    const ESPACO_COLUNA = 110, ESPACO_LINHA = 28;
+
+    function organizar() {
+        const ligadas = tabelas.filter(t => ligadasA[t.chave].size);
+        const soltas = tabelas.filter(t => !ligadasA[t.chave].size);
+        const pais = {};   // chave -> chaves das tabelas para onde ela aponta (FK -> PK)
+        ligadas.forEach(t => { pais[t.chave] = []; });
+        relacoes.filter(r => r.tipo === 'fk').forEach(r => pais[r.de].push(r.para));
+
+        // nível = distância até uma tabela que não aponta pra ninguém
+        const nivel = {};
+        function calcular(chave, visitando) {
+            if (nivel[chave] !== undefined) return nivel[chave];
+            if (visitando.has(chave)) return 0;            // ciclo: corta
+            visitando.add(chave);
+            const n = pais[chave].length ? 1 + Math.max(...pais[chave].map(p => calcular(p, visitando))) : 0;
+            visitando.delete(chave);
+            return (nivel[chave] = n);
+        }
+        ligadas.forEach(t => calcular(t.chave, new Set()));
+        // "mesma chave" (ex.: _old) fica na mesma coluna da tabela principal
+        relacoes.filter(r => r.tipo === 'mesma_chave').forEach(r => {
+            const n = Math.max(nivel[r.de], nivel[r.para]); nivel[r.de] = n; nivel[r.para] = n;
+        });
+
+        const maxNivel = Math.max(0, ...Object.values(nivel));
+        const colunas = Array.from({ length: maxNivel + 1 }, () => []);
+        ligadas.forEach(t => colunas[maxNivel - nivel[t.chave]].push(t));   // pais à direita
+        colunas.forEach(c => c.sort((a, b) => ligadasA[b.chave].size - ligadasA[a.chave].size));
+
+        const ordem = {};
+        const numerar = () => colunas.forEach(c => c.forEach((t, i) => { ordem[t.chave] = i; }));
+        numerar();
+        for (let passada = 0; passada < 8; passada++) {
+            colunas.forEach(c => {
+                c.forEach(t => {
+                    const viz = [...ligadasA[t.chave]].map(k => ordem[k]).filter(v => v !== undefined);
+                    t._centro = viz.length ? viz.reduce((a, b) => a + b, 0) / viz.length : ordem[t.chave];
+                });
+                c.sort((a, b) => a._centro - b._centro);
+            });
+            numerar();
+        }
+
+        let x = 0;
+        colunas.forEach(c => {
+            const largura = Math.max(...c.map(t => t.w));
+            const alturaTotal = c.reduce((soma, t) => soma + t.h, 0) + ESPACO_LINHA * (c.length - 1);
+            let y = -alturaTotal / 2;
+            c.forEach(t => { t.x = x + (largura - t.w) / 2; t.y = y; y += t.h + ESPACO_LINHA; });
+            x += largura + ESPACO_COLUNA;
+        });
+
+        // Tabelas sem ligação: grade abaixo do grupo ligado
+        const base = ligadas.length ? Math.max(...ligadas.map(t => t.y + t.h)) + 70 : 0;
+        const larguraMax = Math.max(900, x - ESPACO_COLUNA);
+        let gx = 0, gy = base, alturaLinha = 0;
+        soltas.forEach(t => {
+            if (gx + t.w > larguraMax && gx > 0) { gx = 0; gy += alturaLinha + 30; alturaLinha = 0; }
+            t.x = gx; t.y = gy; gx += t.w + 30; alturaLinha = Math.max(alturaLinha, t.h);
+        });
+    }
+
+    function separarSobreposicoes(lista) {
+        const folga = 36;
+        for (let passo = 0; passo < 200; passo++) {
+            let mexeu = false;
+            for (let i = 0; i < lista.length; i++) for (let j = i + 1; j < lista.length; j++) {
+                const a = lista[i], b = lista[j];
+                const sx = Math.min(a.x + a.w + folga, b.x + b.w + folga) - Math.max(a.x, b.x);
+                const sy = Math.min(a.y + a.h + folga, b.y + b.h + folga) - Math.max(a.y, b.y);
+                if (sx <= 0 || sy <= 0) continue;
+                mexeu = true;
+                if (sx < sy) {
+                    const m = sx / 2 * (a.x < b.x ? -1 : 1); a.x += m; b.x -= m;
+                } else {
+                    const m = sy / 2 * (a.y < b.y ? -1 : 1); a.y += m; b.y -= m;
+                }
+            }
+            if (!mexeu) break;
+        }
+    }
+
+    function carregarPosicoes() {
+        try { return JSON.parse(localStorage.getItem(CHAVE_POSICOES) || '{}'); } catch (_) { return {}; }
+    }
+    function salvarPosicoes() {
+        try {
+            localStorage.setItem(CHAVE_POSICOES, JSON.stringify(
+                Object.fromEntries(tabelas.map(t => [t.chave, [Math.round(t.x), Math.round(t.y)]]))));
+        } catch (_) { /* sem armazenamento: só não lembra a posição */ }
+    }
+
+    // ---------- Desenho ----------
+    function desenharNos() {
+        camadaNos.replaceChildren();
+        tabelas.forEach(t => {
+            const g = el('g', { class: 'rel-no' + (t.colunas.length ? '' : ' sem-estrutura') });
+            g.dataset.chave = t.chave;
+            const titulo = [`${t.nome}`, `Origem: ${t.origem || '-'}`,
+                `Migração(ões): #${t.migracoes.join(', #')}`,
+                `Colunas: ${t.colunas.length}` + (t.fonte && t.fonte !== 'destino' ? ` (lidas da ${t.fonte === 'fdw' ? 'lista do FDW' : 'origem'} — destino ainda não criado)` : '')];
+            g.appendChild(el('title', {}, titulo.join('\n')));
+            g.appendChild(el('rect', { class: 'caixa', width: t.w, height: t.h, rx: 8 }));
+            g.appendChild(el('path', { class: 'cabecalho',
+                d: `M0,8 a8,8 0 0 1 8,-8 h${t.w - 16} a8,8 0 0 1 8,8 v${ALTURA_CABECALHO - 8} h${-t.w} z` }));
+            g.appendChild(el('text', { class: 'titulo', x: 10, y: 20 }, encurtar(t.nome.split('.').pop(), t.w - 20, 7.4)));
+            t.linhas.forEach((l, i) => {
+                const y = ALTURA_CABECALHO + i * ALTURA_LINHA;
+                if (l.papel === 'pk' || l.papel === 'fk') {
+                    g.appendChild(el('rect', { class: l.papel === 'pk' ? 'linha-pk' : 'linha-fk', x: 1, y, width: t.w - 2, height: ALTURA_LINHA }));
+                }
+                const icone = l.papel === 'pk' ? '🔑 ' : l.papel === 'fk' ? '🔗 ' : l.papel === 'mais' ? '' : '    ';
+                g.appendChild(el('text', { class: l.papel === 'mais' ? 'mais' : 'texto' + (l.papel === 'pk' ? ' texto-pk' : ''), x: 10, y: y + 14 },
+                    icone + encurtar(l.nome, t.w - 90, 6.8)));
+                if (l.tipo) g.appendChild(el('text', { class: 'tipo', x: t.w - 8, y: y + 14, 'text-anchor': 'end' }, encurtar(l.tipo, 70, 6)));
+            });
+            g.addEventListener('mouseenter', () => { if (!selecionada) destacar(t.chave); });
+            g.addEventListener('mouseleave', () => { if (!selecionada) destacar(null); });
+            camadaNos.appendChild(g);
+            t.g = g;
+        });
+        posicionarNos();
+    }
+
+    function encurtar(texto, larguraPx, pxPorLetra) {
+        const max = Math.max(4, Math.floor(larguraPx / pxPorLetra));
+        return texto.length > max ? texto.slice(0, max - 1) + '…' : texto;
+    }
+
+    function posicionarNos() {
+        tabelas.forEach(t => {
+            t.g.setAttribute('transform', `translate(${t.x},${t.y})`);
+            t.g.style.display = visivel(t) ? '' : 'none';
+        });
+        desenharLigacoes();
+    }
+
+    function visivel(t) { return !soLigadas || ligadasA[t.chave].size > 0; }
+
+    function yDaColuna(t, coluna) {
+        const i = t.linhas.findIndex(l => l.papel !== 'mais' && l.nome.toLowerCase() === coluna.toLowerCase());
+        return t.y + (i < 0 ? ALTURA_CABECALHO / 2 : ALTURA_CABECALHO + i * ALTURA_LINHA + ALTURA_LINHA / 2);
+    }
+
+    function desenharLigacoes() {
+        camadaLigacoes.replaceChildren();
+        relacoes.forEach(r => {
+            const a = porChave[r.de], b = porChave[r.para];
+            if (!visivel(a) || !visivel(b)) return;
+            const ya = yDaColuna(a, r.coluna), yb = yDaColuna(b, r.tipo === 'fk' ? b.pk : r.coluna);
+            const acx = a.x + a.w / 2, bcx = b.x + b.w / 2;
+            let xa, xb, sa, sb;
+            if (Math.abs(acx - bcx) < (a.w + b.w) / 2 - 20) {   // um sobre o outro: sai e entra pela direita
+                xa = a.x + a.w; xb = b.x + b.w; sa = 1; sb = 1;
+            } else if (bcx > acx) {
+                xa = a.x + a.w; xb = b.x; sa = 1; sb = -1;
+            } else {
+                xa = a.x; xb = b.x + b.w; sa = -1; sb = 1;
+            }
+            const curva = Math.max(50, Math.abs(xb - xa) / 2);
+            const d = `M${xa},${ya} C${xa + sa * curva},${ya} ${xb + sb * curva},${yb} ${xb},${yb}`;
+            const attrs = { class: 'rel-ligacao' + (r.tipo === 'mesma_chave' ? ' mesma-chave' : ''), d };
+            if (r.tipo === 'fk') { attrs['marker-end'] = 'url(#seta-pk)'; attrs['marker-start'] = 'url(#ponto-fk)'; }
+            const caminho = el('path', attrs);
+            caminho.dataset.de = r.de; caminho.dataset.para = r.para;
+            caminho.appendChild(el('title', {}, r.tipo === 'fk'
+                ? `${a.nome}.${r.coluna} → ${b.nome} (chave primária)`
+                : `${a.nome} e ${b.nome} têm a mesma chave primária (${r.coluna})`));
+            camadaLigacoes.appendChild(caminho);
+        });
+        if (selecionada) destacar(selecionada);
+    }
+
+    // ---------- Destaque, busca ----------
+    function destacar(chave, termo) {
+        const ativos = new Set();
+        if (chave) { ativos.add(chave); ligadasA[chave].forEach(c => ativos.add(c)); }
+        if (termo) {
+            tabelas.forEach(t => {
+                if (t.nome.toLowerCase().includes(termo) || t.colunas.some(c => c.nome.toLowerCase().includes(termo))) ativos.add(t.chave);
+            });
+        }
+        const filtrando = chave || termo;
+        tabelas.forEach(t => {
+            t.g.classList.toggle('esmaecido', !!filtrando && !ativos.has(t.chave));
+            t.g.classList.toggle('selecionado', t.chave === selecionada);
+        });
+        camadaLigacoes.querySelectorAll('.rel-ligacao').forEach(p => {
+            const ligada = chave && (p.dataset.de === chave || p.dataset.para === chave);
+            const entreAtivos = termo && ativos.has(p.dataset.de) && ativos.has(p.dataset.para);
+            p.classList.toggle('esmaecido', !!filtrando && !ligada && !entreAtivos);
+            p.classList.toggle('destacado', !!ligada);
+        });
+        return ativos;
+    }
+
+    // ---------- Zoom, mover, arrastar ----------
+    function aplicarVista() { viewport.setAttribute('transform', `translate(${vista.x},${vista.y}) scale(${vista.k})`); }
+
+    function ajustarATela(lista) {
+        const alvo = (lista || tabelas).filter(visivel);
+        if (!alvo.length) return;
+        const minX = Math.min(...alvo.map(t => t.x)), minY = Math.min(...alvo.map(t => t.y));
+        const maxX = Math.max(...alvo.map(t => t.x + t.w)), maxY = Math.max(...alvo.map(t => t.y + t.h));
+        const caixa = svg.getBoundingClientRect(), margem = 40;
+        vista.k = Math.min(1.4, Math.max(0.15, Math.min((caixa.width - margem * 2) / (maxX - minX), (caixa.height - margem * 2) / (maxY - minY))));
+        vista.x = (caixa.width - (maxX - minX) * vista.k) / 2 - minX * vista.k;
+        vista.y = (caixa.height - (maxY - minY) * vista.k) / 2 - minY * vista.k;
+        aplicarVista();
+    }
+
+    function pontoNoDiagrama(evento) {
+        const caixa = svg.getBoundingClientRect();
+        return { x: (evento.clientX - caixa.left - vista.x) / vista.k, y: (evento.clientY - caixa.top - vista.y) / vista.k };
+    }
+
+    svg.addEventListener('wheel', evento => {
+        evento.preventDefault();
+        const caixa = svg.getBoundingClientRect();
+        const mx = evento.clientX - caixa.left, my = evento.clientY - caixa.top;
+        const novoK = Math.min(2.5, Math.max(0.15, vista.k * (evento.deltaY < 0 ? 1.12 : 1 / 1.12)));
+        vista.x = mx - (mx - vista.x) * (novoK / vista.k);
+        vista.y = my - (my - vista.y) * (novoK / vista.k);
+        vista.k = novoK;
+        aplicarVista();
+    }, { passive: false });
+
+    let arrasto = null;
+    svg.addEventListener('pointerdown', evento => {
+        const no = evento.target.closest('.rel-no');
+        const p = pontoNoDiagrama(evento);
+        if (no) {
+            const t = porChave[no.dataset.chave];
+            arrasto = { tipo: 'no', t, dx: p.x - t.x, dy: p.y - t.y, moveu: false };
+        } else {
+            arrasto = { tipo: 'fundo', x: evento.clientX, y: evento.clientY, vx: vista.x, vy: vista.y, moveu: false };
+            svg.classList.add('arrastando');
+        }
+        svg.setPointerCapture(evento.pointerId);
+    });
+    svg.addEventListener('pointermove', evento => {
+        if (!arrasto) return;
+        if (arrasto.tipo === 'no') {
+            const p = pontoNoDiagrama(evento);
+            arrasto.t.x = p.x - arrasto.dx; arrasto.t.y = p.y - arrasto.dy; arrasto.moveu = true;
+            arrasto.t.g.setAttribute('transform', `translate(${arrasto.t.x},${arrasto.t.y})`);
+            desenharLigacoes();
+        } else {
+            const dx = evento.clientX - arrasto.x, dy = evento.clientY - arrasto.y;
+            if (Math.abs(dx) + Math.abs(dy) > 3) arrasto.moveu = true;
+            vista.x = arrasto.vx + dx; vista.y = arrasto.vy + dy; aplicarVista();
+        }
+    });
+    svg.addEventListener('pointerup', () => {
+        if (!arrasto) return;
+        if (arrasto.tipo === 'no') {
+            if (arrasto.moveu) salvarPosicoes();
+            else { selecionada = selecionada === arrasto.t.chave ? null : arrasto.t.chave; destacar(selecionada); }
+        } else if (!arrasto.moveu && selecionada) {
+            selecionada = null; destacar(null);
+        }
+        svg.classList.remove('arrastando');
+        arrasto = null;
+    });
+
+    // ---------- Controles ----------
+    document.getElementById('rel-todas-colunas').addEventListener('change', evento => {
+        mostrarTodas = evento.target.checked;
+        tabelas.forEach(medir);
+        separarSobreposicoes(tabelas.filter(visivel));
+        desenharNos();
+    });
+    document.getElementById('rel-so-ligadas').addEventListener('change', evento => {
+        soLigadas = evento.target.checked; posicionarNos(); ajustarATela();
+    });
+    document.getElementById('rel-ajustar').addEventListener('click', () => ajustarATela());
+    document.getElementById('rel-reorganizar').addEventListener('click', () => {
+        organizar(); salvarPosicoes(); posicionarNos(); ajustarATela();
+    });
+    document.getElementById('rel-busca').addEventListener('input', evento => {
+        const termo = evento.target.value.trim().toLowerCase();
+        selecionada = null;
+        const ativos = destacar(null, termo || null);
+        if (termo && ativos.size) ajustarATela(tabelas.filter(t => ativos.has(t.chave)));
+    });
+
+    // ---------- Início ----------
+    tabelas.forEach(medir);
+    const salvas = carregarPosicoes();
+    const todasSalvas = tabelas.every(t => Array.isArray(salvas[t.chave]));
+    organizar();
+    if (todasSalvas) tabelas.forEach(t => { [t.x, t.y] = salvas[t.chave]; });
+    else tabelas.forEach(t => { if (Array.isArray(salvas[t.chave])) [t.x, t.y] = salvas[t.chave]; });
+    desenharNos();
+    ajustarATela();
+    window.addEventListener('resize', () => ajustarATela());
+})();
+</script>
+{% endblock %}

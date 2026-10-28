@@ -52,6 +52,10 @@
                 <span>🕓</span>
                 <span>Agendar Importação</span>
             </a>
+            <a href="{{ url_for('relacionamentos') }}" class="nav-link {% if request.endpoint == 'relacionamentos' %}active{% endif %}">
+                <span>🔗</span>
+                <span>Relacionamentos</span>
+            </a>
             {% if session.perfil == 'administrador' %}
             <a href="{{ url_for('configurar_banco') }}" class="nav-link {% if request.endpoint == 'configurar_banco' %}active{% endif %}">
                 <span>🗄️</span>

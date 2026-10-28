@@ -3608,6 +3608,108 @@ def nova_migracao():
     return render_template('nova_migracao.html', fdw_tabelas=get_fdw_tabelas(), fdw_mapeamentos=mapeamentos_fdw_com_migracoes(), migracao_edicao=migracao_edicao)
 
 
+# ============================================================
+# RELACIONAMENTOS: esquema visual das tabelas das migrações
+# ============================================================
+# Cada migração tem uma chave (campo_id), tratada como chave primária da
+# tabela. Se essa coluna aparece em outra tabela configurada, as duas são
+# ligadas (FK -> PK). Duas tabelas com a MESMA chave primária (ex.:
+# t_internacao e t_internacao_old) ganham uma ligação de "mesma chave".
+
+def _colunas_das_relacoes(relacoes):
+    """{'schema.tabela' (minúsculo): [{'nome', 'tipo'}]} numa consulta só."""
+    if not relacoes:
+        return {}
+    rows = execute_query("""
+        SELECT lower(table_schema || '.' || table_name) AS relacao, column_name, data_type
+        FROM information_schema.columns
+        WHERE lower(table_schema || '.' || table_name) = ANY(%s)
+        ORDER BY table_schema, table_name, ordinal_position
+    """, (sorted({r.lower() for r in relacoes}),), statement_timeout_ms=30000)
+    colunas = {}
+    for r in rows:
+        colunas.setdefault(r['relacao'], []).append({'nome': r['column_name'], 'tipo': r['data_type']})
+    return colunas
+
+
+def montar_esquema_relacionamentos():
+    """Tabelas das migrações (uma por destino) com colunas e as ligações
+    encontradas pelo nome da chave primária."""
+    migracoes = execute_query(
+        "SELECT id, tabela_origem, tabela_destino, campo_id FROM controle_migracao ORDER BY id"
+    )
+    tabelas = {}
+    for mig in migracoes:
+        chave = (mig['tabela_destino'] or '').lower()
+        if not chave:
+            continue
+        if chave in tabelas:
+            tabelas[chave]['migracoes'].append(mig['id'])
+            continue
+        tabelas[chave] = {
+            'chave': chave,
+            'nome': mig['tabela_destino'],
+            'origem': mig['tabela_origem'],
+            'pk': (mig['campo_id'] or '').strip(),
+            'migracoes': [mig['id']],
+        }
+
+    colunas = _colunas_das_relacoes(
+        [t['nome'] for t in tabelas.values()] + [t['origem'] for t in tabelas.values() if t['origem']]
+    )
+    colunas_fdw = {
+        t['nome'].lower(): [{'nome': c, 'tipo': None} for c in t.get('colunas') or []]
+        for t in get_fdw_tabelas().get('tabelas') or []
+    }
+    for t in tabelas.values():
+        origem = (t['origem'] or '').lower()
+        if t['chave'] in colunas:
+            t['colunas'], t['fonte'] = colunas[t['chave']], 'destino'
+        elif origem in colunas:
+            t['colunas'], t['fonte'] = colunas[origem], 'origem'
+        elif origem.split('.')[-1] in colunas_fdw:
+            t['colunas'], t['fonte'] = colunas_fdw[origem.split('.')[-1]], 'fdw'
+        else:
+            t['colunas'], t['fonte'] = [], None
+
+    # Ligações: coluna de B com o nome da chave primária de A
+    tabelas_por_pk = {}
+    for t in tabelas.values():
+        if t['pk']:
+            tabelas_por_pk.setdefault(t['pk'].lower(), []).append(t['chave'])
+    relacoes, pares_mesma_chave = [], set()
+    for b in tabelas.values():
+        for coluna in b['colunas']:
+            for a_chave in tabelas_por_pk.get(coluna['nome'].lower(), []):
+                if a_chave == b['chave']:
+                    continue
+                if coluna['nome'].lower() == b['pk'].lower():
+                    par = tuple(sorted((a_chave, b['chave'])))
+                    if par not in pares_mesma_chave:
+                        pares_mesma_chave.add(par)
+                        relacoes.append({'de': par[0], 'para': par[1], 'coluna': coluna['nome'], 'tipo': 'mesma_chave'})
+                else:
+                    relacoes.append({'de': b['chave'], 'para': a_chave, 'coluna': coluna['nome'], 'tipo': 'fk'})
+
+    return {'tabelas': list(tabelas.values()), 'relacoes': relacoes}
+
+
+@app.route('/relacionamentos')
+def relacionamentos():
+    """Esquema visual de relacionamento entre as tabelas das migrações."""
+    if not is_db_configured():
+        flash('Configure o banco antes de ver os relacionamentos.', 'warning')
+        return redirect(url_for('configurar_banco'))
+    try:
+        esquema = montar_esquema_relacionamentos()
+    except (OperationalError, InterfaceError) as error:
+        return handle_db_connection_error(error)
+    except psycopg2.Error as error:
+        flash(f'Erro ao montar os relacionamentos: {error}', 'error')
+        esquema = {'tabelas': [], 'relacoes': []}
+    return render_template('relacionamentos.html', esquema=esquema)
+
+
 @app.route('/importacao-automatica', methods=['GET', 'POST'])
 def importacao_automatica():
     """Lista as tabelas configuradas para importação automática (como as
