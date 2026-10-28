@@ -1,5 +1,5 @@
 {
-  "atualizado_em": "28/10/2026 10:36",
+  "atualizado_em": "28/10/2026 14:30",
   "origem": "172.27.74.16:5451/paciente",
   "schema_remoto": "guardiao",
   "schema_local": "integrasesa",
@@ -11,8 +11,7 @@
         "paciente",
         "pessoafisica",
         "prontuario"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_admissao",
@@ -30,8 +29,7 @@
         "dsc_pp",
         "isn_cid10",
         "primario"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_admissao_diagnostico",
@@ -45,8 +43,7 @@
         "flg_confirmacao",
         "isn_admissao",
         "ordem_cid10"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_admissao_enfermagem",
@@ -132,8 +129,7 @@
         "cod_rede_venosa3",
         "dsc_t",
         "dsc_cod_sist_gastro1"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_ambulatorio",
@@ -148,8 +144,7 @@
         "isn_especialidade",
         "isn_profissional_atendimento",
         "isn_especialidade_atendimento"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_ambulatorio_ocorrencia",
@@ -157,8 +152,7 @@
       "colunas": [
         "isn_ambulatorio_ocorrencia",
         "dsc_ambulatorio_ocorrencia"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_ambulatorio_tipo",
@@ -166,8 +160,7 @@
       "colunas": [
         "isn_ambulatorio_tipo",
         "dsc_ambulatorio_tipo"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_ar_enf",
@@ -238,8 +231,7 @@
         "dat_cadastro",
         "idade_cad",
         "total_braden"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_cid10",
@@ -248,8 +240,7 @@
         "isn_cid10",
         "cod_cid10",
         "dsc_cid10"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_clinica",
@@ -260,8 +251,7 @@
         "v_emergencia",
         "flg_centro_cirurgico",
         "flg_ativo"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_condicao_alta",
@@ -270,8 +260,7 @@
         "isn_condicao_alta",
         "dsc_condicao_alta",
         "isn_motivo_alta"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_conselho",
@@ -280,8 +269,7 @@
         "isn_conselho",
         "cod_conselho",
         "dsc_conselho"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_destino",
@@ -289,8 +277,7 @@
       "colunas": [
         "isn_destino",
         "dsc_destino"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_emergencia_unidade",
@@ -298,8 +285,7 @@
       "colunas": [
         "isn_emergencia_unidade",
         "dsc_emergencia_unidade"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_enfermaria",
@@ -310,8 +296,44 @@
         "dsc_enfermaria",
         "flg_sala_cirurgica",
         "flg_ativo"
-      ],
-      "importada": true
+      ]
+    },
+    {
+      "nome": "v_escala",
+      "tipo": "view",
+      "colunas": [
+        "isn_escala",
+        "isn_usuario_especialidade",
+        "dat_escala",
+        "isn_turno",
+        "qtd_atendimento",
+        "isn_leito",
+        "isn_escala_situacao",
+        "hor_inicio",
+        "hor_fim",
+        "isn_especialidade",
+        "qtd_marcadas",
+        "isn_usuario",
+        "dsc_justificativa",
+        "agrupamento",
+        "dat_cadastro",
+        "flg_substituicao",
+        "dat_sinc",
+        "flg_update",
+        "isn_unidade",
+        "isn_escala_migrada",
+        "qtd_restrito",
+        "qtd_regulado",
+        "qtd_restrito_marcado",
+        "qtd_regulado_marcado",
+        "sexo_paciente",
+        "idade_inicio",
+        "idade_fim",
+        "cod_parametro_agenda",
+        "erro_fastmedic",
+        "cod_parametro_agenda_fort",
+        "isn_usuario_sinc"
+      ]
     },
     {
       "nome": "v_especialidade",
@@ -319,8 +341,7 @@
       "colunas": [
         "isn_especialidade",
         "dsc_especialidade"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_especialidade_internacao",
@@ -331,8 +352,7 @@
         "isn_especialidade",
         "isn_internacao",
         "isn_internacao_leito"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_exame",
@@ -344,8 +364,7 @@
         "flg_exame_externo",
         "flg_prof_realiz",
         "isn_exame_grupo"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_exame_grupo",
@@ -353,8 +372,7 @@
       "colunas": [
         "isn_exame_grupo",
         "dsc_exame_grupo"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_exame_old",
@@ -363,8 +381,7 @@
         "isn_exame",
         "isn_exame_grupo",
         "dsc_exame"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_exame_pep",
@@ -377,8 +394,7 @@
         "isn_internacao",
         "dat_cadastro",
         "dat_realizacao"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_exame_solic",
@@ -403,8 +419,7 @@
         "isn_prof_realizou",
         "isn_internacao_orig",
         "num_boletim"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_exame_solic_item",
@@ -416,16 +431,14 @@
         "isn_exame_grupo",
         "isn_exame",
         "isn_exame_solic"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_exame_solic_matrix",
       "tipo": "view",
       "colunas": [
         "isn_exame_solic_aux"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_exame_solic_old",
@@ -439,8 +452,24 @@
         "isn_internacao",
         "dat_cadastro",
         "dat_realizacao"
-      ],
-      "importada": false
+      ]
+    },
+    {
+      "nome": "v_grupo_medicamento",
+      "tipo": "view",
+      "colunas": [
+        "isn_grupo_medicamento",
+        "dsc_grupo_medicamento",
+        "flg_ficha",
+        "flg_autorizacao",
+        "flg_autorizacao_ccih",
+        "dsc_reacoes_adversas",
+        "dsc_interacoes_medicamentosas",
+        "dsc_contra_indicacoes",
+        "dsc_principio",
+        "num_dias_ccih",
+        "flg_ativo"
+      ]
     },
     {
       "nome": "v_internacao",
@@ -521,8 +550,7 @@
         "num_boletim",
         "isn_internacao_migrada",
         "isn_paciente"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_internacao_admissao",
@@ -537,8 +565,7 @@
         "isn_profissional",
         "isn_clinica",
         "isn_internacao_leito"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_internacao_alta",
@@ -564,8 +591,7 @@
         "cod_regulacao",
         "dat_regulacao",
         "dsc_sequelas_apresentadas"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_internacao_alta_old",
@@ -585,8 +611,7 @@
         "isn_internacao_leito",
         "dsc_resumo_clinico",
         "dsc_exames_realizados"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_internacao_atendimento",
@@ -608,8 +633,7 @@
         "dsc_motivo_encaminhamento",
         "isn_solicitacao_internacao",
         "dsc_justificativa"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_internacao_carater",
@@ -618,8 +642,7 @@
         "isn_internacao_carater",
         "codigo",
         "descricao"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_internacao_leito",
@@ -676,8 +699,7 @@
         "dat_upd",
         "isn_condicao_alta",
         "isn_internacao_leito_migrado"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_internacao_leito_old",
@@ -695,8 +717,7 @@
         "especialidade_profissional_internacao",
         "isn_profissional_alta",
         "especialidade_profissional_alta"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_internacao_old",
@@ -705,8 +726,7 @@
         "isn_internacao",
         "isn_paciente",
         "isn_profissional"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_internacao_risco",
@@ -765,8 +785,7 @@
         "dsc_motivo_encaminhamento",
         "dsc_impressao_diagnostica",
         "isn_internacao_risco_migrada"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_leito",
@@ -778,8 +797,7 @@
         "cod_leito",
         "flg_extra",
         "flg_ativo"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_leito_interditado",
@@ -794,8 +812,7 @@
         "hor_liberacao",
         "isn_usuario_interdicao",
         "isn_usuario_liberacao"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_leito_reserva",
@@ -819,8 +836,7 @@
         "dat_desfazer",
         "isn_usuario_desfazer",
         "dsc_desfazer"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_marcacao",
@@ -881,8 +897,7 @@
         "num_passaporte",
         "flg_estrangeiro",
         "dsc_especialidade"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_marcacao_situacao",
@@ -890,8 +905,7 @@
       "colunas": [
         "isn_marcacao_situacao",
         "dsc_marcacao_situacao"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_motivo_alta",
@@ -899,8 +913,7 @@
       "colunas": [
         "isn_motivo_alta",
         "dsc_motivo_alta"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_municipio",
@@ -908,8 +921,7 @@
       "colunas": [
         "isn_municipio",
         "dsc_municipio"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_ocupacao",
@@ -917,8 +929,7 @@
       "colunas": [
         "isn_ocupacao",
         "dsc_ocupacao"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_paciente",
@@ -960,8 +971,7 @@
         "dsc_folha",
         "dsc_termo",
         "dat_emissao_certidao"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_paciente_old",
@@ -983,8 +993,7 @@
         "dsc_municipio",
         "num_telefone_1",
         "num_telefone_2"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_pais",
@@ -992,8 +1001,157 @@
       "colunas": [
         "isn_pais",
         "dsc_pais"
-      ],
-      "importada": true
+      ]
+    },
+    {
+      "nome": "v_prescricao_pep",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_pep",
+        "isn_prescricao_tipo",
+        "dat_prescricao",
+        "num_conselho",
+        "isn_profissional",
+        "dat_cadastro",
+        "dat_conclusao",
+        "isn_internacao",
+        "isn_internacao_leito",
+        "dsc_obs",
+        "isn_profissional_apz",
+        "dat_apz",
+        "isn_profissional_concl",
+        "isn_usuario_baixa",
+        "dat_baixa",
+        "flg_imp",
+        "dat_analise_farm",
+        "isn_profissional_anal_farm",
+        "dsc_obs_anal_farm",
+        "isn_clinica_anal_farm",
+        "flg_obs_anal_farm",
+        "dat_cancelamento",
+        "isn_profissional_cancelamento",
+        "isn_tev",
+        "flg_tev_nip",
+        "flg_urgente",
+        "flg_imp_apz"
+      ]
+    },
+    {
+      "nome": "v_prescricao_pep_is",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_pep_is",
+        "isn_prescricao_pep",
+        "isn_prescricao_pep_item",
+        "isn_profissional",
+        "dat_cadastro"
+      ]
+    },
+    {
+      "nome": "v_prescricao_pep_item",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_pep_item",
+        "isn_prescricao_pep",
+        "num_item",
+        "isn_tipo_prescricao",
+        "dsc_prescricao",
+        "dat_cadastro",
+        "flg_apz_01",
+        "flg_apz_02",
+        "flg_apz_03",
+        "flg_apz_04",
+        "flg_apz_05",
+        "flg_apz_06",
+        "flg_apz_07",
+        "flg_apz_08",
+        "flg_apz_09",
+        "flg_apz_10",
+        "flg_apz_11",
+        "flg_apz_12",
+        "flg_apz_13",
+        "flg_apz_14",
+        "flg_apz_15",
+        "flg_apz_16",
+        "flg_apz_17",
+        "flg_apz_18",
+        "flg_apz_19",
+        "flg_apz_20",
+        "flg_apz_21",
+        "flg_apz_22",
+        "flg_apz_23",
+        "flg_apz_24",
+        "isn_profissional_apz",
+        "dat_apz",
+        "isn_grupo_medicamento",
+        "flg_se_necessario",
+        "dsc_obs_apz",
+        "isn_prescricao_pep_is",
+        "flg_alterado",
+        "flg_ativo",
+        "flg_item_sugerido",
+        "isn_prescricao_pep_item_susp",
+        "flg_mpp",
+        "flg_dc",
+        "hora_inicio",
+        "intervalo",
+        "isn_prescricao_pep_item_ant",
+        "isn_produto_almox",
+        "dsc_diluicao",
+        "qtd_dose",
+        "isn_prescricao_via",
+        "isn_prescricao_posologia",
+        "dsc_complemento",
+        "qtd_volume",
+        "isn_prescricao_pep_item_proced",
+        "isn_prescricao_pep_item_c_gera",
+        "flg_acm",
+        "dsc_apresentacao",
+        "isn_prescr_pep_item_proced",
+        "isn_dieta",
+        "flg_rediluicao",
+        "dose_diluicao",
+        "flg_associado",
+        "isn_prescricao_pep_item_dieta_zero",
+        "flg_fracionario",
+        "dsc_ultima_dosagem",
+        "isn_prescricao_ultima_dosagem",
+        "qtd_numero_fases",
+        "flg_migrar_para_prescricao",
+        "isn_prescricao_pep_item_hemod_hemoc",
+        "flg_vem_do_agendamento",
+        "isn_prescricao_pep_item_dieta_jejum",
+        "dsc_vazao"
+      ]
+    },
+    {
+      "nome": "v_prescricao_posologia",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_posologia",
+        "dsc_prescricao_posologia",
+        "qtd_prescricao_posologia",
+        "ordem",
+        "flg_aprazamento_obrigatorio"
+      ]
+    },
+    {
+      "nome": "v_prescricao_tipo",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_tipo",
+        "dsc_prescricao_tipo",
+        "flg_ativo",
+        "flg_prescricao_pep"
+      ]
+    },
+    {
+      "nome": "v_prescricao_via",
+      "tipo": "view",
+      "colunas": [
+        "isn_prescricao_via",
+        "dsc_prescricao_via"
+      ]
     },
     {
       "nome": "v_profissional",
@@ -1003,8 +1161,7 @@
         "dsc_usuario",
         "num_conselho",
         "isn_conselho"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_profissional_clinica",
@@ -1013,8 +1170,7 @@
         "isn_profissional_clinica",
         "isn_profissional",
         "isn_clinica"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_risco",
@@ -1025,8 +1181,7 @@
         "dsc_arquivo",
         "limite_espera",
         "flg_ativo"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "v_tipo_atendimento",
@@ -1034,8 +1189,7 @@
       "colunas": [
         "isn_tipo_atendimento",
         "dsc_tipo_atendimento"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_tipo_logradouro",
@@ -1044,8 +1198,23 @@
         "isn_tipo_logradouro",
         "dsc_tipo_logradouro",
         "cod_tipo_logradouro"
-      ],
-      "importada": true
+      ]
+    },
+    {
+      "nome": "v_tipo_prescricao",
+      "tipo": "view",
+      "colunas": [
+        "isn_tipo_prescricao",
+        "dsc_tipo_prescricao",
+        "isn_usuario",
+        "flg_tipo",
+        "num_ordem",
+        "flg_ativo",
+        "dsc_tipo_resumo",
+        "isn_clinica",
+        "flg_novo",
+        "flg_prescricao_padrao"
+      ]
     },
     {
       "nome": "v_tipo_referencia",
@@ -1053,8 +1222,7 @@
       "colunas": [
         "isn_referencia",
         "dsc_referencia"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "v_uf",
@@ -1062,8 +1230,7 @@
       "colunas": [
         "isn_uf",
         "sgl_uf"
-      ],
-      "importada": true
+      ]
     },
     {
       "nome": "vw_diagnosticos",
@@ -1071,8 +1238,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_funcoes",
@@ -1080,8 +1246,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_gruposprocedimento",
@@ -1089,8 +1254,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_hcas_medicos",
@@ -1100,8 +1264,7 @@
         "crm",
         "nome",
         "email"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_hierarquiasprocedimentos",
@@ -1109,8 +1272,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_laudos",
@@ -1188,8 +1350,7 @@
         "datahoraestimadaalta",
         "volumecontraste",
         "tipocontraste"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_laudos_hemo",
@@ -1267,8 +1428,7 @@
         "datahoraestimadaalta",
         "volumecontraste",
         "tipocontraste"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_mapas_hemo",
@@ -1290,8 +1450,7 @@
         "covid19",
         "testertpcr",
         "testerapido"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_mapas_medicos_vinculos",
@@ -1302,8 +1461,7 @@
         "medico_id",
         "vinculo_id",
         "funcao_id"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_mapas_procedimentos",
@@ -1313,8 +1471,7 @@
         "mapa_id",
         "procedimento_id",
         "tipoprocedimento_id"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_medicos",
@@ -1324,8 +1481,7 @@
         "crm",
         "nome",
         "email"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_procedimentos",
@@ -1340,8 +1496,7 @@
         "porte",
         "tipo",
         "grupoprocedimento_id"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_turnos",
@@ -1349,8 +1504,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     },
     {
       "nome": "vw_vinculos",
@@ -1358,8 +1512,7 @@
       "colunas": [
         "id",
         "nome"
-      ],
-      "importada": false
+      ]
     }
   ]
 }
