@@ -20,16 +20,6 @@ app.config['DB_SAVED_CONNECTIONS'] = []
 app.config['DB_SAVED_CONNECTIONS_LOADED'] = False
 app.config['DB_CONFIG_LOADED'] = False
 
-AUTO_IMPORT_EXAMPLES = [
-    {'label': 'Admissão', 'origem': 'v_admissao', 'destino': 't_admissao', 'campo_id': 'isn_admissao'},
-    {'label': 'Exame Solic.', 'origem': 'v_exame_solic', 'destino': 't_exame_solic', 'campo_id': 'isn_exame_solic'},
-    {'label': 'Internação', 'origem': 'v_internacao', 'destino': 't_internacao', 'campo_id': 'isn_internacao'},
-    {'label': 'Internação Alta', 'origem': 'v_internacao_alta', 'destino': 't_internacao_alta', 'campo_id': 'isn_internacao_alta'},
-    {'label': 'Internação Leito', 'origem': 'v_internacao_leito', 'destino': 't_internacao_leito', 'campo_id': 'isn_internacao_leito'},
-    {'label': 'Paciente', 'origem': 'v_paciente', 'destino': 't_paciente', 'campo_id': 'isn_paciente'},
-    {'label': 'Marcação', 'origem': 'v_marcacao', 'destino': 't_marcacao', 'campo_id': 'isn_marcacao'}
-]
-
 # Configuração do Banco de Dados
 DEFAULT_DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
@@ -3027,6 +3017,15 @@ def criar_fdw_route():
         criar_fdw(origem, porta)
         origem['port'] = porta
         persist_fdw_config(origem)
+        # Atualiza também a lista de tabelas (exemplos rápidos), já com as
+        # recém-importadas marcadas — não depende de clicar em "Testar"
+        lista_ok, lista_msg, tabelas = _testar_origem_direta(origem, porta)
+        if tabelas:
+            lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
+            flash(f'Lista de tabelas da origem atualizada: {len(lista["tabelas"])} tabela(s) '
+                  f'disponíveis nos exemplos rápidos.', 'info')
+        else:
+            flash(f'Não foi possível atualizar a lista de tabelas da origem. {lista_msg}', 'warning')
         flash(
             f'FDW criado/atualizado: schema local "{origem["schema_local"]}" '
             f'apontando para {origem["host"]}:{porta}/{origem["database"]} (schema remoto "{origem["schema_remoto"]}").',
@@ -3073,6 +3072,21 @@ def _testar_origem_direta(origem, porta):
                        f'remoto "{origem["schema_remoto"]}" não tem tabelas/views (ou o usuário não tem acesso).'), []
     return True, (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
                   f'{len(tabelas)} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".'), tabelas
+
+
+def salvar_lista_tabelas_fdw(origem, porta, tabelas):
+    """Grava a lista de tabelas da origem (marcando as já importadas no FDW
+    local) — é ela que alimenta os exemplos rápidos das telas de cadastro."""
+    importadas = _foreign_tables_locais(origem['schema_local'])
+    lista = {
+        'atualizado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
+        'origem': f'{origem["host"]}:{porta}/{origem["database"]}',
+        'schema_remoto': origem['schema_remoto'],
+        'schema_local': origem['schema_local'],
+        'tabelas': [{**t, 'importada': t['nome'] in importadas} for t in tabelas],
+    }
+    persist_fdw_tabelas(lista)
+    return lista
 
 
 def _foreign_tables_locais(schema_local):
@@ -3148,16 +3162,8 @@ def testar_fdw_route():
 
     lista = None
     if tabelas:
-        importadas = _foreign_tables_locais(origem['schema_local'])
-        lista = {
-            'atualizado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
-            'origem': f'{origem["host"]}:{porta}/{origem["database"]}',
-            'schema_remoto': origem['schema_remoto'],
-            'schema_local': origem['schema_local'],
-            'tabelas': [{**t, 'importada': t['nome'] in importadas} for t in tabelas],
-        }
         try:
-            persist_fdw_tabelas(lista)
+            lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
         except OSError as error:
             fdw_msg += f'\nAviso: não foi possível salvar a lista de tabelas — {error}'
 
@@ -3625,7 +3631,7 @@ def importacao_automatica():
 
     return render_template(
         'importacao_automatica.html',
-        examples=AUTO_IMPORT_EXAMPLES,
+        examples=get_mapeamentos_fdw(),
         tabelas=tabelas,
         tabela_edicao=tabela_edicao,
         migracoes_disponiveis=migracoes_disponiveis
@@ -5037,7 +5043,7 @@ def agendar_importacao():
 
     return render_template(
         'agendar_importacao.html',
-        examples=AUTO_IMPORT_EXAMPLES,
+        examples=get_mapeamentos_fdw(),
         tabelas=tabelas,
         tabela_edicao=tabela_edicao,
         migracoes_disponiveis=migracoes_disponiveis

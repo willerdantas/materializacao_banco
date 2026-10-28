@@ -2,7 +2,7 @@
   "host": "172.27.74.16",
   "database": "paciente",
   "user": "sistema.guardiao",
-  "password": "gAAAAABq4c6jKvOoZrJk2LtM4T1GOg2IvurupXregVUL0d5D-mav-0NbgENb9UOXlQqpnfvxeQoAjifkEEDKk7c9IKQbdTNpmg==",
+  "password": "gAAAAABq4c8LEO0zd1cxmwXcfOYKcHXe-_fvCErz-GSzBFwCTuziauvrzVH2SfV5hgnJ-M-C05pnfmqGrLh9r2-m6KNiKQj2tw==",
   "schema_remoto": "guardiao",
   "schema_local": "integrasesa",
   "port": 5451

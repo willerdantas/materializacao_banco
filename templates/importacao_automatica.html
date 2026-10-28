@@ -37,17 +37,30 @@
         </div>
 
         {% if not tabela_edicao %}
-        <div class="btn-group" id="auto-import-examples-bar" style="margin-bottom: 12px;">
+        {% if examples %}
+        <div class="btn-group" id="auto-import-examples-bar" style="margin-bottom: 4px; max-height: 160px; overflow-y: auto;">
             {% for example in examples %}
             <button type="button"
-                    class="btn btn-sm {% if loop.index0 % 3 == 0 %}btn-success{% elif loop.index0 % 3 == 1 %}btn-secondary{% else %}btn-warning{% endif %}"
+                    class="btn btn-sm btn-outline"
+                    {% if not example.importada %}style="border-color: var(--color-orange);"{% endif %}
+                    title="{{ example.origem }} → {{ example.destino }} (chave {{ example.campo_id or '?' }}){% if not example.importada %} — ainda não importada no FDW local{% endif %}"
                     data-example-source="{{ example.origem }}"
                     data-example-target="{{ example.destino }}"
                     data-example-key="{{ example.campo_id }}">
-                + {{ example.label }}
+                + {{ '⚠ ' if not example.importada }}{{ example.origem }}
             </button>
             {% endfor %}
         </div>
+        <div class="form-text" style="margin-bottom: 12px;">
+            Tabelas da origem do último teste do FDW — clique para preencher origem, destino e campo chave.
+            {% if examples|rejectattr('importada')|list %}⚠ = ainda não importada no FDW local.{% endif %}
+        </div>
+        {% else %}
+        <div class="form-text" style="margin-bottom: 12px;">
+            Sem exemplos ainda: clique em "Testar conexão FDW" (ou "Criar / Atualizar FDW") em
+            <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> para listar as tabelas da origem.
+        </div>
+        {% endif %}
         {% endif %}
 
         <form method="POST" action="{{ url_for('importacao_automatica') }}" id="form-nova-tabela-auto">
