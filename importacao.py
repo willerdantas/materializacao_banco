@@ -49,6 +49,7 @@ APP_DATA_DIR = os.path.join(app.root_path, 'data')
 SAVED_CONNECTIONS_FILE = os.path.join(APP_DATA_DIR, 'db_saved_connections.json')
 ACTIVE_DB_CONFIG_FILE = os.path.join(APP_DATA_DIR, 'db_active_config.json')
 FDW_CONFIG_FILE = os.path.join(APP_DATA_DIR, 'fdw_config.json')  # credenciais da origem (FDW)
+FDW_TABELAS_FILE = os.path.join(APP_DATA_DIR, 'fdw_tabelas.json')  # última lista de tabelas da origem
 USERS_FILE = os.path.join(APP_DATA_DIR, 'usuarios.json')  # usuários e perfis de acesso
 app.config['DB_CONFIG'] = DEFAULT_DB_CONFIG.copy()
 
@@ -790,6 +791,34 @@ def persist_fdw_config(fdw_config):
     app.config['FDW_CONFIG'] = fdw_config
     app.config['FDW_CONFIG_LOADED'] = True
     save_json_file(FDW_CONFIG_FILE, _config_com_senha_encriptada(fdw_config))
+
+
+def get_fdw_tabelas():
+    """Última lista de tabelas da origem salva pelo "Testar conexão FDW"
+    (reaproveitada nas sugestões da Nova Migração). {} se nunca testou."""
+    dados = load_json_file(FDW_TABELAS_FILE, default={})
+    return dados if isinstance(dados, dict) else {}
+
+
+def persist_fdw_tabelas(dados):
+    save_json_file(FDW_TABELAS_FILE, dados)
+
+
+def sugerir_mapeamento_migracao(tabela):
+    """Origem/destino/campo ID sugeridos pra uma tabela da origem: destino com
+    o prefixo v_ trocado por t_ (v_paciente -> t_paciente) e, como chave, a
+    primeira coluna isn_* (ou a primeira coluna, se não houver)."""
+    nome = tabela['nome']
+    colunas = tabela.get('colunas') or []
+    destino = 't_' + nome[2:] if nome.lower().startswith('v_') else nome
+    campo_id = next((c for c in colunas if c.lower().startswith('isn_')), colunas[0] if colunas else '')
+    return {'origem': nome, 'destino': destino, 'campo_id': campo_id,
+            'tipo': tabela.get('tipo'), 'importada': bool(tabela.get('importada'))}
+
+
+def get_mapeamentos_fdw():
+    """Mapeamentos sugeridos pra todas as tabelas da última lista do FDW."""
+    return [sugerir_mapeamento_migracao(t) for t in get_fdw_tabelas().get('tabelas') or []]
 
 
 # ============================================================
@@ -2830,6 +2859,7 @@ def configurar_banco():
         'configurar_banco.html',
         db_config=db_form,
         fdw_config=fdw_form,
+        fdw_tabelas=get_fdw_tabelas(),
         temp_schema_name=TEMP_SCHEMA_NAME,
         logs_importacao_mantidos=LOGS_IMPORTACAO_MANTIDOS,
         error_details=None,
@@ -3019,21 +3049,46 @@ def _testar_origem_direta(origem, porta):
             connect_timeout=int(os.getenv('DB_TEST_CONNECT_TIMEOUT', '8')),
         )
     except Exception as error:  # noqa: BLE001 - qualquer erro do driver vira mensagem
-        return False, f'Origem: falha ao conectar em {origem["host"]}:{porta}/{origem["database"]} — {error}'
+        return False, f'Origem: falha ao conectar em {origem["host"]}:{porta}/{origem["database"]} — {error}', []
     try:
         with conexao.cursor() as cur:
-            cur.execute(
-                'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s',
-                (origem['schema_remoto'],)
-            )
-            total = cur.fetchone()[0]
+            cur.execute("""
+                SELECT t.table_name, t.table_type,
+                       array_agg(c.column_name::text ORDER BY c.ordinal_position)
+                FROM information_schema.tables t
+                JOIN information_schema.columns c
+                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+                WHERE t.table_schema = %s
+                GROUP BY t.table_name, t.table_type
+                ORDER BY t.table_name
+            """, (origem['schema_remoto'],))
+            tabelas = [
+                {'nome': nome, 'tipo': 'view' if tipo == 'VIEW' else 'tabela', 'colunas': list(colunas)}
+                for nome, tipo, colunas in cur.fetchall()
+            ]
     finally:
         conexao.close()
-    if total == 0:
+    if not tabelas:
         return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas o schema '
-                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views (ou o usuário não tem acesso).')
+                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views (ou o usuário não tem acesso).'), []
     return True, (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
-                  f'{total} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".')
+                  f'{len(tabelas)} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".'), tabelas
+
+
+def _foreign_tables_locais(schema_local):
+    """Nomes das foreign tables já importadas no schema local do FDW."""
+    if not is_db_configured():
+        return set()
+    try:
+        rows = execute_query("""
+            SELECT c.relname FROM pg_foreign_table ft
+            JOIN pg_class c ON c.oid = ft.ftrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+        """, (schema_local,), statement_timeout_ms=15000)
+    except Exception:  # noqa: BLE001 - sem o banco local, só não marca as importadas
+        return set()
+    return {r['relname'] for r in rows}
 
 
 def _testar_via_fdw(schema_local):
@@ -3088,10 +3143,30 @@ def testar_fdw_route():
     except ValueError:
         return jsonify({'sucesso': False, 'mensagem': 'Informe uma porta válida.'})
 
-    direto_ok, direto_msg = _testar_origem_direta(origem, porta)
+    direto_ok, direto_msg, tabelas = _testar_origem_direta(origem, porta)
     fdw_ok, fdw_msg = _testar_via_fdw(origem['schema_local'])
+
+    lista = None
+    if tabelas:
+        importadas = _foreign_tables_locais(origem['schema_local'])
+        lista = {
+            'atualizado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
+            'origem': f'{origem["host"]}:{porta}/{origem["database"]}',
+            'schema_remoto': origem['schema_remoto'],
+            'schema_local': origem['schema_local'],
+            'tabelas': [{**t, 'importada': t['nome'] in importadas} for t in tabelas],
+        }
+        try:
+            persist_fdw_tabelas(lista)
+        except OSError as error:
+            fdw_msg += f'\nAviso: não foi possível salvar a lista de tabelas — {error}'
+
     # FDW ainda não criado (None) não reprova o teste — só a etapa que rodou e falhou
-    return jsonify({'sucesso': direto_ok and fdw_ok is not False, 'mensagem': f'{direto_msg}\n{fdw_msg}'})
+    return jsonify({
+        'sucesso': direto_ok and fdw_ok is not False,
+        'mensagem': f'{direto_msg}\n{fdw_msg}',
+        'lista_tabelas': lista,
+    })
 
 
 @app.route('/logo')
@@ -3314,6 +3389,49 @@ def dashboard():
             manual_em_execucao=manual_em_execucao
         )
 
+# Serializa "conferir duplicidade + criar" — dois envios ao mesmo tempo não
+# podem passar os dois pela verificação
+_nova_migracao_lock = threading.Lock()
+
+
+def buscar_migracao_duplicada(tabela_origem, tabela_destino, ignorar_id=None):
+    """Migração já cadastrada com a mesma tabela de origem ou de destino
+    (nomes já normalizados, sem diferenciar maiúsculas), ou None."""
+    rows = execute_query("""
+        SELECT id, tabela_origem, tabela_destino FROM controle_migracao
+        WHERE (lower(tabela_origem) = lower(%s) OR lower(tabela_destino) = lower(%s))
+          AND (%s IS NULL OR id <> %s)
+        ORDER BY id LIMIT 1
+    """, (tabela_origem, tabela_destino, ignorar_id, ignorar_id))
+    return rows[0] if rows else None
+
+
+def mensagem_migracao_duplicada(existente, tabela_origem):
+    campo = 'origem' if existente['tabela_origem'].lower() == tabela_origem.lower() else 'destino'
+    return (f'Já existe a migração #{existente["id"]} com a mesma tabela de {campo} '
+            f'({existente["tabela_origem"]} → {existente["tabela_destino"]}). '
+            f'Abra ou edite a migração existente em vez de criar outra.')
+
+
+def mapeamentos_fdw_com_migracoes():
+    """Mapeamentos do FDW marcados com a migração já cadastrada pra mesma
+    origem (ou destino), se houver — a tela não oferece criar de novo."""
+    schema_local = (get_fdw_config().get('schema_local') or '').lower()
+    schema_destino = (get_db_config().get('schema_destino') or '').lower()
+    try:
+        migracoes = listar_migracoes_para_selecao()
+    except Exception:  # noqa: BLE001 - sem o banco, só não marca as já cadastradas
+        migracoes = []
+    por_origem = {(m['tabela_origem'] or '').lower(): m['id'] for m in migracoes}
+    por_destino = {(m['tabela_destino'] or '').lower(): m['id'] for m in migracoes}
+    resultado = []
+    for mp in get_mapeamentos_fdw():
+        origem = f'{schema_local}.{mp["origem"]}'.lower()
+        destino = f'{schema_destino}.{mp["destino"]}'.lower()
+        resultado.append({**mp, 'migracao_id': por_origem.get(origem) or por_destino.get(destino)})
+    return resultado
+
+
 @app.route('/nova-migracao', methods=['GET', 'POST'])
 def nova_migracao():
     """Criar ou editar uma migração manual"""
@@ -3342,56 +3460,68 @@ def nova_migracao():
             if is_ajax_request():
                 return jsonify({'status': 'erro', 'mensagem': str(error)}), 400
             flash(str(error), 'error')
-            return render_template('nova_migracao.html', migracao_edicao={'id': editando_id} if editando_id else None)
+            return render_template('nova_migracao.html', fdw_tabelas=get_fdw_tabelas(), fdw_mapeamentos=mapeamentos_fdw_com_migracoes(), migracao_edicao={'id': editando_id} if editando_id else None)
 
         try:
-            tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
+            with _nova_migracao_lock:
+                existente = buscar_migracao_duplicada(tabela_origem, tabela_destino, ignorar_id=editando_id)
+                if existente:
+                    mensagem = mensagem_migracao_duplicada(existente, tabela_origem)
+                    if is_ajax_request():
+                        return jsonify({
+                            'status': 'erro', 'mensagem': mensagem,
+                            'migracao_existente_url': url_for('controle_migracao', id=existente['id']),
+                        }), 409
+                    flash(mensagem, 'error')
+                    return redirect(url_for('controle_migracao', id=existente['id']))
 
-            if editando_id:
-                update_migration_record(
-                    migracao_id=editando_id,
-                    source_table=tabela_origem,
-                    target_table=tabela_destino,
-                    key_column=campo_id
-                )
-                migracao_id_resultado = editando_id
-                mensagem_sucesso = (
-                    f'Migração #{editando_id} atualizada! Recalculando colunas e totais em segundo plano.'
-                )
-            else:
-                migracao = create_migration_record(
-                    source_table=tabela_origem,
-                    target_table=tabela_destino,
-                    key_column=campo_id,
-                    batch_size=tamanho_lote
-                )
-                migracao_id_resultado = migracao['migracao_id']
-                mensagem_sucesso = (
-                    f'Migração #{migracao_id_resultado} registrada! '
-                    f'Acesse o controle para informar a faixa de IDs e iniciar o processamento.'
-                )
+                tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
 
-            if tabela_criada_agora:
-                flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
-            if tabela_origem_raw and tabela_origem_raw.strip() != tabela_origem:
-                flash(f'Tabela origem resolvida automaticamente para: {tabela_origem}', 'info')
-            if tabela_destino_raw and tabela_destino_raw.strip() != tabela_destino:
-                flash(f'Tabela destino resolvida automaticamente para: {tabela_destino}', 'info')
+                if editando_id:
+                    update_migration_record(
+                        migracao_id=editando_id,
+                        source_table=tabela_origem,
+                        target_table=tabela_destino,
+                        key_column=campo_id
+                    )
+                    migracao_id_resultado = editando_id
+                    mensagem_sucesso = (
+                        f'Migração #{editando_id} atualizada! Recalculando colunas e totais em segundo plano.'
+                    )
+                else:
+                    migracao = create_migration_record(
+                        source_table=tabela_origem,
+                        target_table=tabela_destino,
+                        key_column=campo_id,
+                        batch_size=tamanho_lote
+                    )
+                    migracao_id_resultado = migracao['migracao_id']
+                    mensagem_sucesso = (
+                        f'Migração #{migracao_id_resultado} registrada! '
+                        f'Acesse o controle para informar a faixa de IDs e iniciar o processamento.'
+                    )
 
-            # Preparar colunas e totais em segundo plano (apenas COUNT + MAX, não carrega IDs)
-            start_background_refresh_batches(migracao_id_resultado)
+                if tabela_criada_agora:
+                    flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
+                if tabela_origem_raw and tabela_origem_raw.strip() != tabela_origem:
+                    flash(f'Tabela origem resolvida automaticamente para: {tabela_origem}', 'info')
+                if tabela_destino_raw and tabela_destino_raw.strip() != tabela_destino:
+                    flash(f'Tabela destino resolvida automaticamente para: {tabela_destino}', 'info')
 
-            flash(mensagem_sucesso, 'success')
+                # Preparar colunas e totais em segundo plano (apenas COUNT + MAX, não carrega IDs)
+                start_background_refresh_batches(migracao_id_resultado)
 
-            if is_ajax_request():
-                return jsonify({
-                    'status': 'sucesso',
-                    'mensagem': mensagem_sucesso,
-                    'migracao_id': migracao_id_resultado,
-                    'redirect_url': url_for('controle_migracao', id=migracao_id_resultado)
-                })
+                flash(mensagem_sucesso, 'success')
 
-            return redirect(url_for('controle_migracao', id=migracao_id_resultado))
+                if is_ajax_request():
+                    return jsonify({
+                        'status': 'sucesso',
+                        'mensagem': mensagem_sucesso,
+                        'migracao_id': migracao_id_resultado,
+                        'redirect_url': url_for('controle_migracao', id=migracao_id_resultado)
+                    })
+
+                return redirect(url_for('controle_migracao', id=migracao_id_resultado))
         except (OperationalError, InterfaceError) as error:
             if is_ajax_request():
                 response = handle_db_connection_error(error, api=True)
@@ -3414,7 +3544,7 @@ def nova_migracao():
         if migracao_edicao is None:
             flash('Migração não encontrada para edição.', 'error')
 
-    return render_template('nova_migracao.html', migracao_edicao=migracao_edicao)
+    return render_template('nova_migracao.html', fdw_tabelas=get_fdw_tabelas(), fdw_mapeamentos=mapeamentos_fdw_com_migracoes(), migracao_edicao=migracao_edicao)
 
 
 @app.route('/importacao-automatica', methods=['GET', 'POST'])

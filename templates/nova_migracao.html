@@ -25,8 +25,25 @@
                        name="tabela_origem"
                        class="form-control"
                        placeholder="ex: v_paciente"
+                       list="tabelas-origem-fdw"
+                       autocomplete="off"
                        value="{{ migracao_edicao.tabela_origem if migracao_edicao else '' }}"
                        required>
+                {% set tabelas_fdw = (fdw_tabelas or {}).get('tabelas') or [] %}
+                <datalist id="tabelas-origem-fdw">
+                    {% for t in tabelas_fdw %}
+                    <option value="{{ t.nome }}" label="{{ t.tipo }}{{ '' if t.importada else ' · não importada no FDW' }}"></option>
+                    {% endfor %}
+                </datalist>
+                <div class="form-text">
+                    {% if tabelas_fdw %}
+                    {{ tabelas_fdw|length }} tabela(s) da origem para escolher (lista de {{ fdw_tabelas.atualizado_em }}).
+                    Ao escolher, destino e campo ID são sugeridos se estiverem vazios.
+                    {% else %}
+                    Para escolher numa lista, clique em "Testar conexão FDW" em
+                    <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a>.
+                    {% endif %}
+                </div>
             </div>
 
             <div class="form-group">
@@ -85,133 +102,93 @@
     <div class="card-header">
         <div>
             <h2 class="card-title" style="color: var(--color-orange);">Exemplos Rápidos</h2>
-            <p class="card-subtitle">Clique para preencher automaticamente com as tabelas da sua lista de controle</p>
+            <p class="card-subtitle">Mapeamento das tabelas da origem (FDW) — clique para preencher origem, destino e campo ID</p>
         </div>
+        {% if (fdw_mapeamentos or [])|length > 12 %}
+        <input type="search" id="filtro-exemplos" class="form-control" placeholder="Filtrar tabelas..." style="max-width: 240px;">
+        {% endif %}
     </div>
-    
-    <div class="btn-group">
-        <button type="button" class="btn btn-success" onclick="preencherExemplo('admissao')">
-            <span>Admissão</span>
+
+    {% if fdw_mapeamentos %}
+    {% set ja_cadastradas = fdw_mapeamentos | selectattr('migracao_id') | list %}
+    {% set nao_importadas = fdw_mapeamentos | rejectattr('importada') | list %}
+    <div class="btn-group" id="exemplos-fdw" style="max-height: 300px; overflow-y: auto;">
+        {% for mp in fdw_mapeamentos %}
+        {% if mp.migracao_id %}
+        <a href="{{ url_for('controle_migracao', id=mp.migracao_id) }}" class="btn btn-outline btn-sm exemplo-fdw"
+           data-origem="{{ mp.origem }}" style="opacity: 0.55;"
+           title="Já existe a migração #{{ mp.migracao_id }} para esta tabela — clique para abrir">
+            <span>✓ {{ mp.origem }} (#{{ mp.migracao_id }})</span>
+        </a>
+        {% else %}
+        <button type="button" class="btn btn-outline btn-sm exemplo-fdw exemplo-fdw-preencher"
+                data-origem="{{ mp.origem }}" data-destino="{{ mp.destino }}" data-campo-id="{{ mp.campo_id }}"
+                {% if not mp.importada %}style="border-color: var(--color-orange);"{% endif %}
+                title="{{ mp.origem }} → {{ mp.destino }} (chave {{ mp.campo_id or '?' }}){% if not mp.importada %} — ainda não importada no FDW: clique em Criar / Atualizar FDW antes de iniciar{% endif %}">
+            <span>{{ '⚠ ' if not mp.importada }}{{ mp.origem }}</span>
         </button>
-        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('exame_solic')">
-            <span>Exame Solic.</span>
-        </button>
-        <button type="button" class="btn btn-warning" onclick="preencherExemplo('internacao')">
-            <span>Internação</span>
-        </button>
-        <button type="button" class="btn btn-primary" onclick="preencherExemplo('internacao_alta')">
-            <span>Internação Alta</span>
-        </button>
-        <button type="button" class="btn btn-success" onclick="preencherExemplo('internacao_leito')">
-            <span>Internação Leito</span>
-        </button>
-        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('paciente')">
-            <span>Paciente</span>
-        </button>
-        <button type="button" class="btn btn-warning" onclick="preencherExemplo('internacao_old')">
-            <span>Internação Old</span>
-        </button>
-        <button type="button" class="btn btn-primary" onclick="preencherExemplo('internacao_alta_old')">
-            <span>Internação Alta Old</span>
-        </button>
-        <button type="button" class="btn btn-success" onclick="preencherExemplo('internacao_atendimento')">
-            <span>Internação Atendimento</span>
-        </button>
-        <button type="button" class="btn btn-secondary" onclick="preencherExemplo('internacao_leito_old')">
-            <span>Internação Leito Old</span>
-        </button>
-        <button type="button" class="btn btn-warning" onclick="preencherExemplo('marcacao')">
-            <span>Marcação</span>
-        </button>
-        <button type="button" class="btn btn-primary" onclick="preencherExemplo('exame_solic_old')">
-            <span>Exame Solic. Old</span>
-        </button>
+        {% endif %}
+        {% endfor %}
     </div>
-    <div class="form-text mt-2">Os exemplos usam os valores de origem, destino e chave exibidos na imagem enviada.</div>
+    <div class="form-text mt-2">
+        {{ fdw_mapeamentos|length }} tabela(s) da origem (teste do FDW de {{ fdw_tabelas.atualizado_em }}).
+        {% if ja_cadastradas %}✓ = já tem migração cadastrada ({{ ja_cadastradas|length }}) — abre a existente.{% endif %}
+        {% if nao_importadas %}⚠ = ainda não importada no FDW local ({{ nao_importadas|length }}) — clique em "Criar / Atualizar FDW" em
+        <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> antes de iniciar.{% endif %}
+        Confira o destino e o campo ID sugeridos antes de iniciar.
+    </div>
+    {% else %}
+    <div class="form-text">
+        Nenhum mapeamento ainda. Clique em "Testar conexão FDW" em
+        <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> para listar as tabelas da origem.
+    </div>
+    {% endif %}
 </div>
 
 {% endblock %}
 
 {% block extra_js %}
+<script type="application/json" id="fdw-mapeamentos-json">{{ (fdw_mapeamentos or [])|tojson }}</script>
 <script>
-function preencherExemplo(tipo) {
-    const campos = {
-        admissao: {
-            origem: 'v_admissao',
-            destino: 't_admissao',
-            id: 'isn_admissao'
-        },
-        exame_solic: {
-            origem: 'v_exame_solic',
-            destino: 't_exame_solic',
-            id: 'isn_exame_solic'
-        },
-        internacao: {
-            origem: 'v_internacao',
-            destino: 't_internacao',
-            id: 'isn_internacao'
-        },
-        internacao_alta: {
-            origem: 'v_internacao_alta',
-            destino: 't_internacao_alta',
-            id: 'isn_internacao_alta'
-        },
-        internacao_leito: {
-            origem: 'v_internacao_leito',
-            destino: 't_internacao_leito',
-            id: 'isn_internacao_leito'
-        },
-        paciente: {
-            origem: 'v_paciente',
-            destino: 't_paciente',
-            id: 'isn_paciente'
-        },
-        internacao_old: {
-            origem: 'v_internacao_old',
-            destino: 't_internacao_old',
-            id: 'isn_internacao'
-        },
-        internacao_alta_old: {
-            origem: 'v_internacao_alta_old',
-            destino: 't_internacao_alta_old',
-            id: 'isn_internacao_alta'
-        },
-        internacao_atendimento: {
-            origem: 'v_internacao_atendimento',
-            destino: 't_internacao_atendimento',
-            id: 'isn_internacao_atendimento'
-        },
-        internacao_leito_old: {
-            origem: 'v_internacao_leito_old',
-            destino: 't_internacao_leito_old',
-            id: 'isn_internacao_leito'
-        },
-        marcacao: {
-            origem: 'v_marcacao',
-            destino: 't_marcacao',
-            id: 'isn_marcacao'
-        },
-        exame_solic_old: {
-            origem: 'v_exame_solic_old',
-            destino: 't_exame_solic_old',
-            id: 'isn_exame_solic'
-        }
-    };
-    
-    const dados = campos[tipo];
-    if (dados) {
-        document.getElementById('tabela_origem').value = dados.origem;
-        document.getElementById('tabela_destino').value = dados.destino;
-        document.getElementById('campo_id').value = dados.id;
-        
-        // Efeito visual
-        ['tabela_origem', 'tabela_destino', 'campo_id'].forEach(id => {
-            const el = document.getElementById(id);
-            el.style.borderColor = 'var(--color-yellow)';
-            setTimeout(() => el.style.borderColor = '', 500);
-        });
-    }
+// Preenchimento rápido a partir do mapeamento das tabelas do FDW (calculado
+// no servidor: destino v_ -> t_, chave = primeira coluna isn_*)
+function preencherMigracao(mp, sobrescrever) {
+    const campos = { tabela_origem: mp.origem, tabela_destino: mp.destino, campo_id: mp.campo_id };
+    Object.entries(campos).forEach(([id, valor]) => {
+        const el = document.getElementById(id);
+        if (!valor || (!sobrescrever && el.value.trim())) return;
+        el.value = valor;
+        el.style.borderColor = 'var(--color-yellow)';
+        setTimeout(() => el.style.borderColor = '', 500);
+    });
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Botões dos exemplos: preenchem os três campos
+    document.querySelectorAll('.exemplo-fdw-preencher').forEach(btn => {
+        btn.addEventListener('click', () => preencherMigracao({
+            origem: btn.dataset.origem, destino: btn.dataset.destino, campo_id: btn.dataset.campoId,
+        }, true));
+    });
+
+    document.getElementById('filtro-exemplos')?.addEventListener('input', event => {
+        const termo = event.target.value.trim().toLowerCase();
+        document.querySelectorAll('.exemplo-fdw').forEach(btn => {
+            btn.style.display = btn.dataset.origem.toLowerCase().includes(termo) ? '' : 'none';
+        });
+    });
+
+    // Digitou/escolheu a origem na lista: sugere destino e campo ID se vazios
+    let mapeamentos = [];
+    try { mapeamentos = JSON.parse(document.getElementById('fdw-mapeamentos-json').textContent); } catch (_) {}
+    const porNome = Object.fromEntries(mapeamentos.map(mp => [mp.origem.toLowerCase(), mp]));
+    const origem = document.getElementById('tabela_origem');
+    origem.addEventListener('change', () => {
+        // aceita "schema.tabela" — procura só pelo nome
+        const mp = porNome[origem.value.trim().split('.').pop().toLowerCase()];
+        if (mp) preencherMigracao({ ...mp, origem: '' }, false);
+    });
+});
 
 document.addEventListener('DOMContentLoaded', function () {
     const form = document.getElementById('nova-migracao-form');
@@ -289,6 +266,17 @@ document.addEventListener('DOMContentLoaded', function () {
             });
 
             const payload = await parseMigrationResponse(response);
+
+            if (payload.migracao_existente_url) {
+                // Mesma tabela já cadastrada: oferece abrir a migração existente
+                window.clearInterval(stageTimer);
+                setSubmittingState(false);
+                setProgress(0, 'Migração já cadastrada.', payload.mensagem);
+                if (confirm(payload.mensagem + '\n\nAbrir a migração existente?')) {
+                    window.location.href = payload.migracao_existente_url;
+                }
+                return;
+            }
 
             if (!response.ok || payload.status !== 'sucesso') {
                 throw new Error(payload.mensagem || 'Não foi possível iniciar a migração.');

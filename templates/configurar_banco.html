@@ -256,15 +256,38 @@
             <div class="btn-group mt-2">
                 <button type="submit" class="btn btn-primary">Criar / Atualizar FDW</button>
                 <button type="button" id="btn-testar-fdw" class="btn btn-outline"
-                        onclick="testarConexao('btn-testar-fdw', 'resultado-teste-fdw', '{{ url_for("testar_fdw_route") }}')">
+                        onclick="testarConexao('btn-testar-fdw', 'resultado-teste-fdw', '{{ url_for("testar_fdw_route") }}', dados => dados.lista_tabelas && renderizarListaTabelasFdw(dados.lista_tabelas))">
                     <span>Testar conexão FDW</span>
                 </button>
             </div>
             <div class="form-text">
                 O teste confere a origem direto com os dados acima (senha em branco usa a salva) e
                 faz uma consulta pelo FDW já criado no banco local — que é o caminho usado nas importações.
+                A lista de tabelas encontrada fica salva e é sugerida na tela Nova Migração.
             </div>
         </form>
+
+        <div id="lista-tabelas-fdw" style="display: none; margin-top: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
+                <strong id="lista-tabelas-fdw-titulo"></strong>
+                <input type="search" id="lista-tabelas-fdw-filtro" class="form-control" placeholder="Filtrar tabelas..." style="max-width: 260px;">
+            </div>
+            <div class="form-text" id="lista-tabelas-fdw-info" style="margin-bottom: 8px;"></div>
+            <div class="table-container" style="max-height: 320px; overflow-y: auto;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Tabela</th>
+                            <th>Tipo</th>
+                            <th style="text-align: center;">Colunas</th>
+                            <th style="text-align: center;">No FDW local</th>
+                        </tr>
+                    </thead>
+                    <tbody id="lista-tabelas-fdw-corpo"></tbody>
+                </table>
+            </div>
+        </div>
+        <script type="application/json" id="fdw-tabelas-salvas-json">{{ fdw_tabelas|tojson }}</script>
     </div>
 
     <!-- 3) Criar schema temp -->
@@ -449,9 +472,52 @@ function alternarModoConexao() {
 
 document.addEventListener('DOMContentLoaded', alternarModoConexao);
 
+// Lista de tabelas da origem (FDW): a salva no último teste aparece ao abrir
+// a página; um novo teste substitui. Montada com textContent (nomes vêm de
+// outro banco — nunca entram como HTML).
+function renderizarListaTabelasFdw(lista) {
+    const tabelas = (lista && lista.tabelas) || [];
+    if (tabelas.length === 0) return;
+
+    const naoImportadas = tabelas.filter(t => !t.importada).length;
+    document.getElementById('lista-tabelas-fdw-titulo').textContent =
+        `Tabelas da origem (${tabelas.length}) — schema remoto "${lista.schema_remoto}"`;
+    document.getElementById('lista-tabelas-fdw-info').textContent =
+        `${lista.origem} · atualizado em ${lista.atualizado_em}` +
+        (naoImportadas ? ` · ${naoImportadas} ainda não importada(s) no FDW local — clique em "Criar / Atualizar FDW" para importar.` : '');
+
+    const corpo = document.getElementById('lista-tabelas-fdw-corpo');
+    corpo.replaceChildren(...tabelas.map(t => {
+        const tr = document.createElement('tr');
+        tr.dataset.nome = t.nome.toLowerCase();
+        [t.nome, t.tipo, String((t.colunas || []).length), t.importada ? '✓' : '—'].forEach((texto, i) => {
+            const td = document.createElement('td');
+            td.textContent = texto;
+            if (i >= 2) td.style.textAlign = 'center';
+            if (i === 3 && !t.importada) td.style.color = 'var(--color-orange)';
+            tr.appendChild(td);
+        });
+        return tr;
+    }));
+    document.getElementById('lista-tabelas-fdw').style.display = '';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    try {
+        renderizarListaTabelasFdw(JSON.parse(document.getElementById('fdw-tabelas-salvas-json').textContent));
+    } catch (_) { /* sem lista salva */ }
+
+    document.getElementById('lista-tabelas-fdw-filtro')?.addEventListener('input', event => {
+        const termo = event.target.value.trim().toLowerCase();
+        document.querySelectorAll('#lista-tabelas-fdw-corpo tr').forEach(tr => {
+            tr.style.display = tr.dataset.nome.includes(termo) ? '' : 'none';
+        });
+    });
+});
+
 // Teste via AJAX dos dados do formulário do botão, sem salvar nada
 // (usado pela conexão do banco e pelo FDW)
-async function testarConexao(botaoId, resultadoId, url) {
+async function testarConexao(botaoId, resultadoId, url, aoReceber) {
     const botao = document.getElementById(botaoId);
     const resultado = document.getElementById(resultadoId);
     const icone = resultado.querySelector('.alert-icon');
@@ -476,6 +542,7 @@ async function testarConexao(botaoId, resultadoId, url) {
         icone.textContent = dados.sucesso ? '✓' : '✕';
         mensagem.textContent = dados.mensagem;
         resultado.style.display = 'flex';
+        if (aoReceber) aoReceber(dados);
     } catch (erro) {
         resultado.classList.remove('alert-success');
         resultado.classList.add('alert-error');
