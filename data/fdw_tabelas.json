@@ -1,0 +1,1365 @@
+{
+  "atualizado_em": "28/10/2026 10:36",
+  "origem": "172.27.74.16:5451/paciente",
+  "schema_remoto": "guardiao",
+  "schema_local": "integrasesa",
+  "tabelas": [
+    {
+      "nome": "log_table",
+      "tipo": "tabela",
+      "colunas": [
+        "paciente",
+        "pessoafisica",
+        "prontuario"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_admissao",
+      "tipo": "view",
+      "colunas": [
+        "isn_admissao",
+        "isn_internacao",
+        "dat_admissao",
+        "isn_clinica",
+        "isn_internacao_leito",
+        "isn_profissional",
+        "dsc_especialidade",
+        "dsc_qp",
+        "dsc_hda",
+        "dsc_pp",
+        "isn_cid10",
+        "primario"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_admissao_diagnostico",
+      "tipo": "view",
+      "colunas": [
+        "isn_admissao_diagnostico",
+        "isn_cid10",
+        "primario",
+        "isn_usuario",
+        "dat_inc",
+        "flg_confirmacao",
+        "isn_admissao",
+        "ordem_cid10"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_admissao_enfermagem",
+      "tipo": "view",
+      "colunas": [
+        "isn_admissao_enfermagem",
+        "isn_internacao",
+        "isn_internacao_leito",
+        "dat_admissao",
+        "isn_profissional",
+        "flg_queda",
+        "flg_bronco",
+        "flg_les_por_pressao",
+        "flg_dermatite",
+        "flg_flebite",
+        "flg_outros1",
+        "dsc_outros1",
+        "dsc_alergias",
+        "cod_hemovigi",
+        "cod_escala_dor",
+        "dsc_mot_internacao",
+        "flg_hipertensao",
+        "flg_diabetes",
+        "flg_avc",
+        "flg_dpoc",
+        "flg_tuberculose",
+        "flg_ira_irc",
+        "flg_hosp_anterior",
+        "flg_cirur_anterior",
+        "flg_transf_sanguinea",
+        "flg_tabagismo",
+        "flg_etilismo",
+        "flg_drogas_ilicitas",
+        "flg_outros2",
+        "dsc_outros2",
+        "dsc_hist_materna",
+        "dsc_fc",
+        "dsc_fr",
+        "dsc_sato2",
+        "dsc_pam",
+        "dsc_dx",
+        "cod_est_consciencia",
+        "cod_torax",
+        "dsc_cod_torax",
+        "cod_drenos",
+        "dsc_cod_drenos",
+        "cod_fontanelas",
+        "cod_abdomen1",
+        "cod_abdomen2",
+        "cod_drenos2",
+        "dsc_cod_drenos2",
+        "cod_aleit_materno1",
+        "cod_aleit_materno2",
+        "cod_rede_venosa1",
+        "cod_rede_venosa2",
+        "cod_cond_pele",
+        "dsc_cod_cond_pele",
+        "cod_ativ_motora1",
+        "cod_ativ_motora2",
+        "cod_sist_respiratorio1",
+        "cod_sist_respiratorio2",
+        "cod_sist_respiratorio3",
+        "cod_sist_respiratorio4",
+        "cod_sist_gastro1",
+        "cod_sist_gastro2",
+        "dsc_cod_sist_gastro2",
+        "cod_sist_gastro3",
+        "dsc_cod_sist_gastro3",
+        "cod_sist_genit1",
+        "cod_sist_genit2",
+        "dsc_cod_sist_genit2",
+        "dsc_aval_enfermeiro",
+        "total_bps",
+        "isn_risco_bps",
+        "isn_ar_enf",
+        "isn_risco_nas",
+        "isn_risco_nips",
+        "isn_risco_esel11",
+        "dsc_escala_braden",
+        "dsc_esel11",
+        "tot_nas",
+        "total_nips",
+        "cod_rede_venosa3",
+        "dsc_t",
+        "dsc_cod_sist_gastro1"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_ambulatorio",
+      "tipo": "view",
+      "colunas": [
+        "isn_ambulatorio",
+        "isn_paciente",
+        "num_prontuario",
+        "dat_ambulatorio",
+        "hor_ambulatorio",
+        "isn_profissional",
+        "isn_especialidade",
+        "isn_profissional_atendimento",
+        "isn_especialidade_atendimento"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_ambulatorio_ocorrencia",
+      "tipo": "view",
+      "colunas": [
+        "isn_ambulatorio_ocorrencia",
+        "dsc_ambulatorio_ocorrencia"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_ambulatorio_tipo",
+      "tipo": "view",
+      "colunas": [
+        "isn_ambulatorio_tipo",
+        "dsc_ambulatorio_tipo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_ar_enf",
+      "tipo": "view",
+      "colunas": [
+        "isn_ar_enf",
+        "isn_internacao",
+        "isn_internacao_leito",
+        "cod_1_1",
+        "cod_1_2",
+        "cod_1_3",
+        "cod_1_4",
+        "cod_1_5",
+        "cod_1_6",
+        "cod_1_7",
+        "cod_1_2_a",
+        "cod_1_2_b",
+        "cod_1_2_c",
+        "cod_1_2_d",
+        "cod_1_2_e",
+        "dsc_escala_braden",
+        "dsc_escala_braden_ap",
+        "dat_ulsera_pressao",
+        "hor_ulsera_pressao",
+        "cod_2_1",
+        "cod_2_2",
+        "cod_2_3",
+        "cod_2_4",
+        "cod_2_5",
+        "cod_2_6",
+        "cod_2_7",
+        "cod_2_8",
+        "dat_queda",
+        "hor_queda",
+        "dsc_queda",
+        "cod_3_1",
+        "cod_3_2",
+        "cod_3_3",
+        "cod_3_4",
+        "cod_3_5",
+        "cod_3_6",
+        "cod_3_7",
+        "cod_3_8",
+        "cod_3_9",
+        "cod_3_10",
+        "dat_flebite",
+        "hor_flebite",
+        "dsc_flebite",
+        "cod_4_1",
+        "cod_4_2",
+        "cod_4_3",
+        "cod_4_4",
+        "cod_4_5",
+        "cod_4_6",
+        "cod_4_7",
+        "cod_4_8",
+        "cod_4_9",
+        "cod_4_10",
+        "cod_4_11",
+        "cod_4_12",
+        "cod_4_13",
+        "cod_4_14",
+        "cod_4_15",
+        "dat_broncoaspiracao",
+        "hor_broncoaspiracao",
+        "dsc_broncoaspiracao",
+        "isn_profissional",
+        "dat_cadastro",
+        "idade_cad",
+        "total_braden"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_cid10",
+      "tipo": "view",
+      "colunas": [
+        "isn_cid10",
+        "cod_cid10",
+        "dsc_cid10"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_clinica",
+      "tipo": "view",
+      "colunas": [
+        "isn_clinica",
+        "dsc_clinica",
+        "v_emergencia",
+        "flg_centro_cirurgico",
+        "flg_ativo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_condicao_alta",
+      "tipo": "view",
+      "colunas": [
+        "isn_condicao_alta",
+        "dsc_condicao_alta",
+        "isn_motivo_alta"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_conselho",
+      "tipo": "view",
+      "colunas": [
+        "isn_conselho",
+        "cod_conselho",
+        "dsc_conselho"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_destino",
+      "tipo": "view",
+      "colunas": [
+        "isn_destino",
+        "dsc_destino"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_emergencia_unidade",
+      "tipo": "view",
+      "colunas": [
+        "isn_emergencia_unidade",
+        "dsc_emergencia_unidade"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_enfermaria",
+      "tipo": "view",
+      "colunas": [
+        "isn_enfermaria",
+        "isn_clinica",
+        "dsc_enfermaria",
+        "flg_sala_cirurgica",
+        "flg_ativo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_especialidade",
+      "tipo": "view",
+      "colunas": [
+        "isn_especialidade",
+        "dsc_especialidade"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_especialidade_internacao",
+      "tipo": "view",
+      "colunas": [
+        "isn_especialidade_internacao",
+        "isn_especialidade_normalizada",
+        "isn_especialidade",
+        "isn_internacao",
+        "isn_internacao_leito"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_exame",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame",
+        "dsc_exame",
+        "dsc_cbo",
+        "flg_exame_externo",
+        "flg_prof_realiz",
+        "isn_exame_grupo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_exame_grupo",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_grupo",
+        "dsc_exame_grupo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_exame_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame",
+        "isn_exame_grupo",
+        "dsc_exame"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_exame_pep",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_pep",
+        "isn_exame_grupo",
+        "isn_exame",
+        "isn_profissional",
+        "isn_internacao",
+        "dat_cadastro",
+        "dat_realizacao"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_exame_solic",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_solic",
+        "isn_exame_solic_aux",
+        "num_prontuario",
+        "isn_clinica",
+        "dat_solicitacao",
+        "isn_exame_grupo",
+        "isn_exame",
+        "dat_cadastro",
+        "isn_profissional",
+        "isn_internacao",
+        "dat_agendamento",
+        "dat_realizacao",
+        "dat_cancelamento",
+        "num_conselho",
+        "flg_laboratorio",
+        "cod_pedido_matrix",
+        "isn_prof_realizou",
+        "isn_internacao_orig",
+        "num_boletim"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_exame_solic_item",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_solic_item",
+        "isn_exame_solic_aux",
+        "num_prontuario",
+        "isn_exame_grupo",
+        "isn_exame",
+        "isn_exame_solic"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_exame_solic_matrix",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_solic_aux"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_exame_solic_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_exame_solic",
+        "isn_exame_grupo",
+        "isn_exame",
+        "isn_profissional",
+        "dsc_especialidade",
+        "isn_internacao",
+        "dat_cadastro",
+        "dat_realizacao"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_internacao",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao",
+        "isn_profissional",
+        "cod_escolaridade",
+        "isn_ocupacao",
+        "dsc_endereco",
+        "dsc_complemento",
+        "dsc_bairro",
+        "dsc_cidade",
+        "isn_uf",
+        "isn_municipio",
+        "num_cep",
+        "num_ddd_1",
+        "cod_tipo_telefone_1",
+        "num_telefone_1",
+        "hor_chegada",
+        "cod_documento",
+        "num_documento",
+        "isn_cid10",
+        "dsc_cirurgia",
+        "dsc_responsavel",
+        "dat_cadastro",
+        "dsc_obs",
+        "dat_chegada",
+        "isn_referencia",
+        "isn_internacao_old",
+        "dsc_religiao",
+        "dsc_telefone_1_contato",
+        "dsc_telefone_2_contato",
+        "dsc_medicamento",
+        "flg_acidente_trabalho",
+        "isn_tipo_atendimento",
+        "isn_internacao_ant",
+        "nota_avaliacao",
+        "num_declaracao_obito",
+        "dat_validacao",
+        "num_tipo_obito",
+        "proc_cirurgico",
+        "isn_profissional_alta",
+        "isn_profissional_atendimento",
+        "flg_atendimento",
+        "isn_bairro",
+        "flg_atendendo",
+        "flg_risco",
+        "isn_internacao_vinculada",
+        "flg_internacao_vinculada",
+        "dat_sinc",
+        "isn_tipo_logradouro",
+        "flg_laudo_aih",
+        "flg_relat_saida",
+        "flg_relat_cirur",
+        "flg_gasto_sala",
+        "flg_ficha_acomp_anest",
+        "flg_saep",
+        "flg_presc_enferm",
+        "flg_evol_multiprof",
+        "flg_admis_enferm",
+        "flg_anam",
+        "flg_fas",
+        "dsc_exam_esp_exter",
+        "num_pags",
+        "flg_reg_intern",
+        "flg_presc_med_odont",
+        "flg_ddh",
+        "dat_relat_ddh",
+        "flg_caracteristica_atendimento",
+        "dat_dieta_zero",
+        "isn_unidade",
+        "isn_classificacao_internacao",
+        "num_residencia",
+        "flg_retorno",
+        "isn_emergencia_unidade",
+        "isn_clinica_pendente",
+        "num_boletim",
+        "isn_internacao_migrada",
+        "isn_paciente"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_internacao_admissao",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_admissao",
+        "isn_internacao",
+        "dat_cadastro",
+        "isn_cid10_principal",
+        "isn_cid10_secundario",
+        "isn_cid10_terciario",
+        "isn_profissional",
+        "isn_clinica",
+        "isn_internacao_leito"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_internacao_alta",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_alta",
+        "isn_internacao",
+        "dat_cadastro",
+        "dat_programada",
+        "cod_tipo_alta",
+        "isn_cid10_principal",
+        "isn_cid10_secundario",
+        "isn_cid10_terciario",
+        "isn_profissional",
+        "isn_clinica",
+        "isn_internacao_leito",
+        "dsc_resumo_clinico",
+        "dsc_exames_realizados",
+        "dsc_diagnostico",
+        "cod_regulacao_est",
+        "dat_regulacao_est",
+        "dsc_justificativa_outros",
+        "cod_regulacao",
+        "dat_regulacao",
+        "dsc_sequelas_apresentadas"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_internacao_alta_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_alta",
+        "isn_internacao",
+        "dat_cadastro",
+        "dat_programada",
+        "cod_tipo_alta",
+        "isn_cid10_principal",
+        "isn_cid10_secundario",
+        "isn_cid10_terciario",
+        "isn_profissional",
+        "dsc_especialidade",
+        "isn_clinica",
+        "isn_internacao_leito",
+        "dsc_resumo_clinico",
+        "dsc_exames_realizados"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_internacao_atendimento",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_atendimento",
+        "isn_internacao",
+        "dsc_atendimento",
+        "isn_profissional",
+        "isn_clinica_destino",
+        "dsc_destino_atendimento",
+        "hipoteses_diagnostico",
+        "dat_ini",
+        "dsc_hor_ini",
+        "dat_fim",
+        "dsc_hor_fim",
+        "isn_especialidade",
+        "isn_cid10",
+        "dsc_motivo_encaminhamento",
+        "isn_solicitacao_internacao",
+        "dsc_justificativa"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_internacao_carater",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_carater",
+        "codigo",
+        "descricao"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_internacao_leito",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_leito",
+        "isn_internacao",
+        "dat_internacao",
+        "isn_clinica",
+        "isn_enfermaria",
+        "isn_leito",
+        "dsc_obs_internacao",
+        "dat_alta",
+        "cod_destino",
+        "dsc_obs_alta",
+        "isn_usuario",
+        "dat_alta_info",
+        "hor_alta_info",
+        "dat_internacao_info",
+        "hor_internacao_info",
+        "isn_hospital_destino",
+        "num_reserva",
+        "flg_regulacao",
+        "isn_profissional_internacao",
+        "isn_profissional_alta",
+        "flg_checar",
+        "isn_diaria",
+        "isn_clinica_destino",
+        "isn_clinica_trans",
+        "isn_enfermaria_trans",
+        "isn_leito_trans",
+        "flg_ajuste",
+        "flg_primeiro",
+        "isn_destino",
+        "isn_regulacao",
+        "num_regulacao",
+        "dat_transf",
+        "isn_usuario_alta",
+        "isn_usuario_transf",
+        "hor_transf",
+        "hor_alta",
+        "hor_internacao",
+        "isn_internacaoleito_ant",
+        "isn_motivo_alta",
+        "isn_internacao_alta",
+        "flg_baixa",
+        "dat_sinc",
+        "flg_update",
+        "flg_recepcao",
+        "isn_clinica_origem",
+        "flg_ultimo",
+        "isn_unidade",
+        "dat_obito_info",
+        "dat_upd",
+        "isn_condicao_alta",
+        "isn_internacao_leito_migrado"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_internacao_leito_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_leito",
+        "isn_internacao",
+        "dat_internacao",
+        "hor_internacao",
+        "dat_alta",
+        "hor_alta",
+        "flg_primeiro",
+        "flg_ultimo",
+        "isn_profissional_internacao",
+        "especialidade_profissional_internacao",
+        "isn_profissional_alta",
+        "especialidade_profissional_alta"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_internacao_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao",
+        "isn_paciente",
+        "isn_profissional"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_internacao_risco",
+      "tipo": "view",
+      "colunas": [
+        "isn_internacao_risco",
+        "isn_internacao",
+        "isn_risco",
+        "dat_registro",
+        "hor_registro",
+        "isn_usuario",
+        "isn_especialidade_emergencia",
+        "isn_fluxograma",
+        "dsc_discriminador",
+        "dsc_queixa",
+        "dsc_sato2",
+        "dsc_glassgow",
+        "dsc_glicemia",
+        "dsc_regua_dor",
+        "dsc_fc",
+        "flg_acidente",
+        "flg_agressao",
+        "dsc_temperatura",
+        "dsc_peso",
+        "flg_atendendo",
+        "dsc_pa",
+        "flg_risco",
+        "dat_ini",
+        "dsc_hor_ini",
+        "dat_sinc",
+        "flg_update",
+        "isn_risco_dengue",
+        "flg_dengue",
+        "inserido_por",
+        "flg_ultimo",
+        "flg_suspeita_infeccao",
+        "cod_tela1",
+        "flg_autoagressao",
+        "dsc_fr",
+        "hora_ecg",
+        "dsc_hospital_destino",
+        "dsc_justificativa",
+        "dsc_sistolica",
+        "dsc_diastolica",
+        "abertura_ocular",
+        "resposta_verbal",
+        "resposta_motora",
+        "tipo_dor_toracica",
+        "dsc_outras_queixas",
+        "flg_oxigenio_respiratorio",
+        "flg_eletrocardiograma",
+        "flg_classificacao_manual",
+        "isn_usuario_salva",
+        "flg_outras_solicitacoes",
+        "dsc_destino",
+        "dsc_motivo_encaminhamento",
+        "dsc_impressao_diagnostica",
+        "isn_internacao_risco_migrada"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_leito",
+      "tipo": "view",
+      "colunas": [
+        "isn_leito",
+        "isn_enfermaria",
+        "dsc_leito",
+        "cod_leito",
+        "flg_extra",
+        "flg_ativo"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_leito_interditado",
+      "tipo": "view",
+      "colunas": [
+        "isn_leito_interditado",
+        "isn_leito",
+        "dat_interdicao",
+        "hor_interdicao",
+        "dsc_motivo",
+        "dat_liberacao",
+        "hor_liberacao",
+        "isn_usuario_interdicao",
+        "isn_usuario_liberacao"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_leito_reserva",
+      "tipo": "view",
+      "colunas": [
+        "isn_leito_reserva",
+        "isn_leito",
+        "isn_profissional",
+        "dat_reserva",
+        "dsc_paciente",
+        "dsc_diagnostico",
+        "dsc_origem",
+        "dat_chegada",
+        "hor_chegada",
+        "hor_reserva",
+        "isn_usuario",
+        "dsc_idade",
+        "isn_usuario_liberacao",
+        "dsc_obs",
+        "flg_checar",
+        "dat_desfazer",
+        "isn_usuario_desfazer",
+        "dsc_desfazer"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_marcacao",
+      "tipo": "view",
+      "colunas": [
+        "isn_marcacao",
+        "isn_escala",
+        "isn_paciente",
+        "dsc_contato",
+        "dsc_obs",
+        "isn_usuario_cad",
+        "isn_marcacao_situacao",
+        "isn_tipo_consulta",
+        "flg_prioritario",
+        "dsc_prioritario",
+        "flg_presente",
+        "isn_usuario_profissional",
+        "isn_especialidade",
+        "dsc_nome",
+        "dat_cadastro",
+        "hor_chegada",
+        "flg_tap",
+        "isn_internacao",
+        "hor_saida",
+        "hor_ini_amb",
+        "hor_fim_amb",
+        "dsc_obs_ambulatorial",
+        "dsc_motivo_cancelamento",
+        "isn_usuario_alt",
+        "dat_alteracao",
+        "isn_tipo_telefone_1",
+        "num_ddd_1",
+        "num_telefone_1",
+        "isn_tipo_telefone_2",
+        "num_ddd_2",
+        "num_telefone_2",
+        "dsc_contato_2",
+        "isn_tipo_prioridade",
+        "dsc_justificativa_falta",
+        "isn_unidade",
+        "dat_sinc",
+        "flg_update",
+        "isn_entidade",
+        "nome_social",
+        "flg_nome_social",
+        "dsc_obs_consulta_externa",
+        "num_prontuario_referencia",
+        "dat_nascimento",
+        "num_cns",
+        "chamado_atendimento",
+        "marcacao_hash",
+        "isn_marcacao_migrada",
+        "vaga_restrita",
+        "numanocompetencia",
+        "codagendamento",
+        "seqagendamento",
+        "num_cpf",
+        "num_passaporte",
+        "flg_estrangeiro",
+        "dsc_especialidade"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_marcacao_situacao",
+      "tipo": "view",
+      "colunas": [
+        "isn_marcacao_situacao",
+        "dsc_marcacao_situacao"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_motivo_alta",
+      "tipo": "view",
+      "colunas": [
+        "isn_motivo_alta",
+        "dsc_motivo_alta"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_municipio",
+      "tipo": "view",
+      "colunas": [
+        "isn_municipio",
+        "dsc_municipio"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_ocupacao",
+      "tipo": "view",
+      "colunas": [
+        "isn_ocupacao",
+        "dsc_ocupacao"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_paciente",
+      "tipo": "view",
+      "colunas": [
+        "isn_paciente",
+        "num_prontuario",
+        "dsc_nome",
+        "dsc_sexo",
+        "dat_nascimento",
+        "dsc_mae",
+        "num_cns",
+        "num_cep",
+        "dsc_endereco",
+        "dsc_complemento",
+        "dsc_bairro",
+        "dsc_uf",
+        "dsc_municipio",
+        "cod_tipo_telefone_1",
+        "num_ddd_1",
+        "num_telefone_1",
+        "cod_tipo_telefone_2",
+        "num_ddd_2",
+        "num_telefone_2",
+        "dsc_cor",
+        "nome_social",
+        "dsc_pai",
+        "cod_estado_civil",
+        "isn_municipio_naturalidade",
+        "num_rg",
+        "dsc_orgao_emissao_rg",
+        "dat_emissao_rg",
+        "num_cpf",
+        "isn_nacionalidade",
+        "isn_naturalidade",
+        "isn_uf_naturalidade",
+        "dsc_cartorio",
+        "dsc_livro",
+        "dsc_folha",
+        "dsc_termo",
+        "dat_emissao_certidao"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_paciente_old",
+      "tipo": "view",
+      "colunas": [
+        "isn_paciente",
+        "num_prontuario",
+        "dsc_nome",
+        "dsc_sexo",
+        "dat_nascimento",
+        "dsc_cor",
+        "dsc_mae",
+        "num_cns",
+        "num_cep",
+        "dsc_endereco",
+        "dsc_complemento",
+        "dsc_bairro",
+        "dsc_uf",
+        "dsc_municipio",
+        "num_telefone_1",
+        "num_telefone_2"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_pais",
+      "tipo": "view",
+      "colunas": [
+        "isn_pais",
+        "dsc_pais"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_profissional",
+      "tipo": "view",
+      "colunas": [
+        "isn_usuario",
+        "dsc_usuario",
+        "num_conselho",
+        "isn_conselho"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_profissional_clinica",
+      "tipo": "view",
+      "colunas": [
+        "isn_profissional_clinica",
+        "isn_profissional",
+        "isn_clinica"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_risco",
+      "tipo": "view",
+      "colunas": [
+        "isn_risco",
+        "dsc_risco",
+        "dsc_arquivo",
+        "limite_espera",
+        "flg_ativo"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "v_tipo_atendimento",
+      "tipo": "view",
+      "colunas": [
+        "isn_tipo_atendimento",
+        "dsc_tipo_atendimento"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_tipo_logradouro",
+      "tipo": "view",
+      "colunas": [
+        "isn_tipo_logradouro",
+        "dsc_tipo_logradouro",
+        "cod_tipo_logradouro"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_tipo_referencia",
+      "tipo": "view",
+      "colunas": [
+        "isn_referencia",
+        "dsc_referencia"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "v_uf",
+      "tipo": "view",
+      "colunas": [
+        "isn_uf",
+        "sgl_uf"
+      ],
+      "importada": true
+    },
+    {
+      "nome": "vw_diagnosticos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_funcoes",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_gruposprocedimento",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_hcas_medicos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "crm",
+        "nome",
+        "email"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_hierarquiasprocedimentos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_laudos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "mapa_id",
+        "texto",
+        "datarealizacao",
+        "medicoautor_id",
+        "status",
+        "med_estatina",
+        "med_aas",
+        "med_clopidogrel",
+        "med_brilinta",
+        "med_prasugrel",
+        "outros_med",
+        "trat_sugerido",
+        "outros_trat",
+        "houveintervencaocoronaria",
+        "houveintercorrencias",
+        "procedimentoadhoc",
+        "padraoarterialtce",
+        "padraoarterialda",
+        "padraoarterialcx",
+        "padraoarterialcd",
+        "numerolesoestratadas",
+        "numerovasosalvo",
+        "numerostentsimplantados",
+        "tipointervencaocoronaria",
+        "anginaultimas24h",
+        "infrast",
+        "troponina",
+        "killip",
+        "localizacaoinfartoanterior",
+        "localizacaoinfartoseptal",
+        "localizacaoinfartolateral",
+        "localizacaoinfartoinferior",
+        "localizacaoinfartodorsal",
+        "localizacaoinfartovd",
+        "localizacaoinfartobre",
+        "deltatiam",
+        "datahoraaberturaarteria",
+        "tratamentolesaonaoculpada",
+        "posfibrinolise",
+        "estrategiaposfibrinolise",
+        "criteriosreperfusao",
+        "horasposfibrinolise",
+        "procedimentoestadiado",
+        "procedimentoestadiadorealizadomesmainternacao",
+        "isquemiaposprimeiraintervencao",
+        "choquecardiogenico",
+        "instabilidadeeletrica",
+        "pospcr",
+        "intubacaoorotraqueal",
+        "edemaagudopulmao",
+        "vasopressor",
+        "inotropico",
+        "pasmaiorque100",
+        "fcmaiorque100",
+        "outrasituacaoespecial",
+        "outrasituacaomaiorgravidadedesc",
+        "farma_aas",
+        "farma_clopidogrel",
+        "farma_ticagrelor",
+        "farma_prasugrel",
+        "farma_cilostasol",
+        "farma_tirofiban",
+        "farma_abciximab",
+        "farma_heparinanaofracionada",
+        "farma_heparinabaixopesomolecular",
+        "farma_fondaparinux",
+        "farma_fibrinoliticointracoronario",
+        "outros_medadjuvantes",
+        "datahoraestimadaalta",
+        "volumecontraste",
+        "tipocontraste"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_laudos_hemo",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "mapa_id",
+        "texto",
+        "datarealizacao",
+        "medicoautor_id",
+        "status",
+        "med_estatina",
+        "med_aas",
+        "med_clopidogrel",
+        "med_brilinta",
+        "med_prasugrel",
+        "outros_med",
+        "trat_sugerido",
+        "outros_trat",
+        "houveintervencaocoronaria",
+        "houveintercorrencias",
+        "procedimentoadhoc",
+        "padraoarterialtce",
+        "padraoarterialda",
+        "padraoarterialcx",
+        "padraoarterialcd",
+        "numerolesoestratadas",
+        "numerovasosalvo",
+        "numerostentsimplantados",
+        "tipointervencaocoronaria",
+        "anginaultimas24h",
+        "infrast",
+        "troponina",
+        "killip",
+        "localizacaoinfartoanterior",
+        "localizacaoinfartoseptal",
+        "localizacaoinfartolateral",
+        "localizacaoinfartoinferior",
+        "localizacaoinfartodorsal",
+        "localizacaoinfartovd",
+        "localizacaoinfartobre",
+        "deltatiam",
+        "datahoraaberturaarteria",
+        "tratamentolesaonaoculpada",
+        "posfibrinolise",
+        "estrategiaposfibrinolise",
+        "criteriosreperfusao",
+        "horasposfibrinolise",
+        "procedimentoestadiado",
+        "procedimentoestadiadorealizadomesmainternacao",
+        "isquemiaposprimeiraintervencao",
+        "choquecardiogenico",
+        "instabilidadeeletrica",
+        "pospcr",
+        "intubacaoorotraqueal",
+        "edemaagudopulmao",
+        "vasopressor",
+        "inotropico",
+        "pasmaiorque100",
+        "fcmaiorque100",
+        "outrasituacaoespecial",
+        "outrasituacaomaiorgravidadedesc",
+        "farma_aas",
+        "farma_clopidogrel",
+        "farma_ticagrelor",
+        "farma_prasugrel",
+        "farma_cilostasol",
+        "farma_tirofiban",
+        "farma_abciximab",
+        "farma_heparinanaofracionada",
+        "farma_heparinabaixopesomolecular",
+        "farma_fondaparinux",
+        "farma_fibrinoliticointracoronario",
+        "outros_medadjuvantes",
+        "datahoraestimadaalta",
+        "volumecontraste",
+        "tipocontraste"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_mapas_hemo",
+      "tipo": "tabela",
+      "colunas": [
+        "paciente_id",
+        "id",
+        "integrash",
+        "prontuario",
+        "turno",
+        "datarealizacao",
+        "diagnostico_id",
+        "nomepacientemapa",
+        "datanascimentomapa",
+        "nomemaemapa",
+        "datahoracadastro",
+        "peso",
+        "altura",
+        "covid19",
+        "testertpcr",
+        "testerapido"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_mapas_medicos_vinculos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "mapa_id",
+        "medico_id",
+        "vinculo_id",
+        "funcao_id"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_mapas_procedimentos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "mapa_id",
+        "procedimento_id",
+        "tipoprocedimento_id"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_medicos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "crm",
+        "nome",
+        "email"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_procedimentos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome",
+        "natureza",
+        "tuss",
+        "valor",
+        "cbhpm",
+        "porte",
+        "tipo",
+        "grupoprocedimento_id"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_turnos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    },
+    {
+      "nome": "vw_vinculos",
+      "tipo": "tabela",
+      "colunas": [
+        "id",
+        "nome"
+      ],
+      "importada": false
+    }
+  ]
+}

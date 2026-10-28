@@ -42,18 +42,16 @@
             {% for example in examples %}
             <button type="button"
                     class="btn btn-sm btn-outline"
-                    {% if not example.importada %}style="border-color: var(--color-orange);"{% endif %}
-                    title="{{ example.origem }} → {{ example.destino }} (chave {{ example.campo_id or '?' }}){% if not example.importada %} — ainda não importada no FDW local{% endif %}"
+                    title="{{ example.origem }} → {{ example.destino }} (chave {{ example.campo_id or '?' }})"
                     data-example-source="{{ example.origem }}"
                     data-example-target="{{ example.destino }}"
                     data-example-key="{{ example.campo_id }}">
-                + {{ '⚠ ' if not example.importada }}{{ example.origem }}
+                + {{ example.origem }}
             </button>
             {% endfor %}
         </div>
         <div class="form-text" style="margin-bottom: 12px;">
             Tabelas da origem do último teste do FDW — clique para preencher origem, destino e campo chave.
-            {% if examples|rejectattr('importada')|list %}⚠ = ainda não importada no FDW local.{% endif %}
         </div>
         {% else %}
         <div class="form-text" style="margin-bottom: 12px;">

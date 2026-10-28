@@ -461,6 +461,8 @@ def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_se
                 tab_orig = cfg['tabela_origem']
                 tab_dest = cfg['tabela_destino']
                 campo = cfg['campo_id']
+                # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
+                sincronizar_tabela_origem(tab_orig)
                 cols_ins = cfg['sql_colunas_insert']
                 cols_sel = cfg['sql_colunas_select']
 
@@ -802,8 +804,7 @@ def sugerir_mapeamento_migracao(tabela):
     colunas = tabela.get('colunas') or []
     destino = 't_' + nome[2:] if nome.lower().startswith('v_') else nome
     campo_id = next((c for c in colunas if c.lower().startswith('isn_')), colunas[0] if colunas else '')
-    return {'origem': nome, 'destino': destino, 'campo_id': campo_id,
-            'tipo': tabela.get('tipo'), 'importada': bool(tabela.get('importada'))}
+    return {'origem': nome, 'destino': destino, 'campo_id': campo_id, 'tipo': tabela.get('tipo')}
 
 
 def get_mapeamentos_fdw():
@@ -1241,6 +1242,14 @@ def _background_refresh_batches_worker(job_id, migration_id):
                 **get_background_job(job_id),
                 'mensagem': 'Preparando colunas e obtendo totais da migração...',
             })
+
+            # Origem direto do FDW: atualiza a tabela estrangeira antes de ler
+            # as colunas (pega colunas novas da origem)
+            origem_rows = execute_query(
+                "SELECT tabela_origem FROM controle_migracao WHERE id = %s", (migration_id,)
+            )
+            if origem_rows:
+                sincronizar_tabela_origem(origem_rows[0]['tabela_origem'], forcar=True)
 
             # Limpar lotes anteriores (serão populados on-the-fly pelo processar_registro)
             execute_query(
@@ -2740,13 +2749,11 @@ def avisar_se_schema_destino_colide_com_fdw():
 
 
 def criar_fdw(origem, port):
-    """Cria a extensão postgres_fdw, o servidor remoto, o user mapping e importa
-    as tabelas do schema remoto para o schema local. Idempotente: se o servidor ou
-    o mapping já existem, atualiza (ALTER); se as tabelas já foram importadas antes,
-    ignora o erro de duplicidade.
+    """Cria a extensão postgres_fdw, o schema local, o servidor remoto e o user
+    mapping. Idempotente: se o servidor ou o mapping já existem, atualiza (ALTER).
+    As tabelas estrangeiras são criadas sob demanda (sincronizar_tabela_origem).
     """
     schema_local = origem['schema_local']
-    schema_remoto = origem['schema_remoto'] or 'public'
     server_name = f'fdw_srv_{schema_local}'
 
     def _preparar(conn):
@@ -2793,20 +2800,89 @@ def criar_fdw(origem, port):
                     (origem['user'], origem['password'])
                 )
         conn.commit()
-
-        # 4) Importa as tabelas do schema remoto para o schema local
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    f'IMPORT FOREIGN SCHEMA {quote_identifier(schema_remoto)} '
-                    f'FROM SERVER {quote_identifier(server_name)} '
-                    f'INTO {quote_identifier(schema_local)}'
-                )
-                conn.commit()
-            except psycopg2.errors.DuplicateTable:
-                conn.rollback()  # já importado numa execução anterior — não é erro
+        # As tabelas NÃO são mais importadas aqui em bloco (o IMPORT do schema
+        # inteiro falhava inteiro ao achar uma tabela já existente, deixando o
+        # schema local congelado). Cada tabela é criada/atualizada na hora de
+        # usar — veja sincronizar_tabela_origem.
 
     execute_db_operation(lambda conn: _preparar(conn), statement_timeout_ms=120000)
+
+
+# ============================================================
+# ORIGEM DIRETO DO FDW: tabela estrangeira gerenciada pelo app
+# ============================================================
+# O postgres_fdw só lê a origem através de uma tabela estrangeira. Em vez de
+# depender de um schema importado à mão (que ficava desatualizado), o app
+# recria a tabela estrangeira de cada origem logo antes de usá-la, a partir
+# do schema remoto — sempre com as colunas atuais da origem, e qualquer
+# tabela remota pode ser usada sem passo manual. O schema local do FDW
+# (ex.: integrasesa) vira só o lugar onde o app guarda essas tabelas.
+
+# Ciclos frequentes não precisam recriar a tabela toda vez
+SINCRONIZAR_ORIGEM_INTERVALO_SEG = 600
+# Se a tabela estrangeira estiver em uso, não trava: segue com a atual
+SINCRONIZAR_ORIGEM_LOCK_TIMEOUT = '5s'
+_origem_sincronizada_em = {}  # 'schema.tabela' -> time.monotonic()
+_origem_sincronizada_lock = threading.Lock()
+
+
+def sincronizar_tabela_origem(relacao_origem, forcar=False):
+    """Cria/atualiza a tabela estrangeira de `relacao_origem` ('schema.tabela')
+    direto do schema remoto do FDW. Origem fora do schema local do FDW (ex.:
+    uma tabela local) é deixada como está. Levanta ValueError com mensagem
+    pro usuário se o FDW não estiver configurado ou a tabela não existir na origem."""
+    fdw = get_fdw_config()
+    schema_local = (fdw.get('schema_local') or '').strip()
+    schema, tabela = relacao_origem.split('.', 1)
+    if not schema_local or schema.lower() != schema_local.lower():
+        return
+
+    chave = f'{schema_local}.{tabela}'.lower()
+    with _origem_sincronizada_lock:
+        ultima = _origem_sincronizada_em.get(chave)
+    if not forcar and ultima is not None and time.monotonic() - ultima < SINCRONIZAR_ORIGEM_INTERVALO_SEG:
+        return
+
+    schema_remoto = (fdw.get('schema_remoto') or 'public').strip()
+    server_name = f'fdw_srv_{schema_local}'
+    relacao_sql = f'{quote_identifier(schema_local)}.{quote_identifier(tabela)}'
+
+    def _operacao(conn):
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
+            if not cur.fetchone():
+                raise ValueError('O FDW ainda não foi configurado: clique em "Criar / Atualizar FDW" em Configurar Banco.')
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema_local)}')
+            cur.execute(
+                "SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s", (schema_local, tabela)
+            )
+            existente = cur.fetchone()
+            if existente and existente[0] != 'f':
+                return  # tabela/view local com esse nome — não é do FDW, não mexe
+            if existente:
+                cur.execute(f"SET LOCAL lock_timeout = '{SINCRONIZAR_ORIGEM_LOCK_TIMEOUT}'")
+                cur.execute(f'DROP FOREIGN TABLE {relacao_sql}')
+            cur.execute(
+                f'IMPORT FOREIGN SCHEMA {quote_identifier(schema_remoto)} LIMIT TO ({quote_identifier(tabela)}) '
+                f'FROM SERVER {quote_identifier(server_name)} INTO {quote_identifier(schema_local)}'
+            )
+            cur.execute('SELECT to_regclass(%s)', (relacao_sql,))
+            if cur.fetchone()[0] is None:
+                raise ValueError(
+                    f'A tabela "{tabela}" não existe no schema remoto "{schema_remoto}" da origem '
+                    f'(ou o usuário do FDW não tem acesso a ela).'
+                )
+
+    try:
+        execute_db_operation(_operacao, statement_timeout_ms=60000)
+    except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DependentObjectsStillExist):
+        # Em uso por outra leitura agora (ou com views dependentes): a versão
+        # atual continua valendo; tenta atualizar na próxima vez
+        app.logger.warning('Tabela estrangeira %s em uso — mantida a versão atual', relacao_origem)
+        return
+    with _origem_sincronizada_lock:
+        _origem_sincronizada_em[chave] = time.monotonic()
 
 
 
@@ -3017,8 +3093,8 @@ def criar_fdw_route():
         criar_fdw(origem, porta)
         origem['port'] = porta
         persist_fdw_config(origem)
-        # Atualiza também a lista de tabelas (exemplos rápidos), já com as
-        # recém-importadas marcadas — não depende de clicar em "Testar"
+        # Atualiza também a lista de tabelas (exemplos rápidos) — não
+        # depende de clicar em "Testar"
         lista_ok, lista_msg, tabelas = _testar_origem_direta(origem, porta)
         if tabelas:
             lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
@@ -3075,66 +3151,43 @@ def _testar_origem_direta(origem, porta):
 
 
 def salvar_lista_tabelas_fdw(origem, porta, tabelas):
-    """Grava a lista de tabelas da origem (marcando as já importadas no FDW
-    local) — é ela que alimenta os exemplos rápidos das telas de cadastro."""
-    importadas = _foreign_tables_locais(origem['schema_local'])
+    """Grava a lista de tabelas da origem — é ela que alimenta os exemplos
+    rápidos das telas de cadastro."""
     lista = {
         'atualizado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
         'origem': f'{origem["host"]}:{porta}/{origem["database"]}',
         'schema_remoto': origem['schema_remoto'],
         'schema_local': origem['schema_local'],
-        'tabelas': [{**t, 'importada': t['nome'] in importadas} for t in tabelas],
+        'tabelas': tabelas,
     }
     persist_fdw_tabelas(lista)
     return lista
 
 
-def _foreign_tables_locais(schema_local):
-    """Nomes das foreign tables já importadas no schema local do FDW."""
-    if not is_db_configured():
-        return set()
-    try:
-        rows = execute_query("""
-            SELECT c.relname FROM pg_foreign_table ft
-            JOIN pg_class c ON c.oid = ft.ftrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s
-        """, (schema_local,), statement_timeout_ms=15000)
-    except Exception:  # noqa: BLE001 - sem o banco local, só não marca as importadas
-        return set()
-    return {r['relname'] for r in rows}
-
-
-def _testar_via_fdw(schema_local):
-    """Etapa 2: consulta real pelo FDW já criado no banco local — confirma que
-    o servidor PostgreSQL local alcança a origem (é o caminho das importações)."""
+def _testar_via_fdw(schema_local, tabelas):
+    """Etapa 2: consulta real pelo FDW configurado no banco local — cria/atualiza
+    a tabela estrangeira de uma tabela da origem (como as importações fazem) e
+    lê por ela. Confirma que o servidor PostgreSQL local alcança a origem."""
     if not is_db_configured():
         return None, 'FDW: banco local não configurado — teste pelo FDW não executado.'
     server_name = f'fdw_srv_{schema_local}'
-
-    def _operacao(conn):
-        with conn.cursor() as cur:
-            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
-            if not cur.fetchone():
-                return None, f'FDW: servidor "{server_name}" ainda não foi criado — clique em "Criar / Atualizar FDW".'
-            cur.execute("""
-                SELECT c.relname FROM pg_foreign_table ft
-                JOIN pg_class c ON c.oid = ft.ftrelid
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = %s ORDER BY c.relname LIMIT 1
-            """, (schema_local,))
-            row = cur.fetchone()
-            if not row:
-                return False, f'FDW: nenhuma tabela importada no schema local "{schema_local}".'
-            tabela = f'{quote_identifier(schema_local)}.{quote_identifier(row[0])}'
-            cur.execute(f'SELECT 1 FROM {tabela} LIMIT 1')
-            cur.fetchall()
-            return True, f'FDW: consulta pelo servidor local OK ({schema_local}.{row[0]}).'
-
     try:
-        return execute_db_operation(_operacao, statement_timeout_ms=15000)
+        existe = execute_query('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,),
+                               statement_timeout_ms=15000)
     except Exception as error:  # noqa: BLE001
-        return False, f'FDW: falha ao consultar pelo servidor local — {error}'
+        return False, f'FDW: falha ao consultar o banco local — {error}'
+    if not existe:
+        return None, f'FDW: servidor "{server_name}" ainda não foi criado — clique em "Criar / Atualizar FDW".'
+    if not tabelas:
+        return None, 'FDW: sem tabela na origem para testar a leitura pelo FDW.'
+
+    relacao = f'{schema_local}.{tabelas[0]["nome"]}'
+    try:
+        sincronizar_tabela_origem(relacao, forcar=True)
+        execute_query(f'SELECT 1 FROM {quote_qualified_relation(relacao)} LIMIT 1', statement_timeout_ms=15000)
+    except Exception as error:  # noqa: BLE001
+        return False, f'FDW: falha ao ler {tabelas[0]["nome"]} pelo servidor local — {error}'
+    return True, f'FDW: leitura pelo servidor local OK ({tabelas[0]["nome"]}).'
 
 
 @app.route('/configurar-banco/testar-fdw', methods=['POST'])
@@ -3158,7 +3211,7 @@ def testar_fdw_route():
         return jsonify({'sucesso': False, 'mensagem': 'Informe uma porta válida.'})
 
     direto_ok, direto_msg, tabelas = _testar_origem_direta(origem, porta)
-    fdw_ok, fdw_msg = _testar_via_fdw(origem['schema_local'])
+    fdw_ok, fdw_msg = _testar_via_fdw(origem['schema_local'], tabelas)
 
     lista = None
     if tabelas:
@@ -3462,7 +3515,9 @@ def nova_migracao():
         try:
             tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
-        except (ValueError, OperationalError, InterfaceError) as error:
+            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
+            sincronizar_tabela_origem(tabela_origem, forcar=True)
+        except (ValueError, psycopg2.Error) as error:
             if is_ajax_request():
                 return jsonify({'status': 'erro', 'mensagem': str(error)}), 400
             flash(str(error), 'error')
@@ -3586,6 +3641,8 @@ def importacao_automatica():
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
             if not campo_id:
                 raise ValueError('Informe o campo chave (campo_id).')
+            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
+            sincronizar_tabela_origem(tabela_origem, forcar=True)
 
             tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
 
@@ -3604,7 +3661,7 @@ def importacao_automatica():
 
             if tabela_criada_agora:
                 flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
-        except (ValueError, OperationalError, InterfaceError) as error:
+        except (ValueError, psycopg2.Error) as error:
             flash(str(error), 'error')
 
         return redirect(url_for('importacao_automatica'))
@@ -3897,6 +3954,8 @@ def api_processar_registro():
                 tab_orig = cfg['tabela_origem']
                 tab_dest = cfg['tabela_destino']
                 campo = cfg['campo_id']
+                # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
+                sincronizar_tabela_origem(tab_orig)
                 cols_ins = cfg['sql_colunas_insert']
                 cols_sel = cfg['sql_colunas_select']
 
@@ -4179,7 +4238,9 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
     try:
         normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
-    except ValueError as error:
+        # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
+        sincronizar_tabela_origem(normalized_source)
+    except (ValueError, psycopg2.Error) as error:
         set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
         _log_ciclo(job_id, 'erro', str(error))
         return
@@ -4542,7 +4603,9 @@ def _background_agendamento_worker(job_id, tabela_id):
     try:
         normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
-    except ValueError as error:
+        # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
+        sincronizar_tabela_origem(normalized_source)
+    except (ValueError, psycopg2.Error) as error:
         set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
         _log_execucao(job_id, 'erro', str(error))
         return
@@ -5000,6 +5063,8 @@ def agendar_importacao():
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
             if not campo_id:
                 raise ValueError('Informe o campo chave (campo_id).')
+            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
+            sincronizar_tabela_origem(tabela_origem, forcar=True)
 
             tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
 
@@ -5016,7 +5081,7 @@ def agendar_importacao():
 
             if tabela_criada_agora:
                 flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
-        except (ValueError, OperationalError, InterfaceError) as error:
+        except (ValueError, psycopg2.Error) as error:
             flash(str(error), 'error')
 
         return redirect(url_for('agendar_importacao'))

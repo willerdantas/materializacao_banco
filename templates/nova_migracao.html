@@ -32,7 +32,7 @@
                 {% set tabelas_fdw = (fdw_tabelas or {}).get('tabelas') or [] %}
                 <datalist id="tabelas-origem-fdw">
                     {% for t in tabelas_fdw %}
-                    <option value="{{ t.nome }}" label="{{ t.tipo }}{{ '' if t.importada else ' · não importada no FDW' }}"></option>
+                    <option value="{{ t.nome }}" label="{{ t.tipo }}"></option>
                     {% endfor %}
                 </datalist>
                 <div class="form-text">
@@ -111,7 +111,6 @@
 
     {% if fdw_mapeamentos %}
     {% set ja_cadastradas = fdw_mapeamentos | selectattr('migracao_id') | list %}
-    {% set nao_importadas = fdw_mapeamentos | rejectattr('importada') | list %}
     <div class="btn-group" id="exemplos-fdw" style="max-height: 300px; overflow-y: auto;">
         {% for mp in fdw_mapeamentos %}
         {% if mp.migracao_id %}
@@ -123,9 +122,8 @@
         {% else %}
         <button type="button" class="btn btn-outline btn-sm exemplo-fdw exemplo-fdw-preencher"
                 data-origem="{{ mp.origem }}" data-destino="{{ mp.destino }}" data-campo-id="{{ mp.campo_id }}"
-                {% if not mp.importada %}style="border-color: var(--color-orange);"{% endif %}
-                title="{{ mp.origem }} → {{ mp.destino }} (chave {{ mp.campo_id or '?' }}){% if not mp.importada %} — ainda não importada no FDW: clique em Criar / Atualizar FDW antes de iniciar{% endif %}">
-            <span>{{ '⚠ ' if not mp.importada }}{{ mp.origem }}</span>
+                title="{{ mp.origem }} → {{ mp.destino }} (chave {{ mp.campo_id or '?' }})">
+            <span>{{ mp.origem }}</span>
         </button>
         {% endif %}
         {% endfor %}
@@ -133,8 +131,6 @@
     <div class="form-text mt-2">
         {{ fdw_mapeamentos|length }} tabela(s) da origem (teste do FDW de {{ fdw_tabelas.atualizado_em }}).
         {% if ja_cadastradas %}✓ = já tem migração cadastrada ({{ ja_cadastradas|length }}) — abre a existente.{% endif %}
-        {% if nao_importadas %}⚠ = ainda não importada no FDW local ({{ nao_importadas|length }}) — clique em "Criar / Atualizar FDW" em
-        <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> antes de iniciar.{% endif %}
         Confira o destino e o campo ID sugeridos antes de iniciar.
     </div>
     {% else %}

@@ -178,9 +178,10 @@
     <div class="controle-card" style="margin-bottom: 16px;">
         <h4>2. Foreign Data Wrapper (origem)</h4>
         <p class="form-text">
-            Cria a extensão <code>postgres_fdw</code>, o servidor remoto, o mapeamento de usuário
-            e importa as tabelas do schema remoto para o schema local abaixo. Pode ser rodado
-            de novo para atualizar credenciais ou importar tabelas novas.
+            Cria a extensão <code>postgres_fdw</code>, o servidor remoto e o mapeamento de usuário.
+            As importações leem <strong>direto da origem</strong>: o sistema cria/atualiza sozinho a
+            tabela estrangeira de cada tabela usada, sempre com as colunas atuais da origem — não é
+            preciso importar o schema remoto. Rode de novo para atualizar as credenciais.
         </p>
         <form method="POST" action="{{ url_for('criar_fdw_route') }}">
             <div class="form-row">
@@ -246,7 +247,9 @@
                        value="{{ fdw_config.schema_local or 'fdw_externo' }}"
                        required>
                 <div class="form-text">
-                    Prefixo usado nas migrações, ex: <code>{{ fdw_config.schema_local or 'fdw_externo' }}.v_paciente</code>.
+                    Schema interno onde o sistema mantém as tabelas estrangeiras da origem (gerenciado
+                    automaticamente). Nas migrações aparece como prefixo, ex:
+                    <code>{{ fdw_config.schema_local or 'fdw_externo' }}.v_paciente</code>.
                 </div>
             </div>
             <div id="resultado-teste-fdw" class="alert" style="display: none; margin: 12px 0 0;">
@@ -280,7 +283,6 @@
                             <th>Tabela</th>
                             <th>Tipo</th>
                             <th style="text-align: center;">Colunas</th>
-                            <th style="text-align: center;">No FDW local</th>
                         </tr>
                     </thead>
                     <tbody id="lista-tabelas-fdw-corpo"></tbody>
@@ -479,22 +481,19 @@ function renderizarListaTabelasFdw(lista) {
     const tabelas = (lista && lista.tabelas) || [];
     if (tabelas.length === 0) return;
 
-    const naoImportadas = tabelas.filter(t => !t.importada).length;
     document.getElementById('lista-tabelas-fdw-titulo').textContent =
         `Tabelas da origem (${tabelas.length}) — schema remoto "${lista.schema_remoto}"`;
     document.getElementById('lista-tabelas-fdw-info').textContent =
-        `${lista.origem} · atualizado em ${lista.atualizado_em}` +
-        (naoImportadas ? ` · ${naoImportadas} ainda não importada(s) no FDW local — clique em "Criar / Atualizar FDW" para importar.` : '');
+        `${lista.origem} · atualizado em ${lista.atualizado_em}`;
 
     const corpo = document.getElementById('lista-tabelas-fdw-corpo');
     corpo.replaceChildren(...tabelas.map(t => {
         const tr = document.createElement('tr');
         tr.dataset.nome = t.nome.toLowerCase();
-        [t.nome, t.tipo, String((t.colunas || []).length), t.importada ? '✓' : '—'].forEach((texto, i) => {
+        [t.nome, t.tipo, String((t.colunas || []).length)].forEach((texto, i) => {
             const td = document.createElement('td');
             td.textContent = texto;
             if (i >= 2) td.style.textAlign = 'center';
-            if (i === 3 && !t.importada) td.style.color = 'var(--color-orange)';
             tr.appendChild(td);
         });
         return tr;
