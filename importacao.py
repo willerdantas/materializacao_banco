@@ -3172,57 +3172,50 @@ def _testar_origem_direta(origem, porta):
         return False, f'Origem: falha ao conectar em {origem["host"]}:{porta}/{origem["database"]} — {error}', []
     try:
         with conexao.cursor() as cur:
+            # Só as VIEWS (comuns e materializadas) do schema configurado.
             # pg_class em vez de information_schema: o information_schema
-            # esconde o que o usuário não pode ler e as views materializadas.
-            # Lê TODOS os schemas da origem (não só o configurado): views
-            # novas costumam ser criadas em outro schema. Partições ficam de
-            # fora (aparece só a tabela pai).
+            # esconde o que o usuário não pode ler e as views materializadas —
+            # aqui elas aparecem, marcadas com ou sem permissão de leitura.
             cur.execute("""
-                SELECT n.nspname, c.relname, c.relkind,
+                SELECT c.relname, c.relkind,
                        has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT') AS pode_ler,
                        COALESCE(array_agg(a.attname::text ORDER BY a.attnum) FILTER (WHERE a.attnum > 0), '{}')
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
-                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-                  AND n.nspname NOT LIKE 'pg\\_%%'
-                GROUP BY c.oid, n.oid, n.nspname, c.relname, c.relkind
-                ORDER BY (n.nspname <> %s), n.nspname, c.relname
+                WHERE n.nspname = %s AND c.relkind IN ('v', 'm')
+                GROUP BY c.oid, n.oid, c.relname, c.relkind
+                ORDER BY c.relname
             """, (origem['schema_remoto'],))
-            schema_padrao = origem['schema_remoto'].lower()
             tabelas = [
-                {
-                    # no schema configurado basta o nome; nos outros, schema.nome
-                    'nome': nome if schema.lower() == schema_padrao else f'{schema}.{nome}',
-                    'schema': schema,
-                    'tabela': nome,
-                    'tipo': TIPOS_RELACAO_ORIGEM.get(tipo, 'tabela'),
-                    'colunas': list(colunas),
-                    'sem_permissao': not pode_ler,
-                }
-                for schema, nome, tipo, pode_ler, colunas in cur.fetchall()
+                {'nome': nome, 'schema': origem['schema_remoto'], 'tabela': nome,
+                 'tipo': TIPOS_RELACAO_ORIGEM.get(tipo, 'tabela'), 'colunas': list(colunas),
+                 'sem_permissao': not pode_ler}
+                for nome, tipo, pode_ler, colunas in cur.fetchall()
             ]
+            # Onde a conexão caiu de fato — pra conferir se é o mesmo servidor/
+            # banco que se está olhando em outra ferramenta
+            cur.execute("""
+                SELECT current_database(), current_user, COALESCE(host(inet_server_addr()), 'socket local'),
+                       inet_server_port(), split_part(version(), ' ', 2), pg_is_in_recovery()
+            """)
+            banco, usuario, ip, porta_real, versao, replica = cur.fetchone()
     finally:
         conexao.close()
+    endereco = f'[{ip}]' if ':' in ip else ip   # IPv6 entre colchetes
+    servidor = (f'banco "{banco}" no servidor {endereco}:{porta_real or porta} (PostgreSQL {versao}'
+                f'{", réplica somente leitura" if replica else ""}), usuário "{usuario}"')
     if not tabelas:
-        return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas não encontrou '
-                       f'nenhuma tabela/view em nenhum schema.'), []
-    por_schema = {}
-    for t in tabelas:
-        por_schema[t['schema']] = por_schema.get(t['schema'], 0) + 1
-    detalhe = ', '.join(f'{qtd} em "{schema}"' for schema, qtd in por_schema.items())
-    views = sum(1 for t in tabelas if t['tipo'].startswith('view'))
-    mensagem = (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
-                f'{len(tabelas)} tabela(s)/view(s), sendo {views} view(s): {detalhe}.')
-    if origem['schema_remoto'] not in por_schema:
-        mensagem += f'\nAtenção: o schema configurado "{origem["schema_remoto"]}" não tem nenhuma tabela/view.'
+        return False, (f'Origem: conectou ({servidor}), mas o schema "{origem["schema_remoto"]}" '
+                       f'não tem views.'), []
     sem_permissao = [t['nome'] for t in tabelas if t['sem_permissao']]
+    mensagem = (f'Origem: conexão OK — {len(tabelas)} view(s) no schema "{origem["schema_remoto"]}": '
+                f'{len(tabelas) - len(sem_permissao)} com permissão de leitura e {len(sem_permissao)} sem permissão.'
+                f'\nConectado em: {servidor}.')
     if sem_permissao:
-        mensagem += (f'\nAtenção: o usuário "{origem["user"]}" não tem permissão de leitura (SELECT) em '
-                     f'{len(sem_permissao)} delas: {", ".join(sem_permissao[:15])}'
+        mensagem += (f'\nSem permissão para o usuário "{origem["user"]}": {", ".join(sem_permissao[:15])}'
                      f'{"..." if len(sem_permissao) > 15 else ""}. Peça ao DBA da origem: '
-                     f'GRANT SELECT ON ... TO "{origem["user"]}".')
+                     f'GRANT SELECT ON {origem["schema_remoto"]}.<view> TO "{origem["user"]}".')
     return True, mensagem, tabelas
 
 

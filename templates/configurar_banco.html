@@ -250,21 +250,28 @@
             </div>
             <div class="form-text">
                 O teste conecta na origem com os dados acima (senha em branco usa a salva), sem gravar
-                nada. A lista de tabelas encontrada fica salva e é sugerida nas telas de cadastro.
+                nada. A lista de views do schema fica salva (com e sem permissão de leitura) e é sugerida nas telas de cadastro.
             </div>
         </form>
 
         <div id="lista-tabelas-fdw" style="display: none; margin-top: 16px;">
             <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
                 <strong id="lista-tabelas-fdw-titulo"></strong>
-                <input type="search" id="lista-tabelas-fdw-filtro" class="form-control" placeholder="Filtrar tabelas..." style="max-width: 260px;">
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <select id="lista-tabelas-fdw-permissao" class="form-control" style="max-width: 200px;">
+                        <option value="">Todas as views</option>
+                        <option value="com">Com permissão</option>
+                        <option value="sem">Sem permissão</option>
+                    </select>
+                    <input type="search" id="lista-tabelas-fdw-filtro" class="form-control" placeholder="Filtrar views..." style="max-width: 260px;">
+                </div>
             </div>
             <div class="form-text" id="lista-tabelas-fdw-info" style="margin-bottom: 8px;"></div>
             <div class="table-container" style="max-height: 320px; overflow-y: auto;">
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Tabela</th>
+                            <th>View</th>
                             <th>Tipo</th>
                             <th style="text-align: center;">Colunas</th>
                             <th style="text-align: center;">Leitura</th>
@@ -475,34 +482,40 @@ function alternarModoConexao() {
 
 document.addEventListener('DOMContentLoaded', alternarModoConexao);
 
-// Lista de tabelas da origem: a salva no último teste aparece ao abrir
+// Lista de views da origem: a salva no último teste aparece ao abrir
 // a página; um novo teste substitui. Montada com textContent (nomes vêm de
 // outro banco — nunca entram como HTML).
 function renderizarListaTabelasFdw(lista) {
     const tabelas = (lista && lista.tabelas) || [];
     if (tabelas.length === 0) return;
 
+    const semPermissao = tabelas.filter(t => t.sem_permissao).length;
     document.getElementById('lista-tabelas-fdw-titulo').textContent =
-        `Tabelas da origem (${tabelas.length}) — schema remoto "${lista.schema_remoto}"`;
+        `Views da origem (${tabelas.length}) — schema "${lista.schema_remoto}": ` +
+        `${tabelas.length - semPermissao} com permissão, ${semPermissao} sem permissão`;
     document.getElementById('lista-tabelas-fdw-info').textContent =
         `${lista.origem} · atualizado em ${lista.atualizado_em}` +
-        (tabelas.some(t => t.sem_permissao)
-            ? ` · ${tabelas.filter(t => t.sem_permissao).length} sem permissão de leitura para o usuário da origem (peça GRANT SELECT ao DBA)`
-            : '');
+        (semPermissao ? ' · as sem permissão precisam de GRANT SELECT do DBA da origem para o usuário configurado' : '');
 
     const corpo = document.getElementById('lista-tabelas-fdw-corpo');
     corpo.replaceChildren(...tabelas.map(t => {
         const tr = document.createElement('tr');
         tr.dataset.nome = t.nome.toLowerCase();
-        [t.nome, t.tipo, String((t.colunas || []).length), t.sem_permissao ? '🔒 sem permissão' : '✓'].forEach((texto, i) => {
+        tr.dataset.permissao = t.sem_permissao ? 'sem' : 'com';
+        [t.nome, t.tipo, String((t.colunas || []).length), t.sem_permissao ? '🔒 sem permissão' : '✓ com permissão'].forEach((texto, i) => {
             const td = document.createElement('td');
             td.textContent = texto;
             if (i >= 2) td.style.textAlign = 'center';
-            if (i === 3 && t.sem_permissao) td.style.color = 'var(--color-orange)';
+            if (i === 3) td.style.color = t.sem_permissao ? 'var(--color-orange)' : 'var(--color-primary-dark)';
             tr.appendChild(td);
         });
         return tr;
     }));
+    // lista nova: limpa os filtros pra não esconder linhas sem aviso
+    const filtroTexto = document.getElementById('lista-tabelas-fdw-filtro');
+    const filtroPermissao = document.getElementById('lista-tabelas-fdw-permissao');
+    if (filtroTexto) filtroTexto.value = '';
+    if (filtroPermissao) filtroPermissao.value = '';
     document.getElementById('lista-tabelas-fdw').style.display = '';
 }
 
@@ -511,12 +524,17 @@ document.addEventListener('DOMContentLoaded', () => {
         renderizarListaTabelasFdw(JSON.parse(document.getElementById('fdw-tabelas-salvas-json').textContent));
     } catch (_) { /* sem lista salva */ }
 
-    document.getElementById('lista-tabelas-fdw-filtro')?.addEventListener('input', event => {
-        const termo = event.target.value.trim().toLowerCase();
+    // Filtro por nome + por permissão (com / sem)
+    function filtrarListaViews() {
+        const termo = (document.getElementById('lista-tabelas-fdw-filtro')?.value || '').trim().toLowerCase();
+        const permissao = document.getElementById('lista-tabelas-fdw-permissao')?.value || '';
         document.querySelectorAll('#lista-tabelas-fdw-corpo tr').forEach(tr => {
-            tr.style.display = tr.dataset.nome.includes(termo) ? '' : 'none';
+            const visivel = tr.dataset.nome.includes(termo) && (!permissao || tr.dataset.permissao === permissao);
+            tr.style.display = visivel ? '' : 'none';
         });
-    });
+    }
+    document.getElementById('lista-tabelas-fdw-filtro')?.addEventListener('input', filtrarListaViews);
+    document.getElementById('lista-tabelas-fdw-permissao')?.addEventListener('change', filtrarListaViews);
 });
 
 // Teste via AJAX dos dados do formulário do botão, sem salvar nada
