@@ -19,7 +19,7 @@
         <input type="hidden" name="migracao_id" value="{{ migracao_edicao.id if migracao_edicao else '' }}">
         <div class="form-row">
             <div class="form-group">
-                <label class="form-label" for="tabela_origem">Tabela Origem (Foreign Table)</label>
+                <label class="form-label" for="tabela_origem">Tabela Origem (servidor de origem)</label>
                 <input type="text"
                        id="tabela_origem"
                        name="tabela_origem"
@@ -40,7 +40,7 @@
                     {{ tabelas_fdw|length }} tabela(s) da origem para escolher (lista de {{ fdw_tabelas.atualizado_em }}).
                     Ao escolher, destino e campo ID são sugeridos se estiverem vazios.
                     {% else %}
-                    Para escolher numa lista, clique em "Testar conexão FDW" em
+                    Para escolher numa lista, clique em "Testar conexão com a origem" em
                     <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a>.
                     {% endif %}
                 </div>
@@ -102,7 +102,7 @@
     <div class="card-header">
         <div>
             <h2 class="card-title" style="color: var(--color-orange);">Exemplos Rápidos</h2>
-            <p class="card-subtitle">Mapeamento das tabelas da origem (FDW) — clique para preencher origem, destino e campo ID</p>
+            <p class="card-subtitle">Mapeamento das tabelas do servidor de origem — clique para preencher origem, destino e campo ID</p>
         </div>
         {% if (fdw_mapeamentos or [])|length > 12 %}
         <input type="search" id="filtro-exemplos" class="form-control" placeholder="Filtrar tabelas..." style="max-width: 240px;">
@@ -129,13 +129,13 @@
         {% endfor %}
     </div>
     <div class="form-text mt-2">
-        {{ fdw_mapeamentos|length }} tabela(s) da origem (teste do FDW de {{ fdw_tabelas.atualizado_em }}).
+        {{ fdw_mapeamentos|length }} tabela(s) da origem (lista de {{ fdw_tabelas.atualizado_em }}).
         {% if ja_cadastradas %}✓ = já tem migração cadastrada ({{ ja_cadastradas|length }}) — abre a existente.{% endif %}
         Confira o destino e o campo ID sugeridos antes de iniciar.
     </div>
     {% else %}
     <div class="form-text">
-        Nenhum mapeamento ainda. Clique em "Testar conexão FDW" em
+        Nenhum mapeamento ainda. Clique em "Testar conexão com a origem" em
         <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> para listar as tabelas da origem.
     </div>
     {% endif %}
@@ -146,7 +146,7 @@
 {% block extra_js %}
 <script type="application/json" id="fdw-mapeamentos-json">{{ (fdw_mapeamentos or [])|tojson }}</script>
 <script>
-// Preenchimento rápido a partir do mapeamento das tabelas do FDW (calculado
+// Preenchimento rápido a partir do mapeamento das tabelas da origem (calculado
 // no servidor: destino v_ -> t_, chave = primeira coluna isn_*)
 function preencherMigracao(mp, sobrescrever) {
     const campos = { tabela_origem: mp.origem, tabela_destino: mp.destino, campo_id: mp.campo_id };

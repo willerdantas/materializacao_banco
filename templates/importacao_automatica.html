@@ -51,11 +51,11 @@
             {% endfor %}
         </div>
         <div class="form-text" style="margin-bottom: 12px;">
-            Tabelas da origem do último teste do FDW — clique para preencher origem, destino e campo chave.
+            Tabelas do servidor de origem (última lista salva) — clique para preencher origem, destino e campo chave.
         </div>
         {% else %}
         <div class="form-text" style="margin-bottom: 12px;">
-            Sem exemplos ainda: clique em "Testar conexão FDW" (ou "Criar / Atualizar FDW") em
+            Sem exemplos ainda: clique em "Testar conexão com a origem" (ou "Salvar origem") em
             <a href="{{ url_for('configurar_banco') }}">Configurar Banco</a> para listar as tabelas da origem.
         </div>
         {% endif %}

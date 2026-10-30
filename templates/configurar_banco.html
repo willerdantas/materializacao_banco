@@ -123,8 +123,7 @@
                     Schema onde ficam as tabelas de destino e as tabelas de controle. Nas telas
                     de migração/importação, basta informar o nome da tabela, sem o schema.
                     Ao salvar, as tabelas de controle são criadas/verificadas automaticamente
-                    aqui. <strong>Deve ser diferente</strong> do "Schema local do FDW" abaixo,
-                    que é só para as foreign tables (somente leitura) da origem.
+                    aqui.
                 </div>
             </div>
         </div>
@@ -148,15 +147,15 @@
     </form>
 </div>
 
-<!-- Provisionamento: banco local, FDW, schema temp e tabelas de controle -->
+<!-- Provisionamento: banco local, servidor de origem, schema temp e tabelas de controle -->
 <div class="card animate-fade-in" style="border-left: 4px solid var(--color-primary);">
     <div class="card-header">
         <div>
             <h2 class="card-title">⚙️ Provisionamento do Banco</h2>
             <p class="card-subtitle">
                 Ações de configuração inicial. Salve a conexão acima primeiro (isso já cria as
-                tabelas de controle no schema de destino), depois rode: banco local → FDW →
-                schema temp.
+                tabelas de controle no schema de destino), depois rode: banco local → servidor de
+                origem → schema temp.
             </p>
         </div>
     </div>
@@ -174,16 +173,15 @@
         </form>
     </div>
 
-    <!-- 2) Criar FDW -->
+    <!-- 2) Servidor de origem -->
     <div class="controle-card" style="margin-bottom: 16px;">
-        <h4>2. Foreign Data Wrapper (origem)</h4>
+        <h4>2. Servidor de origem</h4>
         <p class="form-text">
-            Cria a extensão <code>postgres_fdw</code>, o servidor remoto e o mapeamento de usuário.
-            As importações leem <strong>direto da origem</strong>: o sistema cria/atualiza sozinho a
-            tabela estrangeira de cada tabela usada, sempre com as colunas atuais da origem — não é
-            preciso importar o schema remoto. Rode de novo para atualizar as credenciais.
+            As importações leem <strong>direto do servidor de origem</strong>: o sistema conecta nele e
+            copia cada lote para o banco local — sem FDW, tabela estrangeira ou schema intermediário.
+            Ao salvar, a conexão é testada e as credenciais só são gravadas se ela funcionar.
         </p>
-        <form method="POST" action="{{ url_for('criar_fdw_route') }}">
+        <form method="POST" action="{{ url_for('salvar_origem_route') }}">
             <div class="form-row">
                 <div class="form-group">
                     <label class="form-label">Host da origem</label>
@@ -232,24 +230,11 @@
                            autocomplete="new-password">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Schema remoto a importar</label>
+                    <label class="form-label">Schema da origem</label>
                     <input type="text"
                            name="fdw_schema_remoto"
                            class="form-control"
                            value="{{ fdw_config.schema_remoto or 'public' }}">
-                </div>
-            </div>
-            <div class="form-group">
-                <label class="form-label">Schema local do FDW</label>
-                <input type="text"
-                       name="fdw_schema_local"
-                       class="form-control"
-                       value="{{ fdw_config.schema_local or 'fdw_externo' }}"
-                       required>
-                <div class="form-text">
-                    Schema interno onde o sistema mantém as tabelas estrangeiras da origem (gerenciado
-                    automaticamente). Nas migrações aparece como prefixo, ex:
-                    <code>{{ fdw_config.schema_local or 'fdw_externo' }}.v_paciente</code>.
                 </div>
             </div>
             <div id="resultado-teste-fdw" class="alert" style="display: none; margin: 12px 0 0;">
@@ -257,16 +242,15 @@
                 <div class="alert-mensagem" style="white-space: pre-line;"></div>
             </div>
             <div class="btn-group mt-2">
-                <button type="submit" class="btn btn-primary">Criar / Atualizar FDW</button>
+                <button type="submit" class="btn btn-primary">Salvar origem</button>
                 <button type="button" id="btn-testar-fdw" class="btn btn-outline"
                         onclick="testarConexao('btn-testar-fdw', 'resultado-teste-fdw', '{{ url_for("testar_fdw_route") }}', dados => dados.lista_tabelas && renderizarListaTabelasFdw(dados.lista_tabelas))">
-                    <span>Testar conexão FDW</span>
+                    <span>Testar conexão com a origem</span>
                 </button>
             </div>
             <div class="form-text">
-                O teste confere a origem direto com os dados acima (senha em branco usa a salva) e
-                faz uma consulta pelo FDW já criado no banco local — que é o caminho usado nas importações.
-                A lista de tabelas encontrada fica salva e é sugerida na tela Nova Migração.
+                O teste conecta na origem com os dados acima (senha em branco usa a salva), sem gravar
+                nada. A lista de tabelas encontrada fica salva e é sugerida nas telas de cadastro.
             </div>
         </form>
 
@@ -290,6 +274,22 @@
             </div>
         </div>
         <script type="application/json" id="fdw-tabelas-salvas-json">{{ fdw_tabelas|tojson }}</script>
+
+        {% if fdw_local %}
+        <div class="alert alert-warning" style="margin-top: 16px; display: block;">
+            <strong>FDW local antigo ainda existe no banco</strong> — schema <code>{{ fdw_local.schema }}</code>
+            {% if fdw_local.servidor_existe %}, servidor <code>fdw_srv_{{ fdw_local.schema }}</code>{% endif %}
+            e {{ fdw_local.tabelas_estrangeiras }} tabela(s) estrangeira(s). Ele não é mais usado: as importações
+            leem direto da origem.
+            <form method="POST" action="{{ url_for('remover_fdw_local_route') }}" style="margin-top: 8px;"
+                  onsubmit="return confirm('Remover o schema {{ fdw_local.schema }}, o servidor FDW e as tabelas estrangeiras? As configurações passam a apontar direto para a origem.');">
+                <button type="submit" class="btn btn-danger btn-sm">Remover FDW local</button>
+            </form>
+            <div class="form-text" style="margin-top: 6px;">
+                Se o schema tiver outras tabelas que não sejam do FDW, ele é mantido e só o FDW é removido.
+            </div>
+        </div>
+        {% endif %}
     </div>
 
     <!-- 3) Criar schema temp -->
@@ -474,7 +474,7 @@ function alternarModoConexao() {
 
 document.addEventListener('DOMContentLoaded', alternarModoConexao);
 
-// Lista de tabelas da origem (FDW): a salva no último teste aparece ao abrir
+// Lista de tabelas da origem: a salva no último teste aparece ao abrir
 // a página; um novo teste substitui. Montada com textContent (nomes vêm de
 // outro banco — nunca entram como HTML).
 function renderizarListaTabelasFdw(lista) {
@@ -515,7 +515,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Teste via AJAX dos dados do formulário do botão, sem salvar nada
-// (usado pela conexão do banco e pelo FDW)
+// (usado pela conexão do banco e pelo servidor de origem)
 async function testarConexao(botaoId, resultadoId, url, aoReceber) {
     const botao = document.getElementById(botaoId);
     const resultado = document.getElementById(resultadoId);

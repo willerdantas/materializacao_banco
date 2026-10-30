@@ -4,7 +4,9 @@
 from flask import Flask, render_template, request, jsonify, flash, redirect, url_for, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet, InvalidToken
+import io
 import json
+import re
 import psycopg2
 from psycopg2 import InterfaceError, OperationalError
 from psycopg2.extras import RealDictCursor
@@ -51,7 +53,7 @@ DEFAULT_FDW_CONFIG = {
     'user': '',
     'password': '',
     'schema_remoto': 'public',
-    'schema_local': 'fdw_externo',
+    'schema_local': '',   # só em instalações antigas (FDW local) — traduz nomes antigos
 }
 app.config['FDW_CONFIG'] = DEFAULT_FDW_CONFIG.copy()
 app.config['FDW_CONFIG_LOADED'] = False
@@ -175,42 +177,21 @@ def ensure_temp_schema(conn):
     conn.commit()
 
 
-def preparar_staging_vazia(conn, migracao_id, tab_orig, cols_ins):
-    """Cria a tabela temp vazia (só estrutura), reaproveitada por todos os lotes."""
+def preparar_staging_vazia(conn, migracao_id, tab_dest, cols_ins):
+    """Cria a tabela temp vazia (estrutura do destino), reaproveitada por todos os lotes."""
     staging = obter_staging_table(migracao_id)
-    quoted_source = quote_qualified_relation(normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local']))
     insert_columns = _split_sql_columns(cols_ins)
     if not insert_columns:
         raise ValueError('Colunas de inserção não preparadas para a migração.')
-    cols_select = ', '.join([f's.{quote_identifier(c)}' for c in insert_columns])
-
-    with conn.cursor() as cur:
-        cur.execute(f'DROP TABLE IF EXISTS {staging}')  # remove staging antigo
-        cur.execute(                                    # cria só a estrutura (WHERE FALSE)
-            f'CREATE UNLOGGED TABLE {staging} AS '
-            f'SELECT {cols_select} FROM {quoted_source} s WHERE FALSE'
-        )
-    conn.commit()
+    destino = normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino'])
+    criar_staging_como_destino(conn, staging, destino, insert_columns)
     return staging
 
 
 def copiar_lote_para_staging(conn, staging, tab_orig, campo, cols_ins, ids_lote):
-    """Substitui o conteúdo da staging pelos IDs do lote atual."""
-    quoted_source = quote_qualified_relation(normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local']))
-    quoted_key = quote_identifier(campo)
-    insert_columns = _split_sql_columns(cols_ins)
-    cols_select = ', '.join([f's.{quote_identifier(c)}' for c in insert_columns])
-    ids_int = [int(v) for v in ids_lote]  # array para WHERE ... = ANY
-
-    with conn.cursor() as cur:
-        cur.execute(f'TRUNCATE TABLE {staging}')  # reaproveita a tabela, só troca linhas
-        cur.execute(
-            f'INSERT INTO {staging} '
-            f'SELECT {cols_select} FROM {quoted_source} s '
-            f'WHERE s.{quoted_key} = ANY(%s)',
-            (ids_int,)
-        )
-    conn.commit()
+    """Substitui o conteúdo da staging pelos IDs do lote atual, lidos direto
+    do servidor de origem."""
+    copiar_ids_da_origem(conn, staging, normalizar_origem(tab_orig), campo, _split_sql_columns(cols_ins), ids_lote)
 
 
 def remover_staging(conn, migracao_id):
@@ -461,8 +442,6 @@ def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_se
                 tab_orig = cfg['tabela_origem']
                 tab_dest = cfg['tabela_destino']
                 campo = cfg['campo_id']
-                # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
-                sincronizar_tabela_origem(tab_orig)
                 cols_ins = cfg['sql_colunas_insert']
                 cols_sel = cfg['sql_colunas_select']
 
@@ -497,7 +476,7 @@ def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_se
 
                 # Staging vazia é criada UMA vez; cada lote só troca o conteúdo
                 ensure_temp_schema(conn)                                     # garante schema temp
-                staging = preparar_staging_vazia(conn, migracao_id, tab_orig, cols_ins)  # cria estrutura
+                staging = preparar_staging_vazia(conn, migracao_id, tab_dest, cols_ins)  # cria estrutura
 
                 total_lotes = math.ceil(len(ids_list) / tamanho_lote)
 
@@ -599,6 +578,7 @@ def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_se
                             time.sleep(0.1)
 
             finally:
+                fechar_conexao_origem_da_thread()
                 # Staging só existe durante o processamento desta migração
                 try:
                     remover_staging(conn, migracao_id)  # limpa a tabela temp
@@ -813,6 +793,215 @@ def get_mapeamentos_fdw():
 
 
 # ============================================================
+# ORIGEM: leitura direta do servidor de origem (sem FDW)
+# ============================================================
+# O sistema conecta direto no servidor de origem (credenciais da seção
+# "Servidor de origem" em Configurar Banco) e copia cada lote com
+# COPY (SELECT ... WHERE chave = ANY(ids)) -> staging local. Não existe mais
+# tabela estrangeira nem schema local do FDW: a origem é sempre
+# "<schema remoto>.<tabela>" no servidor de origem.
+
+def normalizar_origem(relacao_raw):
+    """'v_x', 'guardiao.v_x' ou o nome antigo 'integrasesa.v_x' (schema local
+    do FDW) -> '<schema remoto>.v_x'."""
+    fdw = get_fdw_config()
+    schema_remoto = (fdw.get('schema_remoto') or 'public').strip()
+    relacao = normalize_relation_input(relacao_raw, 'Tabela Origem', schema_remoto)
+    schema, tabela = relacao.split('.', 1)
+    schema_legado = (fdw.get('schema_local') or '').strip().lower()
+    if schema_legado and schema.lower() == schema_legado:
+        schema = schema_remoto
+    return f'{schema}.{tabela}'
+
+
+def abrir_conexao_origem(statement_timeout_ms=120000):
+    """Conexão direta com o servidor de origem."""
+    fdw = get_fdw_config()
+    if not (fdw.get('host') and fdw.get('database') and fdw.get('user')):
+        raise ValueError('Servidor de origem não configurado: preencha e salve a seção "Servidor de origem" em Configurar Banco.')
+    conn = psycopg2.connect(
+        host=fdw['host'], port=int(fdw.get('port') or 5432), dbname=fdw['database'],
+        user=fdw['user'], password=fdw.get('password') or '',
+        connect_timeout=int(os.getenv('DB_TEST_CONNECT_TIMEOUT', '8')),
+        keepalives=1, keepalives_idle=15, keepalives_interval=5, keepalives_count=5,
+        application_name='importacao_intergash',
+        options=f'-c statement_timeout={int(statement_timeout_ms)}',
+    )
+    conn.autocommit = True   # só leitura: não segura snapshot entre os lotes
+    with conn.cursor() as cur:
+        cur.execute('SHOW server_encoding')
+        codificacao = cur.fetchone()[0]
+    # SQL_ASCII não converte nada: lê os bytes como LATIN1 (nunca falha)
+    conn.set_client_encoding('LATIN1' if codificacao.upper() == 'SQL_ASCII' else 'UTF8')
+    return conn
+
+
+# Uma conexão com a origem por thread (worker), reaproveitada entre os lotes
+_origem_por_thread = threading.local()
+
+
+def conexao_origem_da_thread():
+    conn = getattr(_origem_por_thread, 'conn', None)
+    if conn is None or conn.closed:
+        conn = abrir_conexao_origem()
+        _origem_por_thread.conn = conn
+    return conn
+
+
+def fechar_conexao_origem_da_thread():
+    conn = getattr(_origem_por_thread, 'conn', None)
+    _origem_por_thread.conn = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - já caiu: nada a fazer
+            pass
+
+
+def consultar_origem(sql, params=None):
+    """SELECT na origem pela conexão da thread; se a conexão caiu, descarta
+    pra próxima chamada reabrir (e propaga o erro pro retry de quem chamou)."""
+    conn = conexao_origem_da_thread()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    except (OperationalError, InterfaceError):
+        fechar_conexao_origem_da_thread()
+        raise
+
+
+def colunas_origem(relacao):
+    """[{'nome', 'tipo'}] da tabela/view na origem, na ordem. ValueError se não existir."""
+    schema, tabela = relacao.split('.', 1)
+    rows = consultar_origem("""
+        SELECT a.attname AS nome, format_type(a.atttypid, a.atttypmod) AS tipo
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    """, (schema, tabela))
+    if not rows:
+        raise ValueError(
+            f'A tabela "{tabela}" não existe no schema "{schema}" do servidor de origem '
+            f'(ou o usuário da origem não tem acesso a ela).'
+        )
+    return [{'nome': r['nome'], 'tipo': r['tipo']} for r in rows]
+
+
+def validar_origem(relacao):
+    """Confere na origem que a tabela existe (ValueError com mensagem se não)."""
+    try:
+        return colunas_origem(relacao)
+    finally:
+        fechar_conexao_origem_da_thread()
+
+
+def max_id_origem(relacao, chave):
+    row = consultar_origem(f'SELECT MAX({quote_identifier(chave)}) AS ultimo FROM {quote_qualified_relation(relacao)}')
+    return int(row[0]['ultimo']) if row and row[0]['ultimo'] is not None else 0
+
+
+def _desquotar(identificador):
+    """'"Nome"' -> 'Nome'; 'nome' -> 'nome' (colunas vêm com ou sem aspas)."""
+    ident = (identificador or '').strip()
+    if len(ident) >= 2 and ident.startswith('"') and ident.endswith('"'):
+        return ident[1:-1].replace('""', '"')
+    return ident
+
+
+def _ident_sql(nome):
+    """Como o %I do format(): só põe aspas quando precisa."""
+    return nome if re.fullmatch(r'[a-z_][a-z0-9_$]*', nome) else quote_identifier(nome)
+
+
+def copiar_ids_da_origem(conn_local, staging, relacao, chave, colunas, ids):
+    """Troca o conteúdo da staging local pelas linhas da origem com esses IDs
+    (COPY origem -> memória -> COPY staging). `colunas` com ou sem aspas.
+
+    Os bytes passam crus, sem decodificar no Python: o COPY local informa o
+    encoding da origem (ENCODING ...) e o próprio PostgreSQL converte — assim
+    o client_encoding da conexão local (ex.: WIN1252) não limita os
+    caracteres que vêm da origem."""
+    nomes = [quote_identifier(_desquotar(c)) for c in colunas]
+    lista = ', '.join(nomes)
+    ids_int = [int(v) for v in ids]
+    conn_origem = conexao_origem_da_thread()
+    buffer = io.BytesIO()
+    try:
+        with conn_origem.cursor() as cur:
+            consulta = cur.mogrify(
+                f'SELECT {", ".join("s." + n for n in nomes)} FROM {quote_qualified_relation(relacao)} s '
+                f'WHERE s.{quote_identifier(_desquotar(chave))} = ANY(%s)', (ids_int,)
+            ).decode(psycopg2.extensions.encodings.get(conn_origem.encoding, 'utf-8'))
+            cur.copy_expert(f'COPY ({consulta}) TO STDOUT', buffer)
+    except (OperationalError, InterfaceError):
+        fechar_conexao_origem_da_thread()
+        raise
+    buffer.seek(0)
+    with conn_local.cursor() as cur:
+        cur.execute(f'TRUNCATE TABLE {staging}')
+        cur.copy_expert(f"COPY {staging} ({lista}) FROM STDIN WITH (ENCODING '{conn_origem.encoding}')", buffer)
+    conn_local.commit()
+
+
+def criar_staging_como_destino(conn, staging, destino, colunas):
+    """Staging vazia com as colunas (e tipos) do DESTINO — o COPY da origem
+    converte os valores pros tipos do destino já na carga."""
+    lista = ', '.join(quote_identifier(_desquotar(c)) for c in colunas)
+    with conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS {staging}')
+        cur.execute(f'CREATE UNLOGGED TABLE {staging} AS SELECT {lista} FROM {quote_qualified_relation(destino)} WHERE FALSE')
+    conn.commit()
+
+
+def preparar_colunas_origem_destino(tab_orig, tab_dest, campo):
+    """Substitui a antiga função SQL preparar_colunas_migracao (que só lia
+    tabela local): colunas em comum origem x destino (sem geradas/identity/
+    serial, exceto a chave), mais COUNT e MAX(chave) lidos na origem."""
+    relacao_origem = normalizar_origem(tab_orig)
+    destino = normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino'])
+    nomes_origem = {c['nome'] for c in colunas_origem(relacao_origem)}
+
+    colunas_destino = execute_query("""
+        SELECT a.attname AS nome, a.attidentity AS identidade, a.attgenerated AS gerada,
+               pg_get_expr(ad.adbin, ad.adrelid) AS padrao
+        FROM pg_attribute a
+        LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+        WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    """, (destino,))
+    if not colunas_destino:
+        raise ValueError(f'Tabela de destino "{destino}" não encontrada.')
+    if campo not in nomes_origem:
+        raise ValueError(f'A coluna chave "{campo}" não existe na tabela de origem {relacao_origem}.')
+    if not any(c['nome'] == campo for c in colunas_destino):
+        raise ValueError(f'A coluna chave "{campo}" não existe na tabela de destino {destino}.')
+
+    comuns = [
+        c['nome'] for c in colunas_destino
+        if c['nome'] in nomes_origem and (
+            c['nome'] == campo or not (
+                c['gerada'] or c['identidade'] in ('a', 'd') or (c['padrao'] or '').startswith('nextval(')
+            )
+        )
+    ]
+    sem_chave = [c for c in comuns if c != campo]
+    total = consultar_origem(
+        f'SELECT COUNT(*) AS total, MAX({quote_identifier(campo)}) AS maximo FROM {quote_qualified_relation(relacao_origem)}'
+    )[0]
+    return {
+        'sql_colunas_insert': ', '.join(_ident_sql(c) for c in comuns),
+        'sql_colunas_select': ', '.join(f's.{_ident_sql(c)}' for c in comuns),
+        'sql_colunas_update': ', '.join(f'{_ident_sql(c)} = EXCLUDED.{_ident_sql(c)}' for c in sem_chave) or None,
+        'sql_colunas_update_where': ' OR '.join(f'd.{_ident_sql(c)} IS DISTINCT FROM EXCLUDED.{_ident_sql(c)}' for c in sem_chave) or None,
+        'total_registros': int(total['total'] or 0),
+        'id_maximo': int(total['maximo'] or 0),
+    }
+
+
+# ============================================================
 # LOGO DO SISTEMA
 # ============================================================
 # A logo é uma variável do sistema (`logo_url` nos templates): a enviada pela
@@ -972,7 +1161,7 @@ PUBLIC_ENDPOINTS = {'login', 'logout', 'static', 'logo_sistema'}
 ADMIN_ONLY_ENDPOINTS = {
     'configurar_banco', 'usar_conexao_salva', 'excluir_conexao_salva',
     'testar_conexao_banco', 'testar_fdw_route', 'alterar_logo_route', 'restaurar_logo_route',
-    'criar_banco_local_route', 'criar_fdw_route', 'criar_schema_temp_route', 'revisar_tabelas_route',
+    'criar_banco_local_route', 'salvar_origem_route', 'remover_fdw_local_route', 'criar_schema_temp_route', 'revisar_tabelas_route',
     'usuarios', 'excluir_usuario_route',
 }
 
@@ -1214,16 +1403,6 @@ def update_migration_record(migracao_id, source_table, target_table, key_column)
     )
 
 
-def refresh_migration_batches(migration_id):
-    """Atualiza a consulta de diferenças e retorna os totais recalculados da migração."""
-    result = execute_query(
-        "SELECT * FROM atualizar_lotes_migracao(%s)",
-        (migration_id,),
-        statement_timeout_ms=1800000  # 30 minutos para tabelas grandes
-    )
-    return result[0]
-
-
 def _background_refresh_batches_worker(job_id, migration_id):
     """Thread worker que prepara colunas e obtém totais da migração.
 
@@ -1243,14 +1422,6 @@ def _background_refresh_batches_worker(job_id, migration_id):
                 'mensagem': 'Preparando colunas e obtendo totais da migração...',
             })
 
-            # Origem direto do FDW: atualiza a tabela estrangeira antes de ler
-            # as colunas (pega colunas novas da origem)
-            origem_rows = execute_query(
-                "SELECT tabela_origem FROM controle_migracao WHERE id = %s", (migration_id,)
-            )
-            if origem_rows:
-                sincronizar_tabela_origem(origem_rows[0]['tabela_origem'], forcar=True)
-
             # Limpar lotes anteriores (serão populados on-the-fly pelo processar_registro)
             execute_query(
                 "DELETE FROM controle_migracao_lotes WHERE migracao_id = %s",
@@ -1258,15 +1429,31 @@ def _background_refresh_batches_worker(job_id, migration_id):
                 fetch=False
             )
 
-            # Preparar colunas e obter COUNT + MAX(id) — sem carregar todos os IDs
-            info = execute_query(
-                "SELECT * FROM preparar_colunas_migracao(%s)",
-                (migration_id,),
-                statement_timeout_ms=600000
-            )[0]
+            # Preparar colunas e obter COUNT + MAX(id) — lidos direto no
+            # servidor de origem, sem carregar todos os IDs
+            cfg = execute_query(
+                "SELECT tabela_origem, tabela_destino, campo_id FROM controle_migracao WHERE id = %s",
+                (migration_id,)
+            )
+            if not cfg:
+                raise ValueError('Migração não encontrada.')
+            try:
+                info = preparar_colunas_origem_destino(cfg[0]['tabela_origem'], cfg[0]['tabela_destino'], cfg[0]['campo_id'])
+            finally:
+                fechar_conexao_origem_da_thread()
+            execute_query(
+                """UPDATE controle_migracao
+                   SET sql_colunas_insert = %s, sql_colunas_select = %s,
+                       sql_colunas_update = %s, sql_colunas_update_where = %s,
+                       total_registros = %s, id_maximo = %s, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (info['sql_colunas_insert'], info['sql_colunas_select'], info['sql_colunas_update'],
+                 info['sql_colunas_update_where'], info['total_registros'], info['id_maximo'], migration_id),
+                fetch=False
+            )
 
-            total_registros = info.get('total_registros_out', 0) or 0
-            id_maximo = info.get('id_maximo_out', 0) or 0
+            total_registros = info['total_registros']
+            id_maximo = info['id_maximo']
 
             # Resetar contadores para nova execução
             execute_query(
@@ -1584,98 +1771,49 @@ def quote_qualified_relation(relation_name):
     return f'{quote_identifier(schema_name)}.{quote_identifier(table_name)}'
 
 
-def get_relation_columns(relation_name):
-    """Retorna metadados das colunas da relação informada."""
-    schema_name, table_name = relation_name.split('.', 1)
-    return execute_query(
-        """
-        SELECT
-            column_name,
-            is_identity,
-            is_generated,
-            column_default,
-            ordinal_position
-        FROM information_schema.columns
-        WHERE table_schema = %s
-          AND table_name = %s
-        ORDER BY ordinal_position
-        """,
-        (schema_name, table_name)
-    )
-
-
-def get_common_update_columns(source_relation, target_relation, key_column):
-    """Retorna as colunas comuns que podem ser atualizadas entre origem e destino."""
-    source_columns = {column['column_name'] for column in get_relation_columns(source_relation)}
-    target_columns = get_relation_columns(target_relation)
-
-    if key_column not in source_columns:
-        raise ValueError(f'A coluna chave "{key_column}" não existe na tabela de origem {source_relation}.')
-
-    if not any(column['column_name'] == key_column for column in target_columns):
-        raise ValueError(f'A coluna chave "{key_column}" não existe na tabela de destino {target_relation}.')
-
-    common_columns = []
-    for column in target_columns:
-        column_name = column['column_name']
-        if column_name == key_column:
-            continue
-        if column_name not in source_columns:
-            continue
-        if column.get('is_generated') == 'ALWAYS':
-            continue
-        common_columns.append(column_name)
-
-    return common_columns
-
-
 def criar_tabela_destino_como_origem(tabela_origem_raw, tabela_destino_raw, campo_id, falhar_se_existir=True):
-    """Cria a tabela de destino replicando as colunas/tipos da tabela de origem
-    (foreign table via FDW), usando CREATE TABLE ... AS SELECT ... WHERE FALSE
-    (copia estrutura sem dados) e define campo_id como chave primária.
+    """Cria a tabela de destino com as colunas/tipos da tabela de origem (lidos
+    direto no servidor de origem) e define campo_id como chave primária.
+    Tipo que não existe no banco local (ex.: enum da origem) vira text.
 
     Se `falhar_se_existir` for False e o destino já existir, não faz nada e
     retorna com 'criada_agora': False (usado no fluxo automático de
     iniciar/salvar migração, onde a tabela normalmente já existe)."""
-    normalized_source = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+    normalized_source = normalizar_origem(tabela_origem_raw)
     normalized_target = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
     normalized_key = (campo_id or '').strip()
 
     if not normalized_key:
         raise ValueError('Informe o campo chave (campo_id) para criar a tabela de destino.')
 
-    quoted_source = quote_qualified_relation(normalized_source)
+    try:
+        colunas = colunas_origem(normalized_source)
+    finally:
+        fechar_conexao_origem_da_thread()
+    if not any(c['nome'] == normalized_key for c in colunas):
+        raise ValueError(f'A coluna chave "{normalized_key}" não existe na tabela de origem {normalized_source}.')
+
     quoted_target = quote_qualified_relation(normalized_target)
-    quoted_key = quote_identifier(normalized_key)
     target_schema, target_table = normalized_target.split('.', 1)
+    resultado_base = {'tabela_origem': normalized_source, 'tabela_destino': normalized_target, 'campo_id': normalized_key}
 
     def _operacao(conn):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute('SELECT to_regclass(%s) AS existe', (normalized_source,))
-            if cur.fetchone()['existe'] is None:
-                raise ValueError(f'Tabela de origem "{normalized_source}" não encontrada.')
-
             cur.execute('SELECT to_regclass(%s) AS existe', (normalized_target,))
             if cur.fetchone()['existe'] is not None:
                 if not falhar_se_existir:
-                    return {
-                        'tabela_origem': normalized_source,
-                        'tabela_destino': normalized_target,
-                        'campo_id': normalized_key,
-                        'criada_agora': False,
-                    }
+                    return {**resultado_base, 'criada_agora': False}
                 raise ValueError(f'A tabela de destino "{normalized_target}" já existe.')
 
+            definicoes = []
+            for coluna in colunas:
+                cur.execute('SELECT to_regtype(%s) IS NOT NULL AS existe', (coluna['tipo'],))
+                tipo = coluna['tipo'] if cur.fetchone()['existe'] else 'text'
+                definicoes.append(f'{quote_identifier(coluna["nome"])} {tipo}')
+
             cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(target_schema)}')
-            cur.execute(f'CREATE TABLE {quoted_target} AS SELECT * FROM {quoted_source} WHERE FALSE')
-
-            try:
-                cur.execute(f'ALTER TABLE {quoted_target} ADD PRIMARY KEY ({quoted_key})')
-            except psycopg2.errors.UndefinedColumn:
-                raise ValueError(
-                    f'A coluna chave "{normalized_key}" não existe na tabela de origem {normalized_source}.'
-                )
-
+            cur.execute(f'CREATE TABLE {quoted_target} ({", ".join(definicoes)})')
+            cur.execute(f'ALTER TABLE {quoted_target} ADD PRIMARY KEY ({quote_identifier(normalized_key)})')
             cur.execute(
                 """
                 SELECT column_name, data_type
@@ -1685,13 +1823,7 @@ def criar_tabela_destino_como_origem(tabela_origem_raw, tabela_destino_raw, camp
                 """,
                 (target_schema, target_table)
             )
-            return {
-                'tabela_origem': normalized_source,
-                'tabela_destino': normalized_target,
-                'campo_id': normalized_key,
-                'colunas': cur.fetchall(),
-                'criada_agora': True,
-            }
+            return {**resultado_base, 'colunas': cur.fetchall(), 'criada_agora': True}
 
     return execute_db_operation(_operacao, statement_timeout_ms=120000)
 
@@ -1723,11 +1855,10 @@ def _normalize_identifier_token(identifier_token):
 def build_single_record_upsert_sql(tab_orig, tab_dest, campo, cols_ins, cols_sel):
     """Monta SQL para inserir ou atualizar 1 registro comparando origem x destino.
 
-    OBS: `tab_orig` pode ser a tabela de origem real (schema.tabela do FDW)
-    ou a tabela de staging em `temp` (ver copiar_lote_para_staging). A função
-    não muda: ela só monta SQL contra a relação informada.
+    OBS: `tab_orig` é a staging local em `temp` (schema.tabela), já com a
+    linha copiada da origem (ver api_processar_registro).
     """
-    normalized_source = normalize_relation_input(tab_orig, 'Tabela Origem', get_fdw_config()['schema_local'])
+    normalized_source = normalize_relation_input(tab_orig, 'Tabela Origem')
     normalized_target = normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino'])
     normalized_key = (campo or '').strip()
 
@@ -1782,70 +1913,6 @@ def build_single_record_upsert_sql(tab_orig, tab_dest, campo, cols_ins, cols_sel
     """
 
     return base_sql + conflict_sql + tail_sql
-
-
-def process_automatic_update_batch(source_relation, target_relation, key_column, batch_size):
-    """Processa um lote de registros alterados entre origem estrangeira e tabela local."""
-    normalized_source = normalize_relation_input(source_relation, 'Tabela Origem', get_fdw_config()['schema_local'])
-    normalized_target = normalize_relation_input(target_relation, 'Tabela Destino', get_db_config()['schema_destino'])
-    normalized_key = (key_column or '').strip()
-
-    if not normalized_key:
-        raise ValueError('Informe a coluna chave para a atualização automática.')
-
-    if batch_size <= 0:
-        raise ValueError('O tamanho do lote deve ser maior que zero.')
-
-    common_columns = get_common_update_columns(normalized_source, normalized_target, normalized_key)
-    if not common_columns:
-        raise ValueError(
-            f'Nenhuma coluna compatível foi encontrada entre {normalized_source} e {normalized_target}. '
-            'Verifique se as tabelas possuem colunas com os mesmos nomes.'
-        )
-
-    quoted_source = quote_qualified_relation(normalized_source)
-    quoted_target = quote_qualified_relation(normalized_target)
-    quoted_key = quote_identifier(normalized_key)
-    difference_clause = ' OR '.join(
-        [f'd.{quote_identifier(column)} IS DISTINCT FROM s.{quote_identifier(column)}' for column in common_columns]
-    )
-    assignments = ', '.join(
-        [f'{quote_identifier(column)} = s.{quote_identifier(column)}' for column in common_columns]
-    )
-
-    sql = f"""
-        WITH changed_rows AS (
-            SELECT d.{quoted_key} AS row_id
-            FROM {quoted_target} d
-            INNER JOIN {quoted_source} s
-                ON d.{quoted_key} = s.{quoted_key}
-            WHERE {difference_clause}
-            ORDER BY d.{quoted_key}
-            LIMIT %s
-        ), updated_rows AS (
-            UPDATE {quoted_target} d
-            SET {assignments}
-            FROM {quoted_source} s
-            INNER JOIN changed_rows c
-                ON c.row_id = s.{quoted_key}
-            WHERE d.{quoted_key} = c.row_id
-            RETURNING d.{quoted_key} AS row_id
-        )
-        SELECT row_id FROM updated_rows
-    """
-
-    updated_rows = execute_query(sql, (batch_size,))
-    updated_ids = [row['row_id'] for row in updated_rows]
-
-    return {
-        'origem': normalized_source,
-        'destino': normalized_target,
-        'campo_id': normalized_key,
-        'colunas_comparadas': common_columns,
-        'registros_atualizados': len(updated_ids),
-        'registros_ids': updated_ids[:20],
-        'possui_mais': len(updated_ids) == batch_size
-    }
 
 
 # ============================================================
@@ -2445,6 +2512,9 @@ def revisar_tabelas_controle_importacao():
     Retorna a lista de mensagens do que foi feito."""
     criar_tabelas_controle()
     acoes = ['Tabelas, colunas, índices e funções SQL de controle verificados/criados no schema de destino.']
+    convertidas = migrar_origens_legadas()
+    if convertidas:
+        acoes.append(f'{convertidas} configuração(ões) antiga(s) (schema local do FDW) passaram a ler direto da origem.')
     acoes += migrar_tabelas_detalhe_para_bigint()
 
     removidos = execute_db_operation(
@@ -2463,6 +2533,9 @@ def _migrar_tabelas_detalhe_worker():
     try:
         # Tabelas de controle + funções SQL no schema de destino (idempotente)
         criar_tabelas_controle()
+        convertidas = migrar_origens_legadas()
+        if convertidas:
+            app.logger.warning('%s configuração(ões) antigas passaram a ler direto da origem', convertidas)
     except Exception:
         app.logger.exception('Falha ao criar tabelas/funções de controle na subida')
     try:
@@ -2512,10 +2585,7 @@ def criar_banco_local():
 # Funções SQL da migração em lotes — instaladas no schema de destino
 # configurado (não em public), junto com as tabelas de controle.
 ARQUIVO_FUNCOES_MIGRACAO = os.path.join(app.root_path, 'sql', 'funcoes_migracao.sql')
-FUNCOES_MIGRACAO = (
-    'atualizar_lotes_migracao', 'preparar_colunas_migracao', 'inicializar_migracao',
-    'processar_lote', 'processar_registro', 'verificar_progresso', 'finalizar_migracao',
-)
+FUNCOES_MIGRACAO = ('verificar_progresso', 'finalizar_migracao')
 
 
 def instalar_funcoes_migracao(conn):
@@ -2732,160 +2802,6 @@ def garantir_tabelas_controle_no_schema_ativo():
         flash(f'Não foi possível criar as tabelas de controle no schema "{schema_destino}": {str(e)}', 'warning')
 
 
-def avisar_se_schema_destino_colide_com_fdw():
-    """Alerta quando o schema de destino é igual ao schema local do FDW —
-    misturaria as tabelas de controle/migração com as foreign tables somente
-    leitura da origem, que é exatamente a confusão que este aviso evita."""
-    schema_destino = (get_db_config().get('schema_destino') or '').strip().lower()
-    schema_fdw_local = (get_fdw_config().get('schema_local') or '').strip().lower()
-
-    if schema_destino and schema_fdw_local and schema_destino == schema_fdw_local:
-        flash(
-            f'Atenção: o "Schema de destino" ("{schema_destino}") é igual ao "Schema local do FDW". '
-            'O schema de destino deve ser um schema seu, separado do schema onde ficam as foreign '
-            'tables (somente leitura) da origem.',
-            'error'
-        )
-
-
-def criar_fdw(origem, port):
-    """Cria a extensão postgres_fdw, o schema local, o servidor remoto e o user
-    mapping. Idempotente: se o servidor ou o mapping já existem, atualiza (ALTER).
-    As tabelas estrangeiras são criadas sob demanda (sincronizar_tabela_origem).
-    """
-    schema_local = origem['schema_local']
-    server_name = f'fdw_srv_{schema_local}'
-
-    def _preparar(conn):
-        # 1) Extensão + schema local — cada etapa comita separado para não perder
-        #    o que já foi feito caso uma etapa seguinte falhe.
-        with conn.cursor() as cur:
-            cur.execute('CREATE EXTENSION IF NOT EXISTS postgres_fdw')
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema_local)}')
-        conn.commit()
-
-        # 2) Servidor remoto (cria ou atualiza host/porta/banco)
-        with conn.cursor() as cur:
-            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
-            if cur.fetchone():
-                cur.execute(
-                    f'ALTER SERVER {quote_identifier(server_name)} OPTIONS '
-                    f'(SET host %s, SET port %s, SET dbname %s)',
-                    (origem['host'], str(port), origem['database'])
-                )
-            else:
-                cur.execute(
-                    f'CREATE SERVER {quote_identifier(server_name)} FOREIGN DATA WRAPPER postgres_fdw '
-                    f'OPTIONS (host %s, port %s, dbname %s)',
-                    (origem['host'], str(port), origem['database'])
-                )
-        conn.commit()
-
-        # 3) User mapping (cria ou atualiza usuário/senha da origem)
-        with conn.cursor() as cur:
-            cur.execute(
-                'SELECT 1 FROM pg_user_mappings WHERE srvname = %s AND usename = current_user',
-                (server_name,)
-            )
-            if cur.fetchone():
-                cur.execute(
-                    f'ALTER USER MAPPING FOR CURRENT_USER SERVER {quote_identifier(server_name)} '
-                    f'OPTIONS (SET user %s, SET password %s)',
-                    (origem['user'], origem['password'])
-                )
-            else:
-                cur.execute(
-                    f'CREATE USER MAPPING FOR CURRENT_USER SERVER {quote_identifier(server_name)} '
-                    f'OPTIONS (user %s, password %s)',
-                    (origem['user'], origem['password'])
-                )
-        conn.commit()
-        # As tabelas NÃO são mais importadas aqui em bloco (o IMPORT do schema
-        # inteiro falhava inteiro ao achar uma tabela já existente, deixando o
-        # schema local congelado). Cada tabela é criada/atualizada na hora de
-        # usar — veja sincronizar_tabela_origem.
-
-    execute_db_operation(lambda conn: _preparar(conn), statement_timeout_ms=120000)
-
-
-# ============================================================
-# ORIGEM DIRETO DO FDW: tabela estrangeira gerenciada pelo app
-# ============================================================
-# O postgres_fdw só lê a origem através de uma tabela estrangeira. Em vez de
-# depender de um schema importado à mão (que ficava desatualizado), o app
-# recria a tabela estrangeira de cada origem logo antes de usá-la, a partir
-# do schema remoto — sempre com as colunas atuais da origem, e qualquer
-# tabela remota pode ser usada sem passo manual. O schema local do FDW
-# (ex.: integrasesa) vira só o lugar onde o app guarda essas tabelas.
-
-# Ciclos frequentes não precisam recriar a tabela toda vez
-SINCRONIZAR_ORIGEM_INTERVALO_SEG = 600
-# Se a tabela estrangeira estiver em uso, não trava: segue com a atual
-SINCRONIZAR_ORIGEM_LOCK_TIMEOUT = '5s'
-_origem_sincronizada_em = {}  # 'schema.tabela' -> time.monotonic()
-_origem_sincronizada_lock = threading.Lock()
-
-
-def sincronizar_tabela_origem(relacao_origem, forcar=False):
-    """Cria/atualiza a tabela estrangeira de `relacao_origem` ('schema.tabela')
-    direto do schema remoto do FDW. Origem fora do schema local do FDW (ex.:
-    uma tabela local) é deixada como está. Levanta ValueError com mensagem
-    pro usuário se o FDW não estiver configurado ou a tabela não existir na origem."""
-    fdw = get_fdw_config()
-    schema_local = (fdw.get('schema_local') or '').strip()
-    schema, tabela = relacao_origem.split('.', 1)
-    if not schema_local or schema.lower() != schema_local.lower():
-        return
-
-    chave = f'{schema_local}.{tabela}'.lower()
-    with _origem_sincronizada_lock:
-        ultima = _origem_sincronizada_em.get(chave)
-    if not forcar and ultima is not None and time.monotonic() - ultima < SINCRONIZAR_ORIGEM_INTERVALO_SEG:
-        return
-
-    schema_remoto = (fdw.get('schema_remoto') or 'public').strip()
-    server_name = f'fdw_srv_{schema_local}'
-    relacao_sql = f'{quote_identifier(schema_local)}.{quote_identifier(tabela)}'
-
-    def _operacao(conn):
-        with conn.cursor() as cur:
-            cur.execute('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,))
-            if not cur.fetchone():
-                raise ValueError('O FDW ainda não foi configurado: clique em "Criar / Atualizar FDW" em Configurar Banco.')
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema_local)}')
-            cur.execute(
-                "SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = %s AND c.relname = %s", (schema_local, tabela)
-            )
-            existente = cur.fetchone()
-            if existente and existente[0] != 'f':
-                return  # tabela/view local com esse nome — não é do FDW, não mexe
-            if existente:
-                cur.execute(f"SET LOCAL lock_timeout = '{SINCRONIZAR_ORIGEM_LOCK_TIMEOUT}'")
-                cur.execute(f'DROP FOREIGN TABLE {relacao_sql}')
-            cur.execute(
-                f'IMPORT FOREIGN SCHEMA {quote_identifier(schema_remoto)} LIMIT TO ({quote_identifier(tabela)}) '
-                f'FROM SERVER {quote_identifier(server_name)} INTO {quote_identifier(schema_local)}'
-            )
-            cur.execute('SELECT to_regclass(%s)', (relacao_sql,))
-            if cur.fetchone()[0] is None:
-                raise ValueError(
-                    f'A tabela "{tabela}" não existe no schema remoto "{schema_remoto}" da origem '
-                    f'(ou o usuário do FDW não tem acesso a ela).'
-                )
-
-    try:
-        execute_db_operation(_operacao, statement_timeout_ms=60000)
-    except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DependentObjectsStillExist):
-        # Em uso por outra leitura agora (ou com views dependentes): a versão
-        # atual continua valendo; tenta atualizar na próxima vez
-        app.logger.warning('Tabela estrangeira %s em uso — mantida a versão atual', relacao_origem)
-        return
-    with _origem_sincronizada_lock:
-        _origem_sincronizada_em[chave] = time.monotonic()
-
-
-
 @app.route('/configurar-banco', methods=['GET', 'POST'])
 def configurar_banco():
     """Tela de configuração da conexão com o banco de dados."""
@@ -2912,7 +2828,6 @@ def configurar_banco():
                 'Conexão salva na lista e definida como ativa.' if created else 'Conexão atualizada e definida como ativa.',
                 'success'
             )
-            avisar_se_schema_destino_colide_com_fdw()
             garantir_tabelas_controle_no_schema_ativo()
             return redirect(url_for('dashboard'))
         except ValueError as error:
@@ -2926,6 +2841,7 @@ def configurar_banco():
         db_config=db_form,
         fdw_config=fdw_form,
         fdw_tabelas=get_fdw_tabelas(),
+        fdw_local=estado_fdw_local(),
         temp_schema_name=TEMP_SCHEMA_NAME,
         logs_importacao_mantidos=LOGS_IMPORTACAO_MANTIDOS,
         error_details=None,
@@ -3000,7 +2916,6 @@ def usar_conexao_salva(connection_id):
     app.config['DB_CONFIG_LOADED'] = True
     persist_active_db_config()
     flash(f'Conexão "{connection["profile_name"]}" definida como ativa.', 'success')
-    avisar_se_schema_destino_colide_com_fdw()
     garantir_tabelas_controle_no_schema_ativo()
     return redirect(url_for('configurar_banco'))
 
@@ -3048,70 +2963,142 @@ def criar_banco_local_route():
     return redirect(url_for('configurar_banco'))
 
 
-@app.route('/configurar-banco/criar-fdw', methods=['POST'])
-def criar_fdw_route():
-    """Cria/atualiza a extensão postgres_fdw, o servidor, o user mapping e importa as tabelas da origem."""
-    if not is_db_configured():
-        flash('Configure e salve a conexão do banco local antes de criar o FDW.', 'warning')
-        return redirect(url_for('configurar_banco'))
-
-    fdw_atual = get_fdw_config()
+def _origem_do_form():
+    """Lê a seção "Servidor de origem" do formulário. Senha em branco = mantém
+    a salva. Retorna (origem, porta, mensagem_de_erro)."""
+    atual = get_fdw_config()
     origem = {
         'host': (request.form.get('fdw_host') or '').strip(),
         'database': (request.form.get('fdw_database') or '').strip(),
         'user': (request.form.get('fdw_user') or '').strip(),
-        # Senha em branco no form = mantém a última senha salva (mesmo padrão do form de banco)
-        'password': request.form.get('fdw_password') or fdw_atual.get('password') or '',
+        'password': request.form.get('fdw_password') or atual.get('password') or '',
         'schema_remoto': (request.form.get('fdw_schema_remoto') or 'public').strip(),
-        'schema_local': (request.form.get('fdw_schema_local') or 'fdw_externo').strip(),
+        # schema local do antigo FDW: só guardado pra traduzir nomes antigos
+        # (integrasesa.v_x -> <schema remoto>.v_x)
+        'schema_local': atual.get('schema_local') or '',
     }
-    porta_raw = (request.form.get('fdw_port') or '5432').strip()
-
     if not origem['host'] or not origem['database'] or not origem['user'] or not origem['password']:
-        flash('Informe host, banco, usuário e senha da origem para criar o FDW.', 'error')
-        return redirect(url_for('configurar_banco'))
-    if not origem['schema_local']:
-        flash('Informe o schema local que vai receber as tabelas do FDW.', 'error')
-        return redirect(url_for('configurar_banco'))
-
-    schema_destino_ativo = (get_db_config().get('schema_destino') or '').strip().lower()
-    if schema_destino_ativo and origem['schema_local'].strip().lower() == schema_destino_ativo:
-        flash(
-            f'O "Schema local do FDW" não pode ser igual ao "Schema de destino" ("{schema_destino_ativo}"). '
-            'Use um schema separado para as foreign tables (somente leitura) da origem.',
-            'error'
-        )
-        return redirect(url_for('configurar_banco'))
-
+        return origem, None, 'Informe host, banco, usuário e senha da origem.'
     try:
-        porta = int(porta_raw)
+        porta = int((request.form.get('fdw_port') or '5432').strip())
     except ValueError:
-        flash('Porta da origem inválida.', 'error')
+        return origem, None, 'Informe uma porta válida.'
+    return origem, porta, None
+
+
+@app.route('/configurar-banco/salvar-origem', methods=['POST'])
+def salvar_origem_route():
+    """Salva as credenciais do servidor de origem (depois de conectar com
+    sucesso) e atualiza a lista de tabelas usada nos exemplos rápidos."""
+    origem, porta, erro = _origem_do_form()
+    if erro:
+        flash(erro, 'error')
         return redirect(url_for('configurar_banco'))
 
-    try:
-        criar_fdw(origem, porta)
-        origem['port'] = porta
-        persist_fdw_config(origem)
-        # Atualiza também a lista de tabelas (exemplos rápidos) — não
-        # depende de clicar em "Testar"
-        lista_ok, lista_msg, tabelas = _testar_origem_direta(origem, porta)
-        if tabelas:
-            lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
-            flash(f'Lista de tabelas da origem atualizada: {len(lista["tabelas"])} tabela(s) '
-                  f'disponíveis nos exemplos rápidos.', 'info')
-        else:
-            flash(f'Não foi possível atualizar a lista de tabelas da origem. {lista_msg}', 'warning')
-        flash(
-            f'FDW criado/atualizado: schema local "{origem["schema_local"]}" '
-            f'apontando para {origem["host"]}:{porta}/{origem["database"]} (schema remoto "{origem["schema_remoto"]}").',
-            'success'
-        )
-    except (OperationalError, InterfaceError) as error:
-        return handle_db_connection_error(error)
-    except Exception as e:
-        flash(f'Erro ao criar o FDW: {str(e)}', 'error')
+    conectou, mensagem, tabelas = _testar_origem_direta(origem, porta)
+    if not conectou:
+        flash(f'Origem não salva — {mensagem}', 'error')
+        return redirect(url_for('configurar_banco'))
 
+    origem['port'] = porta
+    persist_fdw_config(origem)
+    lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
+    flash(f'Servidor de origem salvo: {origem["host"]}:{porta}/{origem["database"]} '
+          f'(schema "{origem["schema_remoto"]}", {len(lista["tabelas"])} tabela(s) disponíveis).', 'success')
+    if is_db_configured():
+        try:
+            convertidas = migrar_origens_legadas()
+            if convertidas:
+                flash(f'{convertidas} configuração(ões) antiga(s) passaram a ler direto da origem.', 'info')
+        except psycopg2.Error as error:
+            flash(f'Não foi possível atualizar as origens antigas: {error}', 'warning')
+    return redirect(url_for('configurar_banco'))
+
+
+def migrar_origens_legadas():
+    """Troca o prefixo do antigo schema local do FDW (ex.: integrasesa.v_x)
+    pelo schema remoto (guardiao.v_x) nas configurações gravadas. Idempotente."""
+    fdw = get_fdw_config()
+    legado = (fdw.get('schema_local') or '').strip()
+    remoto = (fdw.get('schema_remoto') or '').strip()
+    if not legado or not remoto or legado.lower() == remoto.lower():
+        return 0
+
+    def _operacao(conn):
+        total = 0
+        with conn.cursor() as cur:
+            for tabela in ('controle_migracao', 'auto_importacao_tabelas', 'agendamento_importacao_tabelas'):
+                cur.execute(f"""
+                    UPDATE {tabela}
+                    SET tabela_origem = %s || substr(tabela_origem, length(split_part(tabela_origem, '.', 1)) + 1)
+                    WHERE lower(split_part(tabela_origem, '.', 1)) = lower(%s)
+                """, (remoto, legado))
+                total += cur.rowcount
+        return total
+
+    return garantir_tabelas_e_executar(lambda: execute_db_operation(_operacao, statement_timeout_ms=60000))
+
+
+def estado_fdw_local():
+    """O que ainda existe do antigo FDW local no banco (pra oferecer a remoção)."""
+    schema = (get_fdw_config().get('schema_local') or '').strip()
+    if not schema or not is_db_configured():
+        return None
+    try:
+        row = execute_query("""
+            SELECT
+                EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS schema_existe,
+                EXISTS (SELECT 1 FROM pg_foreign_server WHERE srvname = %s) AS servidor_existe,
+                (SELECT count(*) FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s) AS tabelas_estrangeiras
+        """, (schema, f'fdw_srv_{schema}', schema), statement_timeout_ms=10000)[0]
+    except Exception:  # noqa: BLE001 - só não oferece o botão
+        return None
+    if not row['schema_existe'] and not row['servidor_existe']:
+        return None
+    return {'schema': schema, **row}
+
+
+@app.route('/configurar-banco/remover-fdw-local', methods=['POST'])
+def remover_fdw_local_route():
+    """Remove o antigo FDW local: servidor, user mapping e tabelas estrangeiras
+    (DROP SERVER ... CASCADE) e o schema local, se não sobrar nada nele."""
+    estado = estado_fdw_local()
+    if not estado:
+        flash('Não há FDW local para remover.', 'info')
+        return redirect(url_for('configurar_banco'))
+    schema = estado['schema']
+
+    try:
+        migrar_origens_legadas()   # configurações deixam de citar o schema antes de removê-lo
+    except psycopg2.Error as error:
+        flash(f'Não foi possível atualizar as origens antigas: {error}', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    def _operacao(conn):
+        with conn.cursor() as cur:
+            cur.execute(f'DROP SERVER IF EXISTS {quote_identifier(f"fdw_srv_{schema}")} CASCADE')
+            cur.execute("""
+                SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relkind IN ('r', 'v', 'm', 'f', 'p') ORDER BY 1
+            """, (schema,))
+            restantes = [r[0] for r in cur.fetchall()]
+            if not restantes:
+                cur.execute(f'DROP SCHEMA IF EXISTS {quote_identifier(schema)} CASCADE')
+        return restantes
+
+    try:
+        restantes = execute_db_operation(_operacao, statement_timeout_ms=60000)
+    except psycopg2.Error as error:
+        flash(f'Erro ao remover o FDW local: {error}', 'error')
+        return redirect(url_for('configurar_banco'))
+
+    if restantes:
+        flash(f'Servidor FDW e tabelas estrangeiras removidos. O schema "{schema}" foi mantido porque ainda '
+              f'tem objetos que não são do FDW: {", ".join(restantes[:10])}'
+              f'{"..." if len(restantes) > 10 else ""}.', 'warning')
+    else:
+        flash(f'FDW local removido: schema "{schema}", servidor, mapeamento e tabelas estrangeiras.', 'success')
     return redirect(url_for('configurar_banco'))
 
 
@@ -3157,75 +3144,28 @@ def salvar_lista_tabelas_fdw(origem, porta, tabelas):
         'atualizado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
         'origem': f'{origem["host"]}:{porta}/{origem["database"]}',
         'schema_remoto': origem['schema_remoto'],
-        'schema_local': origem['schema_local'],
         'tabelas': tabelas,
     }
     persist_fdw_tabelas(lista)
     return lista
 
 
-def _testar_via_fdw(schema_local, tabelas):
-    """Etapa 2: consulta real pelo FDW configurado no banco local — cria/atualiza
-    a tabela estrangeira de uma tabela da origem (como as importações fazem) e
-    lê por ela. Confirma que o servidor PostgreSQL local alcança a origem."""
-    if not is_db_configured():
-        return None, 'FDW: banco local não configurado — teste pelo FDW não executado.'
-    server_name = f'fdw_srv_{schema_local}'
-    try:
-        existe = execute_query('SELECT 1 FROM pg_foreign_server WHERE srvname = %s', (server_name,),
-                               statement_timeout_ms=15000)
-    except Exception as error:  # noqa: BLE001
-        return False, f'FDW: falha ao consultar o banco local — {error}'
-    if not existe:
-        return None, f'FDW: servidor "{server_name}" ainda não foi criado — clique em "Criar / Atualizar FDW".'
-    if not tabelas:
-        return None, 'FDW: sem tabela na origem para testar a leitura pelo FDW.'
-
-    relacao = f'{schema_local}.{tabelas[0]["nome"]}'
-    try:
-        sincronizar_tabela_origem(relacao, forcar=True)
-        execute_query(f'SELECT 1 FROM {quote_qualified_relation(relacao)} LIMIT 1', statement_timeout_ms=15000)
-    except Exception as error:  # noqa: BLE001
-        return False, f'FDW: falha ao ler {tabelas[0]["nome"]} pelo servidor local — {error}'
-    return True, f'FDW: leitura pelo servidor local OK ({tabelas[0]["nome"]}).'
-
-
 @app.route('/configurar-banco/testar-fdw', methods=['POST'])
 def testar_fdw_route():
-    """Testa, via AJAX, a origem do FDW (direto e pelo FDW criado) sem salvar nada."""
-    fdw_atual = get_fdw_config()
-    origem = {
-        'host': (request.form.get('fdw_host') or '').strip(),
-        'database': (request.form.get('fdw_database') or '').strip(),
-        'user': (request.form.get('fdw_user') or '').strip(),
-        # Senha em branco = usa a salva (mesmo padrão do botão "Criar / Atualizar FDW")
-        'password': request.form.get('fdw_password') or fdw_atual.get('password') or '',
-        'schema_remoto': (request.form.get('fdw_schema_remoto') or 'public').strip(),
-        'schema_local': (request.form.get('fdw_schema_local') or 'fdw_externo').strip(),
-    }
-    if not origem['host'] or not origem['database'] or not origem['user'] or not origem['password']:
-        return jsonify({'sucesso': False, 'mensagem': 'Informe host, banco, usuário e senha da origem.'})
-    try:
-        porta = int((request.form.get('fdw_port') or '5432').strip())
-    except ValueError:
-        return jsonify({'sucesso': False, 'mensagem': 'Informe uma porta válida.'})
+    """Testa, via AJAX, a conexão direta com o servidor de origem e atualiza a
+    lista de tabelas (sem salvar as credenciais)."""
+    origem, porta, erro = _origem_do_form()
+    if erro:
+        return jsonify({'sucesso': False, 'mensagem': erro})
 
-    direto_ok, direto_msg, tabelas = _testar_origem_direta(origem, porta)
-    fdw_ok, fdw_msg = _testar_via_fdw(origem['schema_local'], tabelas)
-
+    conectou, mensagem, tabelas = _testar_origem_direta(origem, porta)
     lista = None
     if tabelas:
         try:
             lista = salvar_lista_tabelas_fdw(origem, porta, tabelas)
         except OSError as error:
-            fdw_msg += f'\nAviso: não foi possível salvar a lista de tabelas — {error}'
-
-    # FDW ainda não criado (None) não reprova o teste — só a etapa que rodou e falhou
-    return jsonify({
-        'sucesso': direto_ok and fdw_ok is not False,
-        'mensagem': f'{direto_msg}\n{fdw_msg}',
-        'lista_tabelas': lista,
-    })
+            mensagem += f'\nAviso: não foi possível salvar a lista de tabelas — {error}'
+    return jsonify({'sucesso': conectou, 'mensagem': mensagem, 'lista_tabelas': lista})
 
 
 @app.route('/logo')
@@ -3475,7 +3415,7 @@ def mensagem_migracao_duplicada(existente, tabela_origem):
 def mapeamentos_fdw_com_migracoes():
     """Mapeamentos do FDW marcados com a migração já cadastrada pra mesma
     origem (ou destino), se houver — a tela não oferece criar de novo."""
-    schema_local = (get_fdw_config().get('schema_local') or '').lower()
+    schema_remoto = (get_fdw_config().get('schema_remoto') or 'public').lower()
     schema_destino = (get_db_config().get('schema_destino') or '').lower()
     try:
         migracoes = listar_migracoes_para_selecao()
@@ -3485,7 +3425,7 @@ def mapeamentos_fdw_com_migracoes():
     por_destino = {(m['tabela_destino'] or '').lower(): m['id'] for m in migracoes}
     resultado = []
     for mp in get_mapeamentos_fdw():
-        origem = f'{schema_local}.{mp["origem"]}'.lower()
+        origem = f'{schema_remoto}.{mp["origem"]}'.lower()
         destino = f'{schema_destino}.{mp["destino"]}'.lower()
         resultado.append({**mp, 'migracao_id': por_origem.get(origem) or por_destino.get(destino)})
     return resultado
@@ -3513,10 +3453,9 @@ def nova_migracao():
         tamanho_lote = 1
 
         try:
-            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_origem = normalizar_origem(tabela_origem_raw)
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
-            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
-            sincronizar_tabela_origem(tabela_origem, forcar=True)
+            validar_origem(tabela_origem)
         except (ValueError, psycopg2.Error) as error:
             if is_ajax_request():
                 return jsonify({'status': 'erro', 'mensagem': str(error)}), 400
@@ -3654,9 +3593,7 @@ def montar_esquema_relacionamentos():
             'migracoes': [mig['id']],
         }
 
-    colunas = _colunas_das_relacoes(
-        [t['nome'] for t in tabelas.values()] + [t['origem'] for t in tabelas.values() if t['origem']]
-    )
+    colunas = _colunas_das_relacoes([t['nome'] for t in tabelas.values()])
     colunas_fdw = {
         t['nome'].lower(): [{'nome': c, 'tipo': None} for c in t.get('colunas') or []]
         for t in get_fdw_tabelas().get('tabelas') or []
@@ -3665,8 +3602,6 @@ def montar_esquema_relacionamentos():
         origem = (t['origem'] or '').lower()
         if t['chave'] in colunas:
             t['colunas'], t['fonte'] = colunas[t['chave']], 'destino'
-        elif origem in colunas:
-            t['colunas'], t['fonte'] = colunas[origem], 'origem'
         elif origem.split('.')[-1] in colunas_fdw:
             t['colunas'], t['fonte'] = colunas_fdw[origem.split('.')[-1]], 'fdw'
         else:
@@ -3739,12 +3674,11 @@ def importacao_automatica():
         tamanho_lote = min(tamanho_lote, MAX_TAMANHO_LOTE)
 
         try:
-            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_origem = normalizar_origem(tabela_origem_raw)
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
             if not campo_id:
                 raise ValueError('Informe o campo chave (campo_id).')
-            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
-            sincronizar_tabela_origem(tabela_origem, forcar=True)
+            validar_origem(tabela_origem)
 
             tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
 
@@ -3961,62 +3895,6 @@ def atualizar_lotes_migracao(id):
 
     return redirect(url_for('controle_migracao', id=id))
 
-@app.route('/api/processar-lote', methods=['POST'])
-def api_processar_lote():
-    """API para processar um lote específico"""
-    if not is_db_configured():
-        return jsonify({
-            'status': 'erro',
-            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
-            'configurar_banco': url_for('configurar_banco')
-        }), 503
-
-    data = request.json
-    migracao_id = data.get('migracao_id')
-    numero_lote = data.get('numero_lote')
-    
-    try:
-        def processar_lote_na_mesma_conexao(conn):
-            result = run_query_with_connection(
-                conn,
-                "SELECT * FROM processar_lote(%s, %s)",
-                (migracao_id, numero_lote)
-            )[0]
-
-            progresso = run_query_with_connection(
-                conn,
-                "SELECT * FROM verificar_progresso(%s)",
-                (migracao_id,)
-            )[0]
-
-            if progresso['registros_processados'] >= progresso['total_registros']:
-                run_query_with_connection(
-                    conn,
-                    "SELECT finalizar_migracao(%s)",
-                    (migracao_id,),
-                    fetch=False
-                )
-                result['concluido'] = True
-                progresso = run_query_with_connection(
-                    conn,
-                    "SELECT * FROM verificar_progresso(%s)",
-                    (migracao_id,)
-                )[0]
-
-            result['progresso'] = dict(progresso)
-            return result
-
-        result = execute_db_operation(processar_lote_na_mesma_conexao)
-        return jsonify(result)
-    except (OperationalError, InterfaceError) as error:
-        return handle_db_connection_error(error, api=True)
-    except Exception as e:
-        return jsonify({
-            'status': 'erro',
-            'mensagem': str(e),
-            'registros_inseridos': 0
-        }), 500
-
 
 @app.route('/api/processar-registro', methods=['POST'])
 def api_processar_registro():
@@ -4056,19 +3934,29 @@ def api_processar_registro():
                 tab_orig = cfg['tabela_origem']
                 tab_dest = cfg['tabela_destino']
                 campo = cfg['campo_id']
-                # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
-                sincronizar_tabela_origem(tab_orig)
                 cols_ins = cfg['sql_colunas_insert']
                 cols_sel = cfg['sql_colunas_select']
 
                 if not cols_ins or not cols_sel:
                     return {'registros_afetados': 0, 'status': 'erro', 'mensagem': 'Colunas não preparadas'}
 
-                # 1) Inserir/atualizar conforme diferença entre origem e destino
-                sql_upsert_one = build_single_record_upsert_sql(tab_orig, tab_dest, campo, cols_ins, cols_sel)
+                # 1) Copia a linha da origem pra uma staging só deste registro
+                #    (não colide com a staging de uma migração em andamento) e
+                #    insere/atualiza conforme a diferença com o destino
+                staging_registro = f'{TEMP_SCHEMA_NAME}.r_{int(migracao_id)}'
+                ensure_temp_schema(conn)
+                destino = normalize_relation_input(tab_dest, 'Tabela Destino', get_db_config()['schema_destino'])
+                criar_staging_como_destino(conn, staging_registro, destino, _split_sql_columns(cols_ins))
+                try:
+                    copiar_ids_da_origem(conn, staging_registro, normalizar_origem(tab_orig), campo,
+                                         _split_sql_columns(cols_ins), [chave_valor])
+                finally:
+                    fechar_conexao_origem_da_thread()
+                sql_upsert_one = build_single_record_upsert_sql(staging_registro, tab_dest, campo, cols_ins, cols_sel)
                 chave_int = int(chave_valor)
                 cur.execute(sql_upsert_one, (chave_int,))
                 outcome = cur.fetchone() or {}
+                cur.execute(f'DROP TABLE IF EXISTS {staging_registro}')
                 existe_origem = outcome.get('existe_origem')
                 inserido = outcome.get('inserido')
 
@@ -4195,66 +4083,6 @@ def api_registros(migracao_id):
         return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
 
 
-@app.route('/api/importacao-automatica/ciclo', methods=['POST'])
-def api_importacao_automatica_ciclo():
-    """Executa um ciclo de atualização automática por diferenças em lote."""
-    if not is_db_configured():
-        return jsonify({
-            'status': 'erro',
-            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
-            'configurar_banco': url_for('configurar_banco')
-        }), 503
-
-    data = request.json or {}
-    mappings = data.get('mappings') or []
-
-    try:
-        batch_size = int(data.get('batch_size') or 100)
-    except (TypeError, ValueError):
-        return jsonify({'status': 'erro', 'mensagem': 'Informe um tamanho de lote válido.'}), 400
-
-    if batch_size <= 0:
-        return jsonify({'status': 'erro', 'mensagem': 'O tamanho do lote deve ser maior que zero.'}), 400
-
-    if not mappings:
-        return jsonify({'status': 'erro', 'mensagem': 'Informe ao menos uma tabela para a importação automática.'}), 400
-
-    resultados = []
-    total_atualizados = 0
-
-    try:
-        for mapping in mappings:
-            try:
-                result = process_automatic_update_batch(
-                    source_relation=mapping.get('tabela_origem'),
-                    target_relation=mapping.get('tabela_destino'),
-                    key_column=mapping.get('campo_id'),
-                    batch_size=batch_size
-                )
-                result['status'] = 'sucesso'
-                total_atualizados += result['registros_atualizados']
-            except ValueError as error:
-                result = {
-                    'status': 'erro',
-                    'origem': mapping.get('tabela_origem'),
-                    'destino': mapping.get('tabela_destino'),
-                    'campo_id': mapping.get('campo_id'),
-                    'mensagem': str(error)
-                }
-
-            resultados.append(result)
-    except (OperationalError, InterfaceError) as error:
-        return handle_db_connection_error(error, api=True)
-    except Exception as error:
-        return jsonify({'status': 'erro', 'mensagem': str(error)}), 500
-
-    return jsonify({
-        'status': 'sucesso',
-        'resultados': resultados,
-        'total_tabelas': len(resultados),
-        'total_atualizados': total_atualizados
-    })
-
 def _cancelar_ciclo_auto_import(job_id, conn, staging):
     """Chamado quando o usuário clica em 'Parar' com um ciclo em andamento:
     derruba a staging (não deixa lixo em `temp`) e marca o job como cancelado."""
@@ -4317,12 +4145,10 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
     Usa a MESMA arquitetura do worker de migração manual (só muda o nome da
     staging, com prefixo `c_` em vez de `stg_mig_<id>`, pra nunca colidir):
     monta uma lista explícita de IDs a verificar e processa em lotes; cada
-    lote copia só aqueles IDs da origem via `WHERE chave = ANY(...)` — a
-    mesma consulta que já funciona sem problemas em qualquer tabela na
-    migração, porque o postgres_fdw empurra o `= ANY(...)` pra origem usando
-    o índice, sem depender de ORDER BY/LIMIT (que é o que causava timeout).
+    lote copia só aqueles IDs direto do servidor de origem via
+    `WHERE chave = ANY(...)` (usa o índice da origem, sem ORDER BY/LIMIT).
     Reaproveita direto as funções da migração: copiar_lote_para_staging,
-    processar_lote_bulk, processar_lote_fallback (nenhuma delas foi alterada).
+    processar_lote_bulk, processar_lote_fallback.
     """
     job = get_background_job(job_id)
     if not job:
@@ -4338,10 +4164,8 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         return
 
     try:
-        normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
+        normalized_source = normalizar_origem(tabela_cfg['tabela_origem'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
-        # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
-        sincronizar_tabela_origem(normalized_source)
     except (ValueError, psycopg2.Error) as error:
         set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
         _log_ciclo(job_id, 'erro', str(error))
@@ -4350,7 +4174,6 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
     normalized_key = tabela_cfg['campo_id']
     qtd_registros = tabela_cfg['qtd_registros']
     tamanho_lote = min(tabela_cfg['tamanho_lote'], MAX_TAMANHO_LOTE)
-    quoted_source = quote_qualified_relation(normalized_source)
     quoted_target = quote_qualified_relation(normalized_target)
     quoted_key = quote_identifier(normalized_key)
 
@@ -4381,15 +4204,9 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
             return
         # Trava de sessão: libera sozinha quando `conn.close()` roda.
 
-        # 1. Colunas comuns entre origem e destino (metadado local, rápido)
-        source_schema, source_table = normalized_source.split('.', 1)
+        # 1. Colunas comuns entre origem (lidas no servidor de origem) e destino
         target_schema, target_table = normalized_target.split('.', 1)
-
-        source_cols_raw = query(conn,
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
-            (source_schema, source_table))
-        source_columns = {r['column_name'] for r in source_cols_raw}
+        source_columns = {c['nome'] for c in colunas_origem(normalized_source)}
 
         target_cols_raw = query(conn,
             "SELECT column_name, is_identity, is_generated, column_default "
@@ -4410,12 +4227,10 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         ]
 
         all_columns = [normalized_key] + common_columns
-        quoted_columns = [quote_identifier(c) for c in all_columns]
         cols_ins = ', '.join(all_columns)  # CSV de nomes SEM aspas — copiar_lote_para_staging/
                                             # montar_sql_upsert_lote fazem a própria quotação
                                             # internamente (é o mesmo formato que sql_colunas_insert
                                             # usa nas migrações manuais)
-        cols_select_source = ', '.join([f's.{qc}' for qc in quoted_columns])
 
         # 2. MAX(campo_id) do destino e da origem. A migração recebe a faixa
         #    (ID Inicial/Final) escolhida pelo usuário; aqui, como ninguém
@@ -4430,8 +4245,7 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         max_destino = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
         ultimo_id_destino = int(max_destino[0]['ultimo_id']) if max_destino and max_destino[0]['ultimo_id'] is not None else 0
 
-        max_origem = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_source}")
-        ultimo_id_origem = int(max_origem[0]['ultimo_id']) if max_origem and max_origem[0]['ultimo_id'] is not None else 0
+        ultimo_id_origem = max_id_origem(normalized_source, normalized_key)
 
         # 3. Faixa: id_fim é SEMPRE o máximo real da origem — nunca capado,
         #    senão registros novos além do teto de segurança ficariam de fora
@@ -4453,16 +4267,10 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         staging = obter_staging_table_auto(normalized_target)
         ensure_temp_schema(conn)
 
-        def _preparar_staging_vazia(c):
-            with c.cursor() as cur:
-                cur.execute(f'DROP TABLE IF EXISTS {staging}')
-                cur.execute(
-                    f'CREATE UNLOGGED TABLE {staging} AS '
-                    f'SELECT {cols_select_source} FROM {quoted_source} s WHERE FALSE'
-                )
-            c.commit()
-
-        conn = executar_com_reconexao(_preparar_staging_vazia, abrir_conexao_auto, conn, job_id=job_id, etapa='origem (FDW)')
+        conn = executar_com_reconexao(
+            lambda c: criar_staging_como_destino(c, staging, normalized_target, all_columns),
+            abrir_conexao_auto, conn, job_id=job_id, etapa='banco local'
+        )
 
         total_lotes = math.ceil(len(ids_list) / tamanho_lote) if ids_list else 0
 
@@ -4505,7 +4313,7 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
             # paciência em conflito de recovery) se a origem cair no meio.
             conn = executar_com_reconexao(
                 lambda c: copiar_lote_para_staging(c, staging, normalized_source, normalized_key, cols_ins, ids_lote),
-                abrir_conexao_auto, conn, job_id=job_id, etapa='origem (FDW)'
+                abrir_conexao_auto, conn, job_id=job_id, etapa='origem'
             )
 
             # Remove duplicatas de chave dentro do lote — algumas views de
@@ -4627,6 +4435,7 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         _log_ciclo(job_id, 'erro', f'Erro fatal no ciclo: {error}')
         return
     finally:
+        fechar_conexao_origem_da_thread()
         if conn is not None:
             try:
                 conn.close()
@@ -4703,10 +4512,8 @@ def _background_agendamento_worker(job_id, tabela_id):
         return
 
     try:
-        normalized_source = normalize_relation_input(tabela_cfg['tabela_origem'], 'Tabela Origem', get_fdw_config()['schema_local'])
+        normalized_source = normalizar_origem(tabela_cfg['tabela_origem'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
-        # Origem direto do FDW (no máximo a cada SINCRONIZAR_ORIGEM_INTERVALO_SEG)
-        sincronizar_tabela_origem(normalized_source)
     except (ValueError, psycopg2.Error) as error:
         set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
         _log_execucao(job_id, 'erro', str(error))
@@ -4714,7 +4521,6 @@ def _background_agendamento_worker(job_id, tabela_id):
 
     normalized_key = tabela_cfg['campo_id']
     tamanho_lote = min(tabela_cfg['tamanho_lote'], MAX_TAMANHO_LOTE)
-    quoted_source = quote_qualified_relation(normalized_source)
     quoted_target = quote_qualified_relation(normalized_target)
     quoted_key = quote_identifier(normalized_key)
 
@@ -4746,15 +4552,9 @@ def _background_agendamento_worker(job_id, tabela_id):
             return
         # Trava de sessão: libera sozinha quando `conn.close()` roda.
 
-        # 1. Colunas comuns entre origem e destino (metadado local, rápido)
-        source_schema, source_table = normalized_source.split('.', 1)
+        # 1. Colunas comuns entre origem (lidas no servidor de origem) e destino
         target_schema, target_table = normalized_target.split('.', 1)
-
-        source_cols_raw = query(conn,
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
-            (source_schema, source_table))
-        source_columns = {r['column_name'] for r in source_cols_raw}
+        source_columns = {c['nome'] for c in colunas_origem(normalized_source)}
 
         target_cols_raw = query(conn,
             "SELECT column_name, is_identity, is_generated, column_default "
@@ -4775,17 +4575,14 @@ def _background_agendamento_worker(job_id, tabela_id):
         ]
 
         all_columns = [normalized_key] + common_columns
-        quoted_columns = [quote_identifier(c) for c in all_columns]
         cols_ins = ', '.join(all_columns)  # CSV sem aspas — as funções da migração quotam sozinhas
-        cols_select_source = ', '.join([f's.{qc}' for qc in quoted_columns])
 
         # 2. MAX(campo_id) do destino e da origem. int(...) porque campo_id
         #    pode ser NUMERIC no Postgres (Decimal não funciona em range()).
         max_destino = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_target}")
         ultimo_id_destino = int(max_destino[0]['ultimo_id']) if max_destino and max_destino[0]['ultimo_id'] is not None else 0
 
-        max_origem = query(conn, f"SELECT MAX({quoted_key}) AS ultimo_id FROM {quoted_source}")
-        ultimo_id_origem = int(max_origem[0]['ultimo_id']) if max_origem and max_origem[0]['ultimo_id'] is not None else 0
+        ultimo_id_origem = max_id_origem(normalized_source, normalized_key)
 
         # Libera a transação logo — sem isso a conexão fica "idle in
         # transaction" seguradno o snapshot enquanto o Python monta a lista
@@ -4818,16 +4615,10 @@ def _background_agendamento_worker(job_id, tabela_id):
         staging = obter_staging_table_agendamento(normalized_target)
         ensure_temp_schema(conn)
 
-        def _preparar_staging_vazia(c):
-            with c.cursor() as cur:
-                cur.execute(f'DROP TABLE IF EXISTS {staging}')
-                cur.execute(
-                    f'CREATE UNLOGGED TABLE {staging} AS '
-                    f'SELECT {cols_select_source} FROM {quoted_source} s WHERE FALSE'
-                )
-            c.commit()
-
-        conn = executar_com_reconexao(_preparar_staging_vazia, abrir_conexao_agendamento, conn, job_id=job_id, etapa='origem (FDW)')
+        conn = executar_com_reconexao(
+            lambda c: criar_staging_como_destino(c, staging, normalized_target, all_columns),
+            abrir_conexao_agendamento, conn, job_id=job_id, etapa='banco local'
+        )
 
         set_background_job(job_id, {
             **get_background_job(job_id),
@@ -4882,7 +4673,7 @@ def _background_agendamento_worker(job_id, tabela_id):
             # paciência em conflito de recovery) se a origem cair no meio.
             conn = executar_com_reconexao(
                 lambda c: copiar_lote_para_staging(c, staging, normalized_source, normalized_key, cols_ins, ids_lote),
-                abrir_conexao_agendamento, conn, job_id=job_id, etapa='origem (FDW)'
+                abrir_conexao_agendamento, conn, job_id=job_id, etapa='origem'
             )
 
             # Remove duplicatas de chave dentro do lote — mesma razão da
@@ -5029,6 +4820,7 @@ def _background_agendamento_worker(job_id, tabela_id):
         _fechar_execucao_com_erro(conn, execucao_id, str(error), locals())
         return
     finally:
+        fechar_conexao_origem_da_thread()
         if conn is not None:
             try:
                 conn.close()
@@ -5161,12 +4953,11 @@ def agendar_importacao():
             return redirect(url_for('agendar_importacao'))
 
         try:
-            tabela_origem = normalize_relation_input(tabela_origem_raw, 'Tabela Origem', get_fdw_config()['schema_local'])
+            tabela_origem = normalizar_origem(tabela_origem_raw)
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
             if not campo_id:
                 raise ValueError('Informe o campo chave (campo_id).')
-            # Origem direto do FDW: cria/atualiza a tabela estrangeira agora
-            sincronizar_tabela_origem(tabela_origem, forcar=True)
+            validar_origem(tabela_origem)
 
             tabela_criada_agora = garantir_tabela_destino(tabela_origem, tabela_destino, campo_id)
 
@@ -5392,108 +5183,6 @@ def api_progresso(id):
     except Exception as e:
         return jsonify({'status': 'erro', 'mensagem': str(e)}), 500
 
-@app.route('/api/processar-automatico', methods=['POST'])
-def api_processar_automatico():
-    """API para processar múltiplos lotes automaticamente com delay"""
-    if not is_db_configured():
-        return jsonify({
-            'status': 'erro',
-            'mensagem': 'Configure a conexão com o banco de dados para continuar.',
-            'configurar_banco': url_for('configurar_banco')
-        }), 503
-
-    data = request.json
-    migracao_id = data.get('migracao_id')
-    lote_inicial = data.get('lote_inicial', 1)
-    quantidade_lotes = data.get('quantidade_lotes', 1)
-    try:
-        migracao = execute_query(
-            "SELECT total_registros, registros_processados, tamanho_lote FROM controle_migracao WHERE id = %s",
-            (migracao_id,)
-        )[0]
-    except IndexError:
-        return jsonify({'status': 'erro', 'mensagem': 'Migração não encontrada.'}), 404
-    except (OperationalError, InterfaceError) as error:
-        return handle_db_connection_error(error, api=True)
-
-    total_lotes = (migracao['total_registros'] + migracao['tamanho_lote'] - 1) // migracao['tamanho_lote']
-    lote_atual = migracao['registros_processados'] // migracao['tamanho_lote']
-    lotes_restantes = max(0, total_lotes - lote_atual)
-
-    if quantidade_lotes > lotes_restantes:
-        return jsonify({
-            'status': 'erro',
-            'mensagem': f'A quantidade solicitada ({quantidade_lotes}) excede os lotes restantes ({lotes_restantes}).',
-            'lotes_restantes': lotes_restantes,
-            'total_lotes': total_lotes
-        }), 400
-    
-    resultados = []
-    lotes_com_erro_encoding = []
-
-    def processar_todos_lotes(conn):
-        resultados.clear()
-        lotes_com_erro_encoding.clear()
-        for i in range(quantidade_lotes):
-            numero_lote = lote_inicial + i
-            result = run_query_with_connection(
-                conn,
-                "SELECT * FROM processar_lote(%s, %s)",
-                (migracao_id, numero_lote)
-            )[0]
-
-            result['lote'] = numero_lote
-
-            try:
-                progresso = run_query_with_connection(
-                    conn,
-                    "SELECT * FROM verificar_progresso(%s)",
-                    (migracao_id,)
-                )[0]
-                result['progresso'] = dict(progresso)
-            except Exception:
-                pass
-
-            conn.commit()
-            resultados.append(result)
-
-            if result.get('status') == 'erro':
-                if _is_encoding_error(result.get('mensagem') or ''):
-                    lotes_com_erro_encoding.append(numero_lote)
-                    continue
-                break
-
-        return resultados
-
-    try:
-        execute_db_operation(processar_todos_lotes)
-    except (OperationalError, InterfaceError) as error:
-        if resultados:
-            return jsonify({
-                'resultados': resultados,
-                'total_processado': len(resultados),
-                'erro_conexao': str(error),
-                'lotes_encoding': lotes_com_erro_encoding
-            })
-        return handle_db_connection_error(error, api=True)
-    except Exception as e:
-        if resultados:
-            return jsonify({
-                'resultados': resultados,
-                'total_processado': len(resultados),
-                'erro': str(e),
-                'lotes_encoding': lotes_com_erro_encoding
-            })
-        return jsonify({
-            'status': 'erro',
-            'mensagem': str(e),
-        }), 500
-
-    return jsonify({
-        'resultados': resultados,
-        'total_processado': len(resultados),
-        'lotes_encoding': lotes_com_erro_encoding
-    })
 
 @app.route('/api/dashboard/stats')
 def api_dashboard_stats():

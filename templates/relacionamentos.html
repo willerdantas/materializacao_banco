@@ -270,7 +270,7 @@
             g.dataset.chave = t.chave;
             const titulo = [`${t.nome}`, `Origem: ${t.origem || '-'}`,
                 `Migração(ões): #${t.migracoes.join(', #')}`,
-                `Colunas: ${t.colunas.length}` + (t.fonte && t.fonte !== 'destino' ? ` (lidas da ${t.fonte === 'fdw' ? 'lista do FDW' : 'origem'} — destino ainda não criado)` : '')];
+                `Colunas: ${t.colunas.length}` + (t.fonte && t.fonte !== 'destino' ? ` (lidas da lista da origem — destino ainda não criado)` : '')];
             g.appendChild(el('title', {}, titulo.join('\n')));
             g.appendChild(el('rect', { class: 'caixa', width: t.w, height: t.h, rx: 8 }));
             g.appendChild(el('path', { class: 'cabecalho',
