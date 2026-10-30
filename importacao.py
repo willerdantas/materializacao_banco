@@ -593,7 +593,7 @@ def _background_migracao_worker(job_id, migracao_id, id_inicio, id_fim, delay_se
         set_background_job(job_id, {
             **(get_background_job(job_id) or {}),
             'status': 'erro',
-            'mensagem': f'Erro fatal no worker: {str(e)}',
+            'mensagem': mensagem_de_erro(e, 'Erro fatal no worker'),
             'registros_inseridos': registros_inseridos,
             'registros_atualizados': registros_atualizados,
             'registros_com_erro': registros_com_erro,
@@ -780,12 +780,21 @@ def sugerir_mapeamento_migracao(tabela):
     """Origem/destino/campo ID sugeridos pra uma tabela da origem: destino com
     o prefixo v_ trocado por t_ (v_paciente -> t_paciente) e, como chave, a
     primeira coluna isn_* (ou a primeira coluna, se não houver)."""
-    nome = tabela['nome']
+    nome = tabela['nome']                     # 'v_x' ou 'outro_schema.v_x'
     colunas = tabela.get('colunas') or []
-    destino = 't_' + nome[2:] if nome.lower().startswith('v_') else nome
+    base = nome.split('.')[-1]
+    destino = 't_' + base[2:] if base.lower().startswith('v_') else base
     campo_id = next((c for c in colunas if c.lower().startswith('isn_')), colunas[0] if colunas else '')
     return {'origem': nome, 'destino': destino, 'campo_id': campo_id, 'tipo': tabela.get('tipo'),
             'sem_permissao': bool(tabela.get('sem_permissao'))}
+
+
+def relacao_origem_da_lista(item_ou_nome):
+    """'schema.tabela' de um item da lista da origem (ou do nome digitado)."""
+    nome = item_ou_nome['nome'] if isinstance(item_ou_nome, dict) else item_ou_nome
+    if '.' in nome:
+        return nome
+    return f'{(get_fdw_config().get("schema_remoto") or "public").strip()}.{nome}'
 
 
 def get_mapeamentos_fdw():
@@ -801,6 +810,24 @@ def get_mapeamentos_fdw():
 # COPY (SELECT ... WHERE chave = ANY(ids)) -> staging local. Não existe mais
 # tabela estrangeira nem schema local do FDW: a origem é sempre
 # "<schema remoto>.<tabela>" no servidor de origem.
+
+def mensagem_de_erro(erro, contexto=''):
+    """Texto curto pro usuário: só a mensagem principal do PostgreSQL (e a dica,
+    se houver), sem os trechos de SQL (LINE/QUERY/CONTEXT). O erro completo
+    vai pro log do sistema (docker logs)."""
+    diag = getattr(erro, 'diag', None)
+    if isinstance(erro, psycopg2.Error) and diag is not None and diag.message_primary:
+        curta = diag.message_primary
+        if diag.message_hint:
+            curta += f' (dica: {diag.message_hint})'
+        app.logger.warning('%s%s', f'{contexto}: ' if contexto else '', str(erro).strip())
+    else:
+        linhas = str(erro).strip().splitlines()
+        curta = linhas[0] if linhas else erro.__class__.__name__
+        if len(linhas) > 1:
+            app.logger.warning('%s%s', f'{contexto}: ' if contexto else '', str(erro).strip())
+    return f'{contexto}: {curta}' if contexto else curta
+
 
 def normalizar_origem(relacao_raw):
     """'v_x', 'guardiao.v_x' ou o nome antigo 'integrasesa.v_x' (schema local
@@ -1077,6 +1104,20 @@ def restaurar_logo_padrao():
     while caminho:
         os.remove(caminho)
         caminho = caminho_logo_personalizada()
+
+
+# Versão do código em execução: data do importacao.py (o COPY do Docker
+# preserva a data) — mostrada no rodapé pra conferir se um servidor está
+# com o código atualizado.
+try:
+    VERSAO_SISTEMA = datetime.fromtimestamp(os.path.getmtime(__file__)).strftime('%d/%m/%Y %H:%M')
+except OSError:
+    VERSAO_SISTEMA = '?'
+
+
+@app.context_processor
+def inject_versao():
+    return {'versao_sistema': VERSAO_SISTEMA}
 
 
 @app.context_processor
@@ -1495,7 +1536,7 @@ def _background_refresh_batches_worker(job_id, migration_id):
         set_background_job(job_id, {
             **get_background_job(job_id),
             'status': 'erro',
-            'mensagem': f'Erro ao preparar migração: {str(e)}',
+            'mensagem': mensagem_de_erro(e, 'Erro ao preparar migração'),
             'fim': datetime.now().isoformat(),
         })
 
@@ -3132,32 +3173,50 @@ def _testar_origem_direta(origem, porta):
     try:
         with conexao.cursor() as cur:
             # pg_class em vez de information_schema: o information_schema
-            # esconde o que o usuário não pode ler e as views materializadas
-            # (foi o que fazia "sumir" tabelas da lista). Partições ficam de
+            # esconde o que o usuário não pode ler e as views materializadas.
+            # Lê TODOS os schemas da origem (não só o configurado): views
+            # novas costumam ser criadas em outro schema. Partições ficam de
             # fora (aparece só a tabela pai).
             cur.execute("""
-                SELECT c.relname, c.relkind,
+                SELECT n.nspname, c.relname, c.relkind,
                        has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT') AS pode_ler,
                        COALESCE(array_agg(a.attname::text ORDER BY a.attnum) FILTER (WHERE a.attnum > 0), '{}')
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-                WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
-                GROUP BY c.oid, n.oid, c.relname, c.relkind
-                ORDER BY c.relname
+                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND n.nspname NOT LIKE 'pg\\_%%'
+                GROUP BY c.oid, n.oid, n.nspname, c.relname, c.relkind
+                ORDER BY (n.nspname <> %s), n.nspname, c.relname
             """, (origem['schema_remoto'],))
+            schema_padrao = origem['schema_remoto'].lower()
             tabelas = [
-                {'nome': nome, 'tipo': TIPOS_RELACAO_ORIGEM.get(tipo, 'tabela'), 'colunas': list(colunas),
-                 'sem_permissao': not pode_ler}
-                for nome, tipo, pode_ler, colunas in cur.fetchall()
+                {
+                    # no schema configurado basta o nome; nos outros, schema.nome
+                    'nome': nome if schema.lower() == schema_padrao else f'{schema}.{nome}',
+                    'schema': schema,
+                    'tabela': nome,
+                    'tipo': TIPOS_RELACAO_ORIGEM.get(tipo, 'tabela'),
+                    'colunas': list(colunas),
+                    'sem_permissao': not pode_ler,
+                }
+                for schema, nome, tipo, pode_ler, colunas in cur.fetchall()
             ]
     finally:
         conexao.close()
     if not tabelas:
-        return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas o schema '
-                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views.'), []
+        return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas não encontrou '
+                       f'nenhuma tabela/view em nenhum schema.'), []
+    por_schema = {}
+    for t in tabelas:
+        por_schema[t['schema']] = por_schema.get(t['schema'], 0) + 1
+    detalhe = ', '.join(f'{qtd} em "{schema}"' for schema, qtd in por_schema.items())
+    views = sum(1 for t in tabelas if t['tipo'].startswith('view'))
     mensagem = (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
-                f'{len(tabelas)} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".')
+                f'{len(tabelas)} tabela(s)/view(s), sendo {views} view(s): {detalhe}.')
+    if origem['schema_remoto'] not in por_schema:
+        mensagem += f'\nAtenção: o schema configurado "{origem["schema_remoto"]}" não tem nenhuma tabela/view.'
     sem_permissao = [t['nome'] for t in tabelas if t['sem_permissao']]
     if sem_permissao:
         mensagem += (f'\nAtenção: o usuário "{origem["user"]}" não tem permissão de leitura (SELECT) em '
@@ -3445,7 +3504,6 @@ def mensagem_migracao_duplicada(existente, tabela_origem):
 def mapeamentos_fdw_com_migracoes():
     """Mapeamentos do FDW marcados com a migração já cadastrada pra mesma
     origem (ou destino), se houver — a tela não oferece criar de novo."""
-    schema_remoto = (get_fdw_config().get('schema_remoto') or 'public').lower()
     schema_destino = (get_db_config().get('schema_destino') or '').lower()
     try:
         migracoes = listar_migracoes_para_selecao()
@@ -3455,7 +3513,7 @@ def mapeamentos_fdw_com_migracoes():
     por_destino = {(m['tabela_destino'] or '').lower(): m['id'] for m in migracoes}
     resultado = []
     for mp in get_mapeamentos_fdw():
-        origem = f'{schema_remoto}.{mp["origem"]}'.lower()
+        origem = relacao_origem_da_lista(mp['origem']).lower()
         destino = f'{schema_destino}.{mp["destino"]}'.lower()
         resultado.append({**mp, 'migracao_id': por_origem.get(origem) or por_destino.get(destino)})
     return resultado
@@ -3487,9 +3545,10 @@ def nova_migracao():
             tabela_destino = normalize_relation_input(tabela_destino_raw, 'Tabela Destino', get_db_config()['schema_destino'])
             validar_origem(tabela_origem)
         except (ValueError, psycopg2.Error) as error:
+            mensagem = mensagem_de_erro(error, 'Origem')
             if is_ajax_request():
-                return jsonify({'status': 'erro', 'mensagem': str(error)}), 400
-            flash(str(error), 'error')
+                return jsonify({'status': 'erro', 'mensagem': mensagem}), 400
+            flash(mensagem, 'error')
             return render_template('nova_migracao.html', fdw_tabelas=get_fdw_tabelas(), fdw_mapeamentos=mapeamentos_fdw_com_migracoes(), migracao_edicao={'id': editando_id} if editando_id else None)
 
         try:
@@ -3559,9 +3618,10 @@ def nova_migracao():
             return handle_db_connection_error(error)
         except Exception as e:
             acao = 'atualizar' if editando_id else 'criar'
+            mensagem = mensagem_de_erro(e, f'Erro ao {acao} migração')
             if is_ajax_request():
-                return jsonify({'status': 'erro', 'mensagem': f'Erro ao {acao} migração: {str(e)}'}), 500
-            flash(f'Erro ao {acao} migração: {str(e)}', 'error')
+                return jsonify({'status': 'erro', 'mensagem': mensagem}), 500
+            flash(mensagem, 'error')
 
     migracao_edicao = None
     editar_id = request.args.get('editar')
@@ -3625,15 +3685,15 @@ def montar_esquema_relacionamentos():
 
     colunas = _colunas_das_relacoes([t['nome'] for t in tabelas.values()])
     colunas_fdw = {
-        t['nome'].lower(): [{'nome': c, 'tipo': None} for c in t.get('colunas') or []]
+        relacao_origem_da_lista(t).lower(): [{'nome': c, 'tipo': None} for c in t.get('colunas') or []]
         for t in get_fdw_tabelas().get('tabelas') or []
     }
     for t in tabelas.values():
         origem = (t['origem'] or '').lower()
         if t['chave'] in colunas:
             t['colunas'], t['fonte'] = colunas[t['chave']], 'destino'
-        elif origem.split('.')[-1] in colunas_fdw:
-            t['colunas'], t['fonte'] = colunas_fdw[origem.split('.')[-1]], 'fdw'
+        elif origem in colunas_fdw:
+            t['colunas'], t['fonte'] = colunas_fdw[origem], 'fdw'
         else:
             t['colunas'], t['fonte'] = [], None
 
@@ -3728,7 +3788,7 @@ def importacao_automatica():
             if tabela_criada_agora:
                 flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
         except (ValueError, psycopg2.Error) as error:
-            flash(str(error), 'error')
+            flash(mensagem_de_erro(error), 'error')
 
         return redirect(url_for('importacao_automatica'))
 
@@ -4197,8 +4257,9 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         normalized_source = normalizar_origem(tabela_cfg['tabela_origem'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
     except (ValueError, psycopg2.Error) as error:
-        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
-        _log_ciclo(job_id, 'erro', str(error))
+        mensagem = mensagem_de_erro(error)
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': mensagem})
+        _log_ciclo(job_id, 'erro', mensagem)
         return
 
     normalized_key = tabela_cfg['campo_id']
@@ -4461,8 +4522,9 @@ def _background_auto_import_ciclo_worker(job_id, tabela_id):
         _log_ciclo(job_id, 'erro', f'Ciclo interrompido: {error}')
         return
     except Exception as error:
-        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
-        _log_ciclo(job_id, 'erro', f'Erro fatal no ciclo: {error}')
+        mensagem = mensagem_de_erro(error, 'Erro fatal no ciclo')
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': mensagem})
+        _log_ciclo(job_id, 'erro', mensagem)
         return
     finally:
         fechar_conexao_origem_da_thread()
@@ -4545,8 +4607,9 @@ def _background_agendamento_worker(job_id, tabela_id):
         normalized_source = normalizar_origem(tabela_cfg['tabela_origem'])
         normalized_target = normalize_relation_input(tabela_cfg['tabela_destino'], 'Tabela Destino', get_db_config()['schema_destino'])
     except (ValueError, psycopg2.Error) as error:
-        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
-        _log_execucao(job_id, 'erro', str(error))
+        mensagem = mensagem_de_erro(error)
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': mensagem})
+        _log_execucao(job_id, 'erro', mensagem)
         return
 
     normalized_key = tabela_cfg['campo_id']
@@ -4845,9 +4908,10 @@ def _background_agendamento_worker(job_id, tabela_id):
         _fechar_execucao_com_erro(conn, execucao_id, str(error), locals())
         return
     except Exception as error:
-        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': str(error)})
-        _log_execucao(job_id, 'erro', f'Erro fatal na execução: {error}')
-        _fechar_execucao_com_erro(conn, execucao_id, str(error), locals())
+        mensagem = mensagem_de_erro(error, 'Erro fatal na execução')
+        set_background_job(job_id, {**get_background_job(job_id), 'status': 'erro', 'mensagem': mensagem})
+        _log_execucao(job_id, 'erro', mensagem)
+        _fechar_execucao_com_erro(conn, execucao_id, mensagem, locals())
         return
     finally:
         fechar_conexao_origem_da_thread()
@@ -5005,7 +5069,7 @@ def agendar_importacao():
             if tabela_criada_agora:
                 flash(f'Tabela de destino "{tabela_destino}" criada automaticamente (mesma estrutura da origem).', 'info')
         except (ValueError, psycopg2.Error) as error:
-            flash(str(error), 'error')
+            flash(mensagem_de_erro(error), 'error')
 
         return redirect(url_for('agendar_importacao'))
 
