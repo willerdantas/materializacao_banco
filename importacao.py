@@ -784,7 +784,8 @@ def sugerir_mapeamento_migracao(tabela):
     colunas = tabela.get('colunas') or []
     destino = 't_' + nome[2:] if nome.lower().startswith('v_') else nome
     campo_id = next((c for c in colunas if c.lower().startswith('isn_')), colunas[0] if colunas else '')
-    return {'origem': nome, 'destino': destino, 'campo_id': campo_id, 'tipo': tabela.get('tipo')}
+    return {'origem': nome, 'destino': destino, 'campo_id': campo_id, 'tipo': tabela.get('tipo'),
+            'sem_permissao': bool(tabela.get('sem_permissao'))}
 
 
 def get_mapeamentos_fdw():
@@ -891,11 +892,24 @@ def colunas_origem(relacao):
 
 
 def validar_origem(relacao):
-    """Confere na origem que a tabela existe (ValueError com mensagem se não)."""
+    """Confere na origem que a tabela existe e que o usuário da origem pode
+    lê-la (ValueError com mensagem se não)."""
     try:
-        return colunas_origem(relacao)
+        colunas = colunas_origem(relacao)
+        schema, tabela = relacao.split('.', 1)
+        permissao = consultar_origem("""
+            SELECT has_schema_privilege(%s, 'USAGE')
+                   AND has_table_privilege(format('%%I.%%I', %s, %s), 'SELECT') AS pode_ler,
+                   current_user AS usuario
+        """, (schema, schema, tabela))[0]
     finally:
         fechar_conexao_origem_da_thread()
+    if not permissao['pode_ler']:
+        raise ValueError(
+            f'O usuário "{permissao["usuario"]}" da origem não tem permissão de leitura em {relacao}. '
+            f'Peça ao DBA da origem: GRANT SELECT ON {relacao} TO "{permissao["usuario"]}".'
+        )
+    return colunas
 
 
 def max_id_origem(relacao, chave):
@@ -3102,6 +3116,9 @@ def remover_fdw_local_route():
     return redirect(url_for('configurar_banco'))
 
 
+TIPOS_RELACAO_ORIGEM = {'r': 'tabela', 'p': 'tabela', 'v': 'view', 'm': 'view materializada', 'f': 'tabela estrangeira'}
+
+
 def _testar_origem_direta(origem, porta):
     """Etapa 1: o app conecta direto na origem com os dados informados."""
     try:
@@ -3114,27 +3131,40 @@ def _testar_origem_direta(origem, porta):
         return False, f'Origem: falha ao conectar em {origem["host"]}:{porta}/{origem["database"]} — {error}', []
     try:
         with conexao.cursor() as cur:
+            # pg_class em vez de information_schema: o information_schema
+            # esconde o que o usuário não pode ler e as views materializadas
+            # (foi o que fazia "sumir" tabelas da lista). Partições ficam de
+            # fora (aparece só a tabela pai).
             cur.execute("""
-                SELECT t.table_name, t.table_type,
-                       array_agg(c.column_name::text ORDER BY c.ordinal_position)
-                FROM information_schema.tables t
-                JOIN information_schema.columns c
-                  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-                WHERE t.table_schema = %s
-                GROUP BY t.table_name, t.table_type
-                ORDER BY t.table_name
+                SELECT c.relname, c.relkind,
+                       has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT') AS pode_ler,
+                       COALESCE(array_agg(a.attname::text ORDER BY a.attnum) FILTER (WHERE a.attnum > 0), '{}')
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
+                GROUP BY c.oid, n.oid, c.relname, c.relkind
+                ORDER BY c.relname
             """, (origem['schema_remoto'],))
             tabelas = [
-                {'nome': nome, 'tipo': 'view' if tipo == 'VIEW' else 'tabela', 'colunas': list(colunas)}
-                for nome, tipo, colunas in cur.fetchall()
+                {'nome': nome, 'tipo': TIPOS_RELACAO_ORIGEM.get(tipo, 'tabela'), 'colunas': list(colunas),
+                 'sem_permissao': not pode_ler}
+                for nome, tipo, pode_ler, colunas in cur.fetchall()
             ]
     finally:
         conexao.close()
     if not tabelas:
         return False, (f'Origem: conectou em {origem["host"]}:{porta}/{origem["database"]}, mas o schema '
-                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views (ou o usuário não tem acesso).'), []
-    return True, (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
-                  f'{len(tabelas)} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".'), tabelas
+                       f'remoto "{origem["schema_remoto"]}" não tem tabelas/views.'), []
+    mensagem = (f'Origem: conexão OK com {origem["host"]}:{porta}/{origem["database"]} — '
+                f'{len(tabelas)} tabela(s)/view(s) no schema remoto "{origem["schema_remoto"]}".')
+    sem_permissao = [t['nome'] for t in tabelas if t['sem_permissao']]
+    if sem_permissao:
+        mensagem += (f'\nAtenção: o usuário "{origem["user"]}" não tem permissão de leitura (SELECT) em '
+                     f'{len(sem_permissao)} delas: {", ".join(sem_permissao[:15])}'
+                     f'{"..." if len(sem_permissao) > 15 else ""}. Peça ao DBA da origem: '
+                     f'GRANT SELECT ON ... TO "{origem["user"]}".')
+    return True, mensagem, tabelas
 
 
 def salvar_lista_tabelas_fdw(origem, porta, tabelas):

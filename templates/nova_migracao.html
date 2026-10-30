@@ -122,8 +122,9 @@
         {% else %}
         <button type="button" class="btn btn-outline btn-sm exemplo-fdw exemplo-fdw-preencher"
                 data-origem="{{ mp.origem }}" data-destino="{{ mp.destino }}" data-campo-id="{{ mp.campo_id }}"
-                title="{{ mp.origem }} → {{ mp.destino }} (chave {{ mp.campo_id or '?' }})">
-            <span>{{ mp.origem }}</span>
+                {% if mp.sem_permissao %}style="border-color: var(--color-orange);"{% endif %}
+                title="{{ mp.origem }} → {{ mp.destino }} (chave {{ mp.campo_id or '?' }}){% if mp.sem_permissao %} — o usuário da origem não tem permissão de leitura nesta tabela{% endif %}">
+            <span>{{ '🔒 ' if mp.sem_permissao }}{{ mp.origem }}</span>
         </button>
         {% endif %}
         {% endfor %}

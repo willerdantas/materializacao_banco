@@ -267,6 +267,7 @@
                             <th>Tabela</th>
                             <th>Tipo</th>
                             <th style="text-align: center;">Colunas</th>
+                            <th style="text-align: center;">Leitura</th>
                         </tr>
                     </thead>
                     <tbody id="lista-tabelas-fdw-corpo"></tbody>
@@ -484,16 +485,20 @@ function renderizarListaTabelasFdw(lista) {
     document.getElementById('lista-tabelas-fdw-titulo').textContent =
         `Tabelas da origem (${tabelas.length}) — schema remoto "${lista.schema_remoto}"`;
     document.getElementById('lista-tabelas-fdw-info').textContent =
-        `${lista.origem} · atualizado em ${lista.atualizado_em}`;
+        `${lista.origem} · atualizado em ${lista.atualizado_em}` +
+        (tabelas.some(t => t.sem_permissao)
+            ? ` · ${tabelas.filter(t => t.sem_permissao).length} sem permissão de leitura para o usuário da origem (peça GRANT SELECT ao DBA)`
+            : '');
 
     const corpo = document.getElementById('lista-tabelas-fdw-corpo');
     corpo.replaceChildren(...tabelas.map(t => {
         const tr = document.createElement('tr');
         tr.dataset.nome = t.nome.toLowerCase();
-        [t.nome, t.tipo, String((t.colunas || []).length)].forEach((texto, i) => {
+        [t.nome, t.tipo, String((t.colunas || []).length), t.sem_permissao ? '🔒 sem permissão' : '✓'].forEach((texto, i) => {
             const td = document.createElement('td');
             td.textContent = texto;
             if (i >= 2) td.style.textAlign = 'center';
+            if (i === 3 && t.sem_permissao) td.style.color = 'var(--color-orange)';
             tr.appendChild(td);
         });
         return tr;

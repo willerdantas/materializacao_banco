@@ -42,11 +42,12 @@
             {% for example in examples %}
             <button type="button"
                     class="btn btn-sm btn-outline"
-                    title="{{ example.origem }} → {{ example.destino }} (chave {{ example.campo_id or '?' }})"
+                    {% if example.sem_permissao %}style="border-color: var(--color-orange);"{% endif %}
+                    title="{{ example.origem }} → {{ example.destino }} (chave {{ example.campo_id or '?' }}){% if example.sem_permissao %} — o usuário da origem não tem permissão de leitura nesta tabela{% endif %}"
                     data-example-source="{{ example.origem }}"
                     data-example-target="{{ example.destino }}"
                     data-example-key="{{ example.campo_id }}">
-                + {{ example.origem }}
+                + {{ '🔒 ' if example.sem_permissao }}{{ example.origem }}
             </button>
             {% endfor %}
         </div>
